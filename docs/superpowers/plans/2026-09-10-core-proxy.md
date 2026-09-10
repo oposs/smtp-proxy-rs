@@ -2136,7 +2136,7 @@ async fn commands_valid_in_any_state() {
     let (mut c, _) = open_session().await;
     assert_eq!(c.command("NOOP").await, "250 OK\r\n");
     assert_eq!(c.command("NOOP keep alive").await, "250 OK\r\n");
-    assert_eq!(c.command("VRFY someone").await, "553 User ambiguous\r\n");
+    assert_eq!(c.command("VRFY someone").await, "553 Unimplemented\r\n");
     assert_eq!(c.command("VRFY").await, "501 string required\r\n");
     assert_eq!(c.command("EHLO").await, "501 domain required\r\n");
     assert_eq!(c.command("PING").await, "502 unknown command\r\n");
@@ -2564,7 +2564,7 @@ impl<H: Handler> Session<H> {
             }
             Command::Vrfy { .. } => {
                 debug!("Processing VRFY for {}", self.client);
-                self.send(Reply::new(553, "User ambiguous")).await?;
+                self.send(Reply::new(553, "Unimplemented")).await?;
                 Ok(Flow::Continue)
             }
             Command::Ehlo { .. } | Command::Helo { .. } => {
