@@ -2,5 +2,6 @@
 
 pub mod command;
 pub mod dsn;
+pub mod extensions;
 pub mod params;
 pub mod reply;
