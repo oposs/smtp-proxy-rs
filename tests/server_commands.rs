@@ -325,6 +325,36 @@ async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
 }
 
 #[tokio::test]
+async fn a_message_that_fills_the_cap_exactly_still_ends_normally() {
+    let factory = ScriptedFactory::default();
+    let mut config = server_config(false, false);
+    config.max_message_size = 64;
+    let addr = start_server(config, factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    // 12 bytes of header plus a 52 byte body line is exactly the 64 byte cap,
+    // and the blank line between them costs nothing. That leaves no capacity
+    // at all for the terminator, which also costs nothing.
+    c.write_raw("Subject: x\r\n\r\n").await;
+    c.write_raw(&format!("{}\r\n", "z".repeat(50))).await;
+    // The terminator arrives split across two reads. The lone dot must not be
+    // read as an over-cap line: doing so would discard the message, swallow
+    // the rest of the terminator as a discarded tail, and leave the session
+    // waiting for a terminator that has already been sent.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.write_raw(".").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.write_raw("\r\n").await;
+    assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
+    let rec = factory.recorded();
+    assert_eq!(rec.headers[0], "Subject: x\r\n");
+    assert_eq!(rec.bodies[0].len(), 52);
+}
+
+#[tokio::test]
 async fn a_discarded_data_line_tail_is_not_mistaken_for_the_terminator() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
@@ -335,16 +365,17 @@ async fn a_discarded_data_line_tail_is_not_mistaken_for_the_terminator() {
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    // The header block leaves 52 of the 64 bytes unspent, so the very next
-    // 53 bytes without a newline are what tips the message over the cap.
-    // Each sleep lets the server consume what was sent and go back to
-    // waiting with an empty buffer, which fixes where the discard falls.
+    // The header block leaves 52 of the 64 bytes unspent, and the reader
+    // holds two bytes of slack for a half-read terminator, so 55 bytes
+    // without a newline are what tips the message over the cap. Each sleep
+    // lets the server consume what was sent and go back to waiting with an
+    // empty buffer, which fixes where the discard falls.
     c.write_raw("Subject: x\r\n\r\n").await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    c.write_raw(&"y".repeat(53)).await;
+    c.write_raw(&"y".repeat(55)).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     // The rest of that same body line now happens to be a lone dot. It ends
-    // the line, but the line began 53 bytes ago, so this is not a dot on a
+    // the line, but the line began 55 bytes ago, so this is not a dot on a
     // line of its own and must not end the message. Reading it as the
     // terminator would reply 552 here and leave the rest of the body to be
     // parsed as commands.

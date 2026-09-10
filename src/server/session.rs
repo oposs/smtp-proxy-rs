@@ -30,6 +30,13 @@ impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
 /// to keep a client that never sends a newline from filling memory.
 const MAX_COMMAND_BUFFER: usize = 64 * 1024;
 
+/// Bytes of headroom the DATA reader keeps on top of what the size cap still
+/// allows, so that a half-read terminator is never mistaken for an over-cap
+/// line. The terminator and the blank line that ends the header block are
+/// both free of charge, and the longest either can be while still incomplete
+/// is `.\r`.
+const TERMINATOR_SLACK: usize = 2;
+
 /// What one read attempt produced.
 enum Line {
     Got(Vec<u8>),
@@ -566,7 +573,20 @@ impl<H: Handler> Session<H> {
             // An incomplete line counts against the cap like any other bytes.
             // Once the reader is already discarding, the cap has nothing left
             // to say and a plain byte bound keeps the drain bounded.
-            let budget = reader.remaining_capacity().unwrap_or(MAX_COMMAND_BUFFER);
+            //
+            // TERMINATOR_SLACK covers the two lines that cost nothing: the
+            // terminator and the blank line that ends the headers. A message
+            // that fills the cap exactly leaves no capacity, and the ".\r\n"
+            // or "\r\n" that follows can still be split across reads. Held
+            // half-read it is at most ".\r", two bytes, so without the slack
+            // it would look like an over-cap line, the message would be
+            // discarded, and the rest of the terminator would be eaten as a
+            // discarded tail -- leaving the session waiting for a terminator
+            // that had already arrived. Two bytes cannot hide a real line:
+            // any body line costs at least its own terminator.
+            let budget = reader
+                .remaining_capacity()
+                .map_or(MAX_COMMAND_BUFFER, |left| left + TERMINATOR_SLACK);
             let line = match self.next_line(budget).await? {
                 Line::Got(line) => line,
                 Line::Eof => {
