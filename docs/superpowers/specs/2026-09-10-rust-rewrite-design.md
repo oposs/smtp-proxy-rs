@@ -243,7 +243,9 @@ Size cap: the accumulated message (headers plus body) may not exceed
 `--max_message_size` bytes, default 1 GiB (1073741824). When it is
 exceeded, the reader keeps consuming and discarding lines until the
 terminator, then replies `552 Message exceeds maximum size of N bytes`,
-resets the transaction, and returns to WantMail. The API is not called.
+resets the transaction, and returns to WantMail. The message is never
+relayed. If the API call had already started (the cap was crossed inside
+the body), its result is ignored.
 
 Handler result: `250 OK: <message>` and state WantMail, or `550 <message>`
 and state WantMail. If the client has gone away by then, the reply is
