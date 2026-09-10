@@ -24,11 +24,12 @@ pub fn format_timestamp(now: &jiff::Zoned) -> String {
 
 fn level_name(level: &Level) -> &'static str {
     match *level {
-        Level::DEBUG => "debug",
+        // `trace` is not one of the Perl-compatible level names (spec 7/8.1);
+        // fold it into `debug` rather than invent a new name or panic on it.
+        Level::TRACE | Level::DEBUG => "debug",
         Level::INFO => "info",
         Level::WARN => "warn",
         Level::ERROR => "error",
-        Level::TRACE => unreachable!("trace events are filtered out by init"),
     }
 }
 

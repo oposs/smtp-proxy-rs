@@ -14,19 +14,37 @@ pub fn format_entry(id: &str, timestamp: &str, sent: bool, line: &str) -> String
     format!("{id} {timestamp} {leader} {line}\n")
 }
 
+/// Byte range of the next run of non-whitespace characters at or after
+/// `from`, or `None` if only whitespace (or nothing) remains.
+fn next_token(s: &str, from: usize) -> Option<(usize, usize)> {
+    let rest = &s[from..];
+    let start_rel = rest.find(|c: char| !c.is_whitespace())?;
+    let start = from + start_rel;
+    let tail = &s[start..];
+    let end_rel = tail.find(char::is_whitespace).unwrap_or(tail.len());
+    Some((start, start + end_rel))
+}
+
 /// `AUTH <mech> <secret>` -> `AUTH <mech> [REDACTED]`, matched on the raw
 /// line because verb and mechanism are case-insensitive on the wire.
+/// Tokens may be separated by any run of whitespace (multiple spaces,
+/// tabs), not just a single space, so the split is done by hand rather
+/// than with a fixed-width `splitn`.
 pub fn redact_auth_line(line: &str) -> String {
-    let mut parts = line.splitn(3, char::is_whitespace);
-    let (Some(verb), Some(mech), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+    let Some((verb_start, verb_end)) = next_token(line, 0) else {
         return line.to_string();
     };
-    if verb.eq_ignore_ascii_case("AUTH") && !mech.is_empty() && !rest.trim().is_empty() {
-        let prefix_len = line.len() - rest.len();
-        format!("{}[REDACTED]", &line[..prefix_len])
-    } else {
-        line.to_string()
+    if !line[verb_start..verb_end].eq_ignore_ascii_case("AUTH") {
+        return line.to_string();
     }
+    let Some((_mech_start, mech_end)) = next_token(line, verb_end) else {
+        return line.to_string();
+    };
+    // Only redact when there is an actual secret token after the mechanism.
+    if next_token(line, mech_end).is_none() {
+        return line.to_string();
+    }
+    format!("{} [REDACTED]", &line[..mech_end])
 }
 
 fn now() -> String {
@@ -100,6 +118,23 @@ mod tests {
             redact_auth_line("MAIL FROM:<a@b.com>"),
             "MAIL FROM:<a@b.com>"
         );
+    }
+
+    #[test]
+    fn auth_arguments_are_redacted_with_irregular_whitespace() {
+        // Two spaces between verb and mechanism must not defeat redaction.
+        assert_eq!(
+            redact_auth_line("AUTH  PLAIN dXNlcgBwYXNz"),
+            "AUTH  PLAIN [REDACTED]"
+        );
+        // A tab between mechanism and secret must not defeat redaction.
+        assert_eq!(
+            redact_auth_line("AUTH PLAIN\tdXNlcgBwYXNz"),
+            "AUTH PLAIN [REDACTED]"
+        );
+        // `AUTH` alone, with nothing after it, has nothing to redact.
+        assert_eq!(redact_auth_line("AUTH"), "AUTH");
+        assert_eq!(redact_auth_line("AUTH   "), "AUTH   ");
     }
 
     #[test]
