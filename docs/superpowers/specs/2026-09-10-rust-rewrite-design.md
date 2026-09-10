@@ -49,7 +49,7 @@ src/
   main.rs            parse CLI, build Config, start the tokio runtime
   lib.rs
   config.rs          Config: listen addrs, upstream host/port, TLS paths,
-                     API URL, log settings, user, max message size
+                     API URL, log settings, user, limits, upstream TLS
   logging.rs         tracing subscriber with a Mojo::Log compatible formatter
   smtplog.rs         optional wire log with credential redaction
   privdrop.rs        setgid/setuid after bind, via nix
@@ -320,12 +320,37 @@ every address the relay writes.
 
 ## 6. Relay to the upstream
 
-`relay.rs` is a minimal SMTP client written for this project, plain TCP,
-inactivity timeout 60 s. Sequence per mail: read 220, EHLO (fall back to
-HELO on a 5xx), MAIL FROM, one RCPT TO per recipient entry, DATA, message,
-`.`, QUIT. Any reply outside the expected class aborts with an error
+`relay.rs` is a minimal SMTP client written for this project, inactivity
+timeout 60 s. Sequence per mail: connect, read 220, EHLO (fall back to HELO
+on a 5xx), STARTTLS and a second EHLO when TLS applies (see 6.1), MAIL FROM,
+one RCPT TO per recipient entry, DATA, message, `.`, QUIT. Any reply outside the expected class aborts with an error
 carrying the upstream's text; the client then gets `550 <text>` and the log
 gets info `Mail refused by relay server (<text>) for <client>`.
+
+### 6.1 TLS to the upstream
+
+`--upstream_tls` selects the mode:
+
+| Mode | Behaviour |
+|---|---|
+| `off` | plain TCP, what the Perl did |
+| `opportunistic` (default) | STARTTLS if the upstream announces it; plain if it does not. If STARTTLS is announced but the handshake or the certificate check fails, the relay fails; there is no fallback to plain, so a downgrade cannot be forced by breaking the handshake. |
+| `required` | STARTTLS must be announced and must succeed, else the relay fails |
+| `implicit` | TLS from the first byte, for port 465 |
+
+The certificate is verified against the system roots plus the PEM bundle
+in `--upstream_tls_ca`, with `--tohost` as the server name.
+`--upstream_tls_insecure` disables verification and logs a warning at
+startup. rustls, TLS 1.2 and 1.3.
+
+The extension set that counts, for DSN and for anything else, is the one
+from the EHLO sent after STARTTLS, since an upstream may announce different
+extensions inside TLS. The startup probe runs the same connect and TLS
+sequence, so its DSN answer matches what a relay will see.
+
+A relay that fails because of TLS reaches the client as `550 <error>` and
+the log as info `Mail refused by relay server (<error>) for <client>`, the
+same path as any other upstream failure.
 
 DSN forwarding: on the EHLO reply, parse the extension keywords and store
 `DSN` presence into `upstream_dsn`. When true, append the RET and ENVID
@@ -365,6 +390,20 @@ Flags, spelled with underscores as in the Perl:
     --smtplog=x           optional wire log file
     --credentials         include credentials in the smtplog
     --max_message_size=n  bytes, default 1073741824 (1 GiB)
+    --upstream_tls=mode   off|opportunistic|required|implicit,
+                          default opportunistic
+    --upstream_tls_ca=x   extra PEM CA bundle for the upstream certificate
+    --upstream_tls_insecure
+                          do not verify the upstream certificate
+    --max_connections=n   default 1000; 0 means unlimited
+    --max_connections_per_ip=n
+                          default 50; 0 means unlimited
+    --max_messages_per_minute=n
+                          per authenticated username, default 60;
+                          0 means unlimited
+    --max_recipients=n    per message, default 1000; 0 means unlimited
+    --drain_timeout=s     seconds to wait for sessions at shutdown,
+                          default 30
 ```
 
 A missing mandatory flag prints the usage to stderr and exits 1. On start
@@ -413,10 +452,59 @@ unless `--credentials` is set.
 - Privilege drop: after all listeners are bound, `setgid` then `setuid` to
   `--user`, resolved with `getpwnam`. Failure aborts startup. Log info
   `Dropped privileges to user <user>`.
-- Signals: SIGTERM and SIGINT stop the process. No connection drain, as in
-  the Perl.
-- Concurrency: no limit on connections, as in the Perl.
-- Memory: one message is held in memory up to the size cap.
+- Memory: one message is held in memory per connection, up to the size
+  cap.
+
+### 9.1 Graceful drain
+
+On SIGTERM or SIGINT:
+
+1. Every listener is closed, so new connections are refused by the
+   kernel. Log info `Shutting down; draining <n> connection(s)`.
+2. A session that is waiting for a command (any state, no transaction in
+   flight, or a transaction that has not reached DATA) is sent
+   `421 <svc> Service not available, closing transmission channel` and
+   closed. RFC 5321 3.8 allows 421 in place of any reply.
+3. A session that is inside DATA, or waiting on the API or the upstream,
+   is allowed to finish its reply and is then closed the same way.
+4. After `--drain_timeout` seconds everything still open is closed
+   without a reply, and the log gets warn `Drain timeout; closing <n>
+   connection(s)`.
+5. Exit code 0. A second signal during the drain exits immediately.
+
+Implemented with a `CancellationToken` from `tokio-util` that every session
+selects on between commands, and a `TaskTracker` that the main task waits
+on with a timeout.
+
+### 9.2 Connection limits
+
+- `--max_connections`: total open client connections. Held as a semaphore;
+  the permit lives as long as the session task.
+- `--max_connections_per_ip`: open connections per client IP address, in
+  a map that is pruned when a count reaches zero.
+
+An accepted socket that exceeds either limit gets
+`421 <svc> Too many connections, try again later` and is closed. Log info
+`Connection limit reached (<which>) for <client>`. The counters are checked
+before the 220 greeting is sent, so the client is never invited in.
+
+### 9.3 Rate limits
+
+- `--max_messages_per_minute`: a token bucket per authenticated username,
+  capacity N, refilled at N per minute. Checked at MAIL FROM. Over the
+  limit: `450 4.7.1 Rate limit exceeded, try again later`, state stays
+  WantMail, and the log gets info `Message rate limit reached for user
+  <username> from <client>`. Buckets are kept in a map that is pruned of
+  entries idle for more than ten minutes, on a timer. The username is the
+  one the client claimed at AUTH, which the API has not yet verified; the
+  limit therefore bounds API calls per claimed identity, not per client.
+- `--max_recipients`: number of RCPT entries per transaction, counted
+  including repeats. The RCPT that would exceed it gets
+  `452 4.5.3 Too many recipients` and is not recorded; the transaction
+  stays valid with the recipients it has. RFC 5321 4.5.3.1.10 requires a
+  minimum of 100, and the default of 1000 matches Postfix.
+
+A value of 0 for any limit means unlimited.
 
 ## 10. Packaging
 
@@ -463,7 +551,11 @@ upstream acceptance text, api from injection, api log redaction, smtplog
 redaction, starttls failure, raw client settle, end-to-end (simple, denied,
 insert headers, relay error, transparency, change from, change headers,
 login auth, multi mail). Plus new: size cap with a small override,
-`--version`, and TLS 1.2 handshake.
+`--version`, TLS 1.2 handshake, upstream STARTTLS in each mode against a
+TLS-capable recording upstream (with a certificate check failure case),
+graceful drain (idle session gets 421, in-flight relay completes, timeout
+closes), both connection limits, the per-username message rate, and the
+recipient limit.
 
 Any test that streams large or unbounded input runs under
 `systemd-run --user --scope -p MemoryMax=2G`.
@@ -487,11 +579,19 @@ been trusted through a release.
 - TLS 1.0 and 1.1 are not offered.
 - A message larger than 1 GiB (configurable) is refused with 552.
 - Debug-level data dumps are JSON rather than Perl dumper output.
-- `--version` and `--max_message_size` are new flags.
+- The upstream session uses STARTTLS when the upstream offers it, with
+  certificate verification. An upstream with a self-signed certificate
+  needs `--upstream_tls_ca` or `--upstream_tls=off` to keep working.
+- Connection, per-IP, per-username message rate, and recipient limits are
+  on by default at 1000, 50, 60 per minute, and 1000.
+- SIGTERM drains sessions for up to 30 seconds instead of dropping them.
+- New flags: `--version`, `--max_message_size`, `--upstream_tls`,
+  `--upstream_tls_ca`, `--upstream_tls_insecure`, `--max_connections`,
+  `--max_connections_per_ip`, `--max_messages_per_minute`,
+  `--max_recipients`, `--drain_timeout`.
 
 ## 13. Out of scope
 
 - Any change to the API contract.
-- Graceful connection drain on shutdown.
-- TLS to the upstream server.
-- Rate limiting or connection limits.
+- Per-IP rate limiting (only counts and rates listed in 9.2 and 9.3).
+- Client certificate authentication in either direction.
