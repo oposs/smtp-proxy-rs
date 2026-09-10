@@ -283,6 +283,84 @@ async fn message_over_the_cap_is_refused_with_552() {
 }
 
 #[tokio::test]
+async fn a_command_line_that_never_ends_is_cut_off() {
+    let (mut c, _) = open_session().await;
+    // 64 KiB is the command buffer, so the server must consume every one of
+    // these 65537 bytes before it can decide the line is too long. Sending
+    // no more than that keeps the socket clean: nothing is left unread when
+    // the server closes, so the 500 cannot be lost to a reset.
+    c.write_raw(&"x".repeat(64 * 1024)).await;
+    c.write_raw("y").await;
+    assert_eq!(c.read_reply().await, "500 Line too long\r\n");
+    assert!(c.expect_close().await);
+}
+
+#[tokio::test]
+async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
+    let factory = ScriptedFactory::default();
+    let mut config = server_config(false, false);
+    config.max_message_size = 64;
+    let addr = start_server(config, factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // 256 KiB of body in a single line with no newline anywhere. The cap is
+    // 64 bytes, so the server has to throw these away as they arrive instead
+    // of buffering them while it waits for the end of the line.
+    for _ in 0..4 {
+        c.write_raw(&"y".repeat(64 * 1024)).await;
+    }
+    c.write_raw("\r\n.\r\n").await;
+    assert_eq!(
+        c.read_reply().await,
+        "552 Message exceeds maximum size of 64 bytes\r\n"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+    // The connection survives and the next transaction works.
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+}
+
+#[tokio::test]
+async fn a_discarded_data_line_tail_is_not_mistaken_for_the_terminator() {
+    let factory = ScriptedFactory::default();
+    let mut config = server_config(false, false);
+    config.max_message_size = 64;
+    let addr = start_server(config, factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    // The header block leaves 52 of the 64 bytes unspent, so the very next
+    // 53 bytes without a newline are what tips the message over the cap.
+    // Each sleep lets the server consume what was sent and go back to
+    // waiting with an empty buffer, which fixes where the discard falls.
+    c.write_raw("Subject: x\r\n\r\n").await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    c.write_raw(&"y".repeat(53)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The rest of that same body line now happens to be a lone dot. It ends
+    // the line, but the line began 53 bytes ago, so this is not a dot on a
+    // line of its own and must not end the message. Reading it as the
+    // terminator would reply 552 here and leave the rest of the body to be
+    // parsed as commands.
+    c.write_raw(".\r\n").await;
+    c.write_raw("still inside the message\r\n").await;
+    c.write_raw(".\r\n").await;
+    assert_eq!(
+        c.read_reply().await,
+        "552 Message exceeds maximum size of 64 bytes\r\n"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+    // Nothing from the message body was taken for a command.
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+}
+
+#[tokio::test]
 async fn a_client_leaving_during_a_slow_message_does_not_stop_the_server() {
     let factory = ScriptedFactory::default();
     factory.set(|s| s.message_delay = std::time::Duration::from_millis(300));

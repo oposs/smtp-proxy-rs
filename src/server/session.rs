@@ -24,6 +24,34 @@ type Stream = Pin<Box<dyn AsyncReadWrite>>;
 trait AsyncReadWrite: AsyncRead + AsyncWrite + Send {}
 impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
 
+/// How many bytes of an unterminated command line the reader will hold
+/// before it gives up on ever finding the end of it. RFC 5321 4.5.3.1.4
+/// caps a command line at 512 octets, so this is generous; its job is only
+/// to keep a client that never sends a newline from filling memory.
+const MAX_COMMAND_BUFFER: usize = 64 * 1024;
+
+/// What one read attempt produced.
+enum Line {
+    Got(Vec<u8>),
+    /// The client closed its side.
+    Eof,
+    /// The budget ran out before a newline arrived. Nothing is consumed;
+    /// the caller decides what to do with what is buffered.
+    TooLong,
+}
+
+/// A client that simply went away. Routine, so it is logged once at info and
+/// never as an error: only a genuinely unexpected I/O failure is an error.
+fn is_hangup(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        BrokenPipe, ConnectionAborted, ConnectionReset, NotConnected, UnexpectedEof,
+    };
+    matches!(
+        e.kind(),
+        UnexpectedEof | BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected
+    )
+}
+
 /// Spec 4.1. The order matters: `state >= WantMail` is what "a transaction
 /// may be running, and the session is past authentication" means, so the
 /// derived `Ord` carries part of the protocol.
@@ -47,12 +75,25 @@ enum End {
     Io(std::io::Error),
     Timeout,
     TlsFailed,
+    /// Ended deliberately, with the reason already logged.
+    Closed,
 }
 
 enum Flow {
     Continue,
     Quit,
     TlsFailed,
+    /// Stop serving this connection; the reason has already been logged.
+    Close,
+}
+
+/// What one SASL continuation line produced.
+enum AuthLine {
+    Token(String),
+    /// A `500 confused authentication response` went out; the session lives on.
+    Confused,
+    /// The connection is finished and the reason is already logged.
+    Closed,
 }
 
 struct Session<H> {
@@ -84,8 +125,9 @@ pub async fn run<H: Handler>(
         handler,
     };
     match s.serve().await {
-        End::Quit | End::Eof | End::TlsFailed => {}
+        End::Quit | End::Eof | End::TlsFailed | End::Closed => {}
         End::Timeout => tracing::error!("Timeout on stream for {}", s.client),
+        End::Io(e) if is_hangup(&e) => info!("Client {} hung up: {e}", s.client),
         End::Io(e) => tracing::error!("Error on stream for {}: {e}", s.client),
     }
 }
@@ -100,9 +142,13 @@ impl<H: Handler> Session<H> {
             return End::Io(e);
         }
         loop {
-            let line = match self.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) => return End::Eof,
+            let line = match self.next_line(MAX_COMMAND_BUFFER).await {
+                Ok(Line::Got(line)) => line,
+                Ok(Line::Eof) => return End::Eof,
+                Ok(Line::TooLong) => {
+                    self.refuse_long_line().await;
+                    return End::Closed;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return End::Timeout,
                 Err(e) => return End::Io(e),
             };
@@ -125,18 +171,27 @@ impl<H: Handler> Session<H> {
                 Ok(Flow::Continue) => {}
                 Ok(Flow::Quit) => return End::Quit,
                 Ok(Flow::TlsFailed) => return End::TlsFailed,
+                Ok(Flow::Close) => return End::Closed,
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return End::Timeout,
                 Err(e) => return End::Io(e),
             }
         }
     }
 
-    /// One line including its terminator; None at EOF. After TLS, an idle
-    /// connection times out; before TLS it does not, as in the Perl.
-    async fn next_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    /// One line including its terminator. After TLS, an idle connection
+    /// times out; before TLS it does not, as in the Perl.
+    ///
+    /// `max_incomplete` bounds the bytes held while no newline has arrived.
+    /// Without it a client that sends bytes and never a newline grows the
+    /// buffer without limit: `DataReader` cannot help, because `push_line`
+    /// only ever sees lines that are already complete.
+    async fn next_line(&mut self, max_incomplete: usize) -> std::io::Result<Line> {
         loop {
             if let Some(line) = take_line(&mut self.buf) {
-                return Ok(Some(line));
+                return Ok(Line::Got(line));
+            }
+            if self.buf.len() > max_incomplete {
+                return Ok(Line::TooLong);
             }
             let mut chunk = [0u8; 8192];
             let n = if self.tls_active {
@@ -158,10 +213,18 @@ impl<H: Handler> Session<H> {
                 self.stream.read(&mut chunk).await?
             };
             if n == 0 {
-                return Ok(None);
+                return Ok(Line::Eof);
             }
             self.buf.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    /// A command line with no end in sight: say so once and close, because
+    /// there is no way to resynchronise on a command boundary that the
+    /// client never sends.
+    async fn refuse_long_line(&mut self) {
+        info!("Line too long from {}", self.client);
+        let _ = self.send(Reply::new(500, "Line too long")).await;
     }
 
     async fn send(&mut self, reply: Reply) -> std::io::Result<()> {
@@ -321,8 +384,9 @@ impl<H: Handler> Session<H> {
                         None => {
                             self.send(Reply::new(334, "")).await?;
                             match self.auth_continuation().await? {
-                                Some(t) => t,
-                                None => return Ok(Flow::Continue),
+                                AuthLine::Token(t) => t,
+                                AuthLine::Confused => return Ok(Flow::Continue),
+                                AuthLine::Closed => return Ok(Flow::Close),
                             }
                         }
                     };
@@ -332,12 +396,16 @@ impl<H: Handler> Session<H> {
                 "LOGIN" => {
                     debug!("Processing AUTH LOGIN for {}", self.client);
                     self.send(Reply::new(334, USERNAME_CHALLENGE)).await?;
-                    let Some(user) = self.auth_continuation().await? else {
-                        return Ok(Flow::Continue);
+                    let user = match self.auth_continuation().await? {
+                        AuthLine::Token(t) => t,
+                        AuthLine::Confused => return Ok(Flow::Continue),
+                        AuthLine::Closed => return Ok(Flow::Close),
                     };
                     self.send(Reply::new(334, PASSWORD_CHALLENGE)).await?;
-                    let Some(pass) = self.auth_continuation().await? else {
-                        return Ok(Flow::Continue);
+                    let pass = match self.auth_continuation().await? {
+                        AuthLine::Token(t) => t,
+                        AuthLine::Confused => return Ok(Flow::Continue),
+                        AuthLine::Closed => return Ok(Flow::Close),
                     };
                     debug!("Received AUTH LOGIN password for {}", self.client);
                     let creds = decode_login(&user, &pass);
@@ -363,17 +431,22 @@ impl<H: Handler> Session<H> {
         }
     }
 
-    /// One SASL continuation line. None means a 500 was already sent.
+    /// One SASL continuation line.
     /// Spec 4.5: a continuation line that carries a line break before its
     /// end is answered `500 confused authentication response`. An empty line
     /// is the degenerate case of that, and an embedded CR or LF the general
     /// one; neither can be a base64 token.
-    async fn auth_continuation(&mut self) -> std::io::Result<Option<String>> {
-        let Some(line) = self.next_line().await? else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "eof in AUTH",
-            ));
+    async fn auth_continuation(&mut self) -> std::io::Result<AuthLine> {
+        let line = match self.next_line(MAX_COMMAND_BUFFER).await? {
+            Line::Got(line) => line,
+            Line::Eof => {
+                info!("Client {} hung up during authentication", self.client);
+                return Ok(AuthLine::Closed);
+            }
+            Line::TooLong => {
+                self.refuse_long_line().await;
+                return Ok(AuthLine::Closed);
+            }
         };
         let raw = String::from_utf8_lossy(&line).into_owned();
         let text = raw
@@ -387,9 +460,9 @@ impl<H: Handler> Session<H> {
         if text.is_empty() || text.contains(['\r', '\n']) {
             self.send(Reply::new(500, "confused authentication response"))
                 .await?;
-            return Ok(None);
+            return Ok(AuthLine::Confused);
         }
-        Ok(Some(text))
+        Ok(AuthLine::Token(text))
     }
 
     async fn finish_auth(
@@ -484,13 +557,37 @@ impl<H: Handler> Session<H> {
         let mut headers_error: Option<String> = None;
         let mut logged_mb = 0usize;
         let mut received = 0usize;
+        // Set when an unterminated line was thrown away mid-flight: the rest
+        // of that line is still to come, and must not be read as a line of
+        // its own -- a tail that happened to be `.` would end DATA early and
+        // leave the remaining body to be parsed as commands.
+        let mut discarding_line_tail = false;
         let outcome: Result<String, (u16, String)> = loop {
-            let Some(line) = self.next_line().await? else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "eof in DATA",
-                ));
+            // An incomplete line counts against the cap like any other bytes.
+            // Once the reader is already discarding, the cap has nothing left
+            // to say and a plain byte bound keeps the drain bounded.
+            let budget = reader.remaining_capacity().unwrap_or(MAX_COMMAND_BUFFER);
+            let line = match self.next_line(budget).await? {
+                Line::Got(line) => line,
+                Line::Eof => {
+                    info!("Client {} hung up during DATA", self.client);
+                    return Ok(Flow::Close);
+                }
+                Line::TooLong => {
+                    debug!(
+                        "Message from {} crossed the size cap inside an unterminated line",
+                        self.client
+                    );
+                    reader.mark_too_large();
+                    self.buf.clear();
+                    discarding_line_tail = true;
+                    continue;
+                }
             };
+            if discarding_line_tail {
+                discarding_line_tail = false;
+                continue;
+            }
             received += line.len();
             if received / 1_000_000 > logged_mb {
                 logged_mb = received / 1_000_000;
@@ -539,11 +636,16 @@ impl<H: Handler> Session<H> {
             Ok(message) => {
                 debug!("Accepted DATA for {} {message}", self.client);
                 if let Err(e) = self.send(Reply::new(250, format!("OK: {message}"))).await {
+                    if !is_hangup(&e) {
+                        return Err(e);
+                    }
+                    // Spec 4.7: the reply is dropped and logged at info, as
+                    // the Perl does. A client that hung up is not an error.
                     info!(
                         "Client {} left before the message could be accepted: {message}",
                         self.client
                     );
-                    return Err(e);
+                    return Ok(Flow::Close);
                 }
             }
             Err((code, text)) => {
@@ -552,11 +654,14 @@ impl<H: Handler> Session<H> {
                     self.start_transaction();
                 }
                 if let Err(e) = self.send(Reply::new(code, text.clone())).await {
+                    if !is_hangup(&e) {
+                        return Err(e);
+                    }
                     info!(
                         "Client {} left before the rejection could be sent: {text}",
                         self.client
                     );
-                    return Err(e);
+                    return Ok(Flow::Close);
                 }
             }
         }

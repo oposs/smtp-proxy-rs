@@ -66,6 +66,28 @@ impl DataReader {
         None
     }
 
+    /// Bytes still allowed before the cap is crossed, or `None` once it has
+    /// been crossed and the reader is discarding. A caller reading from a
+    /// socket uses this to bound an incomplete line: those bytes count
+    /// against the cap too, but `push_line` never gets to see them.
+    pub fn remaining_capacity(&self) -> Option<usize> {
+        if self.too_large {
+            None
+        } else {
+            Some(self.max_size.saturating_sub(self.size))
+        }
+    }
+
+    /// Enters discard mode without a complete line, for a caller that has
+    /// watched the cap being crossed by bytes it is still buffering.
+    /// Everything accumulated so far is dropped and the next terminator
+    /// reports `TooLarge`, exactly as if a complete line had crossed it.
+    pub fn mark_too_large(&mut self) {
+        self.too_large = true;
+        self.headers.clear();
+        self.body.clear();
+    }
+
     /// The header block, if the terminator arrived before any empty line.
     pub fn take_pending_headers(&mut self) -> Option<String> {
         if self.headers_done {
@@ -143,6 +165,32 @@ mod tests {
         assert!(matches!(&events[0], DataEvent::HeadersComplete(_)));
         assert!(matches!(&events[1], DataEvent::TooLarge));
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn remaining_capacity_shrinks_with_the_counted_bytes() {
+        let mut r = DataReader::new(20);
+        assert_eq!(r.remaining_capacity(), Some(20));
+        feed(&mut r, "A: 1\r\n");
+        assert_eq!(r.remaining_capacity(), Some(14));
+        // The blank line that ends the headers is not counted. Dot stuffing
+        // is undone first, so "..x\r\n" costs the 4 bytes of ".x\r\n".
+        feed(&mut r, "\r\n..x\r\n");
+        assert_eq!(r.remaining_capacity(), Some(10));
+    }
+
+    #[test]
+    fn mark_too_large_discards_and_reports_at_the_terminator() {
+        let mut r = DataReader::new(1000);
+        feed(&mut r, "A: 1\r\n\r\nbody\r\n");
+        r.mark_too_large();
+        // No capacity is left to report once the reader is discarding.
+        assert_eq!(r.remaining_capacity(), None);
+        // Lines still arrive and are still thrown away.
+        assert!(r.push_line(b"more body\r\n").is_none());
+        let events = feed(&mut r, ".\r\n");
+        assert!(matches!(&events[0], DataEvent::TooLarge));
+        assert_eq!(events.len(), 1);
     }
 
     #[test]
