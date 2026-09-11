@@ -4,6 +4,10 @@
 //! `stale-transaction.t` and `raw-client-settle.t`.
 mod common;
 
+use std::sync::{Arc, Mutex, OnceLock};
+
+use tracing_subscriber::prelude::*;
+
 use common::fake_api::FakeApi;
 use common::raw_client::RawClient;
 use common::upstream::RecordingUpstream;
@@ -19,7 +23,50 @@ struct Rig {
     addr: std::net::SocketAddr,
 }
 
+/// Every line the binary logs, in the real Mojo format, so that a test can
+/// assert on the `[cid]` bracket of spec 8.1.
+///
+/// It has to be a *global* subscriber installed before any server starts, not
+/// a per-test `set_default`: `tracing` caches each callsite's interest process
+/// wide, so once a test without a subscriber has evaluated the `conn` span
+/// callsite in `listener.rs`, that span stays disabled for every later test on
+/// every thread, and no connection gets a cid at all. Installing it from
+/// `rig()` means the first test to build a rig installs it, and
+/// `set_global_default` rebuilds the interest cache as it goes.
+fn captured_log() -> &'static Mutex<Vec<u8>> {
+    static LOG: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let sink = buffer.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(smtp_proxy::logging::MojoFormat)
+                .with_writer(move || Capture(sink.clone()))
+                .with_filter(tracing::level_filters::LevelFilter::DEBUG),
+        );
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("nothing else installs a subscriber in this binary");
+        buffer
+    })
+}
+
+/// Collects formatted log lines for [`captured_log`]. One `write_all` per
+/// event, so lines from tests running in parallel interleave but never split.
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 async fn rig(upstream_extensions: &[&str]) -> Rig {
+    captured_log();
     let api = FakeApi::start().await;
     let upstream = RecordingUpstream::start(upstream_extensions).await;
     let factory = ProxyFactory::new(ProxyConfig {
@@ -368,19 +415,77 @@ async fn dsn_follows_the_upstream() {
     assert!(c.command("EHLO again").await.contains("DSN"));
 }
 
+/// Long enough to be unmistakably a wait, short enough to stay far below the
+/// rig's 5 s relay timeout and the raw client's 30 s reply timeout.
+const RELAY_STALL: std::time::Duration = std::time::Duration::from_millis(300);
+
 #[tokio::test]
 async fn slow_relay_reply_stays_in_its_transaction() {
     // The reply to DATA is awaited before the next command is read, so a
     // pipelined RSET after the terminator is answered after the 250.
     let r = rig(&["DSN"]).await;
+    // The upstream stops reading right after its 354, so the relay -- and
+    // with it the client's 250 -- is held up for as long as the stall lasts.
+    // Meanwhile the RSET and the second MAIL are already sitting in the
+    // session's socket, which is the window this test is about.
+    r.upstream.stall_data(RELAY_STALL);
     let (mut c, _) = RawClient::connect(r.addr).await;
     c.login("user", "pass").await;
     assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<x@y.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
+    let started = std::time::Instant::now();
     c.write_raw(&format!("{MESSAGE}.\r\nRSET\r\nMAIL FROM:<b@c.com>\r\n"))
         .await;
     assert!(c.read_reply().await.starts_with("250 OK: "));
+    let waited = started.elapsed();
+    assert!(
+        waited >= RELAY_STALL,
+        "the relay was not actually slow: {waited:?}"
+    );
     assert_eq!(c.read_reply().await, "250 OK\r\n");
     assert_eq!(c.read_reply().await, "250 OK\r\n");
+}
+
+/// The `[cid]` of a main-log line (spec 8.1
+/// `[ts] [pid] [level] [cid] message`), or None when the line carries no
+/// span and so no bracket.
+fn cid_of(line: &str) -> Option<&str> {
+    let mut rest = line;
+    for _ in 0..3 {
+        rest = rest.strip_prefix('[')?.split_once("] ")?.1;
+    }
+    let id = rest.strip_prefix('[')?.split_once(']')?.0;
+    (id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())).then_some(id)
+}
+
+#[tokio::test]
+async fn the_api_debug_dump_carries_the_connection_id() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .fail_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    // Unique to this test, so its dump can be picked out of the shared log.
+    let from = "cid-probe@foobar.com";
+    let reply = send_mail(&mut c, from, &["receiver@foobaz.com"], MESSAGE).await;
+    assert_eq!(reply, "550 authentication service failed\r\n");
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    // Spec 5.3: a failing call dumps the request with the password redacted.
+    let dumps: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("\"password\":\"*******\"") && l.contains(from))
+        .collect();
+    assert_eq!(dumps.len(), 1, "expected one redacted dump in:\n{text}");
+    // Spec 8.1: and it carries the connection id, even though `ApiClient`
+    // writes it from a task the handler spawned.
+    let cid = cid_of(dumps[0]).unwrap_or_else(|| panic!("no [cid] on: {}", dumps[0]));
+    // It is this connection's id, not merely a well-formed one: the line the
+    // handler logged just before spawning the call carries the same one.
+    assert!(
+        text.lines()
+            .any(|l| cid_of(l) == Some(cid) && l.contains("Making call to auth/headers API")),
+        "no matching handler line for [{cid}] in:\n{text}"
+    );
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::api::{
     ApiClient, ApiError, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
@@ -261,7 +261,14 @@ impl Handler for ProxyHandler {
         debug!("Making call to auth/headers API");
         let api = self.factory.config.api.clone();
         let request = self.check_request();
-        self.transaction.api_call = Some(tokio::spawn(async move { api.check(&request).await }));
+        // `tokio::spawn` starts a task with no span of its own, so without
+        // this the spec 5.3 redacted-request dump that `ApiClient::check`
+        // writes on a failure would come out with no `[cid]` bracket at all
+        // (spec 8.1) -- on the one line an operator reads to find out why a
+        // customer's mail was refused.
+        self.transaction.api_call = Some(tokio::spawn(
+            async move { api.check(&request).await }.in_current_span(),
+        ));
         Ok(())
     }
 
