@@ -251,7 +251,9 @@ impl ProxyHandler {
                 // The Perl dumps the API result next to the mail: it is what
                 // says whether the refused message carried injected headers
                 // or a substituted sender.
-                debug!("ApiResult {outcome:?}");
+                // JSON like the line above it, because README promises that
+                // every debug dump on this branch is JSON.
+                debug!("ApiResult {}", outcome.json());
                 Err(e.to_string())
             }
         }

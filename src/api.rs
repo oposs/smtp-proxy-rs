@@ -79,7 +79,9 @@ impl CheckRequest {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// `Serialize` is here for the debug dump only; nothing ever sends this
+/// back to the API.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CheckResponse {
     pub allow: bool,
     #[serde(default)]
@@ -90,6 +92,21 @@ pub struct CheckResponse {
     pub from: Option<String>,
     #[serde(default, rename = "authId")]
     pub auth_id: Option<String>,
+}
+
+impl CheckResponse {
+    /// The answer as JSON, for the dump on the relay-failure path. Unlike
+    /// [`CheckRequest::redacted_json`] there is nothing to redact: the
+    /// response carries no credential, and `authId` is the token name that
+    /// both this proxy and the Perl already write to the main log at info
+    /// on every relayed mail (`SMTPProxy.pm:310`). The Perl's counterpart
+    /// dumps the decoded response whole (`SMTPProxy.pm:299`), so the
+    /// content matches -- except that a field the API sent and this struct
+    /// does not model is absent here, and one it omitted appears with its
+    /// default.
+    pub fn json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +222,26 @@ mod tests {
         let json = request().redacted_json();
         assert!(json.contains("\"password\":\"*******\""), "{json}");
         assert!(!json.contains("secret"));
+    }
+
+    /// The relay-failure dump is JSON, as README promises of every debug
+    /// dump, and it carries the API's own field names.
+    #[test]
+    fn response_json_is_the_dump_format() {
+        let response = CheckResponse {
+            allow: true,
+            reason: None,
+            headers: vec![ResponseHeader {
+                name: "X".into(),
+                value: Some("1".into()),
+            }],
+            from: Some("o@b.com".into()),
+            auth_id: Some("tok".into()),
+        };
+        assert_eq!(
+            response.json(),
+            r#"{"allow":true,"reason":null,"headers":[{"name":"X","value":"1"}],"from":"o@b.com","authId":"tok"}"#
+        );
     }
 
     #[test]

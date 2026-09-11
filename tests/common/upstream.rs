@@ -219,7 +219,10 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
             Ok(_) => {}
         }
         if in_data {
-            if raw == b".\r\n" || raw == b".\n" {
+            // CRLF only. A fake that ended on `.\n` as well would accept a
+            // relay that had stopped normalising its line endings, which is
+            // the very defect this byte-exact recording exists to catch.
+            if raw == b".\r\n" {
                 in_data = false;
                 since_pause = 0;
                 pauses_done = 0;
