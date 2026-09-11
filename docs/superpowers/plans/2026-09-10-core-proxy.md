@@ -19,7 +19,7 @@
 - Never more than 4 parallel jobs: `.cargo/config.toml` sets `jobs = 4` and `RUST_TEST_THREADS=4`. Run every cargo command with `timeout: 600000`.
 - Any test feeding large or unbounded input runs under `systemd-run --user --scope -p MemoryMax=2G -- cargo test ...`.
 - Comments, identifiers, and docs in English.
-- Commit after every task with the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+- Commit after every task with a `Co-Authored-By:` trailer naming the model that actually authored the commit (e.g. `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`).
 - Rust 2024 edition, `cargo clippy --all-targets -- -D warnings` clean and `cargo fmt --check` clean before every commit.
 
 ---

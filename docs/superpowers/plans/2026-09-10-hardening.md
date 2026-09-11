@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-Same as part 1: verbatim reply texts, 4 jobs max, `timeout: 600000` on cargo commands, memory cap on unbounded-input tests, English identifiers, commit per task with the `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` trailer, clippy and fmt clean.
+Same as part 1: verbatim reply texts, 4 jobs max, `timeout: 600000` on cargo commands, memory cap on unbounded-input tests, English identifiers, commit per task with a `Co-Authored-By:` trailer naming the model that actually authored the commit, clippy and fmt clean.
 
 New reply texts (verbatim): `421 smtp-proxy Service not available, closing transmission channel`, `421 smtp-proxy Too many connections, try again later`, `450 4.7.1 Rate limit exceeded, try again later`, `452 4.5.3 Too many recipients`.
 
