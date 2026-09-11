@@ -2,6 +2,7 @@
 //! different subset, so the module as a whole is exempt from dead-code
 //! warnings.
 #![allow(dead_code)]
+pub mod certs;
 pub mod fake_api;
 pub mod fake_handler;
 pub mod raw_client;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use smtp_proxy::server::{HandlerFactory, ServerConfig};
 
 pub fn test_tls() -> Arc<rustls::ServerConfig> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs");
+    let dir = certs::dir();
     ServerConfig::load_tls(&dir.join("server.crt"), &dir.join("server.key")).unwrap()
 }
 
