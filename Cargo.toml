@@ -1,0 +1,46 @@
+[package]
+name = "smtp-proxy"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "SMTP authentication and header injection proxy"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/oposs/smtp-proxy-rs"
+
+[[bin]]
+name = "smtp-proxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal", "fs"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = { version = "1.15", features = ["std"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "http2", "charset"] }
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
+nix = { version = "0.31", features = ["user", "hostname"] }
+anyhow = "1"
+thiserror = "2"
+base64 = "0.23"
+memchr = "2"
+jiff = "0.2"
+rand = "0.10"
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

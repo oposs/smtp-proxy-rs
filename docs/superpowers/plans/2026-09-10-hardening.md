@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-Same as part 1: verbatim reply texts, 4 jobs max, `timeout: 600000` on cargo commands, memory cap on unbounded-input tests, English identifiers, commit per task with the `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` trailer, clippy and fmt clean.
+Same as part 1: verbatim reply texts, 4 jobs max, `timeout: 600000` on cargo commands, memory cap on unbounded-input tests, English identifiers, commit per task with a `Co-Authored-By:` trailer naming the model that actually authored the commit, clippy and fmt clean.
 
 New reply texts (verbatim): `421 smtp-proxy Service not available, closing transmission channel`, `421 smtp-proxy Too many connections, try again later`, `450 4.7.1 Rate limit exceeded, try again later`, `452 4.5.3 Too many recipients`.
 
@@ -801,3 +801,72 @@ git add -A && git commit -m "Perl conformance gate running the original end-to-e
 | 10 deb, release, Makefile | 20 |
 | 11.3 conformance gate | 21 |
 | 12 known differences documented | README in Task 20 |
+
+## Carried over from part 1 — items this plan does not currently cover
+
+Raised during part 1's execution and its final whole-branch review, and ruled
+into part 2 rather than fixed on that branch. Each says why it was deferred and
+what it costs. Items 1, 3, 4 and 5 are security-relevant; none is a regression,
+because the Perl behaves the same way in every case.
+
+1. **Bound the upstream `read_reply`** (`src/relay.rs`). Unbounded today, as in
+   the Perl. A hostile or compromised upstream can feed an endless reply and
+   exhaust memory. Tasks 16-21 do not touch it.
+2. **Case-insensitive header merge** (`src/proxy.rs`). Matches the Perl; RFC 5322
+   says otherwise. Both implementations emit a duplicate header when the API
+   varies the casing.
+3. **Bare-LF header blocks reach the API as one opaque header** (both
+   implementations), so API-side header policy can be evaded by sending bare LF
+   instead of CRLF. Not a regression; worth a decision.
+4. **Supplementary groups survive the privilege drop** (`src/privdrop.rs`). No
+   `setgroups` before `setuid`, so a proxy started as root keeps root's
+   supplementary groups. Matches the Perl (`SMTPProxy.pm:212-217`), so not a
+   regression, but a real privilege-retention weakness in both.
+5. **An API-supplied header value containing CRLF is relayed unchecked**
+   (`src/proxy.rs`, `format_message`). A value carrying `\r\n\r\n` splits the
+   relayed message and forges a body. The Perl does the same
+   (`SMTPProxy.pm:252-253`), the envelope addresses *are* guarded
+   (`assert_relayable`), and the API is the operator's own service — so it is
+   neither a regression nor a client-facing hole. A `value.contains(['\r','\n'])`
+   refusal costs nothing; it was not applied in part 1 only because it would
+   diverge from the Perl on wire output in a drop-in release.
+
+### Known divergences for Task 21's conformance gate
+
+These are deliberate. The gate will report them; they are not defects.
+
+- **Exit codes.** The Perl does missing-mandatory → 2 on stderr and `--help` → 1
+  on stdout (`pod2usage()` vs `pod2usage(1)`, measured). Ours does
+  missing-mandatory → 1 on stderr and `--help`/`--man`/`--version` → 0, per spec
+  section 7 and because a `--help` that exits non-zero breaks scripts.
+- **`MAIL FROM` fallback on `"0"`.** The Perl's `$apiResult->{from} || $mail{from}`
+  is a truthiness test, so the API returning the string `"0"` also falls back to
+  the client's sender. We fall back only on an empty string.
+- **Pipelined AUTH continuation.** The Perl answers `500 confused authentication
+  response` and leaves its data eater installed — a Perl bug. We accept the line.
+  RFC 4954 forbids the pipelining, so no real client reaches this.
+- **`QUIT 0`.** The Perl's `if ($arguments)` truthiness test wrongly let the
+  single argument `0` through as no argument. We answer 501. Ours is correct.
+- **`500 Line too long`.** A reply the Perl never sends, reachable at the 64 KiB
+  command-line cap. Documented in the README's differences list.
+- **Three log-wording drifts** (`src/server/session.rs`, `src/smtplog.rs`): the
+  `received <N> MB data` line counts cumulative receipt where the Perl counted
+  pending buffer past 1 MB; the Perl's debug line carrying the *decoded* AUTH
+  LOGIN username is deliberately omitted; and redaction rejoins with a single
+  space where the Perl preserved the original whitespace run.
+
+### Test-suite notes for Tasks 20-21 (CI)
+
+- The part-1 timing tests in `tests/relay.rs` were made host-independent before
+  part 1 closed: `Upstream` is generic over `AsyncRead + AsyncWrite` and they run
+  over `tokio::io::duplex`, so their margins are arithmetic rather than a
+  function of the host's TCP buffers. Keep them that way — the earlier
+  socket-based versions went *vacuous* rather than flaky on a fast host, passing
+  while measuring the wrong thing.
+- `RecordingUpstream` ends DATA on `.\r\n` only, and records raw bytes. Both are
+  deliberate: a lenient fake hid a real wire-format bug (the missing line-ending
+  normalisation) for fifteen tasks. Do not relax either to make a test green.
+- This host's `registries.conf` has no `unqualified-search-registries`, so
+  `podman build` cannot resolve the bare name `rust:1-alpine` without a prior
+  pull and local tag. The unqualified `FROM` is faithful to the Perl's own
+  `FROM alpine:3.15` — the CI file may need a fully-qualified name instead.
