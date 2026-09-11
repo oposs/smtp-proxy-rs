@@ -1,3 +1,4 @@
 /target
 *~
 /.superpowers/
+/*.test-output.txt

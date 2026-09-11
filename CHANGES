@@ -1,0 +1,134 @@
+1.0.0 2026-09-10 Tobias Oetiker <tobi@oetiker.ch>
+
+ - complete rewrite in Rust; a drop-in replacement for smtpproxy.pl 0.8.0:
+   same flags, same API JSON, same SMTP replies, same log formats
+ - TLS 1.0 and 1.1 are no longer offered (rustls)
+ - new: --max_message_size, default 1 GiB; a larger message is answered 552
+ - new: --version
+ - debug-level data dumps are JSON instead of Perl dumper output
+
+0.8.0 2026-09-10 14:24:32 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - SMTP protocol conformance against the RFC 5321 4.5.1 minimum
+   implementation. Reply codes a client can see have changed: HELO and NOOP
+   are answered 250 rather than 502, NOOP takes the argument RFC 5321 4.1.1.9
+   allows, PING is no longer a command and draws 502 rather than 503, and
+   EHLO or HELO is now accepted at any point in a session and resets the
+   transaction as RSET does (RFC 5321 4.1.4)
+ - EHLO and HELO without a domain, and VRFY without a string, are now
+   answered 501 rather than accepted
+ - the MAIL FROM and RCPT TO keywords, and the AUTH verb and mechanism name,
+   are matched without regard to case; an AUTH mechanism containing a hyphen
+   is answered 504 rather than 501
+ - MAIL FROM:<> is accepted, so a bounce or a DSN can be relayed
+ - a group of commands sent in one write is processed in order, one at a time
+ - DSN is announced, and the RFC 3461 parameters (RET, ENVID, NOTIFY, ORCPT)
+   are relayed, only when the upstream server announces DSN itself. The proxy
+   asks it once at startup and keeps the answer current from every mail it
+   relays. The parameters are validated where they are given: a malformed one
+   is answered 501 at the MAIL or RCPT that carried it
+ - the upstream's acceptance text, which is its queue id, is relayed to the
+   submitting client instead of an empty one
+ - the API request carries two new fields, mailParameters and rcptParameters;
+   see README.md
+ - the submitting user's password is no longer written to the main log when
+   the API answers with anything other than a 2xx
+
+0.7.7 2023-07-21 14:34:38 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - further improve failure handling for connection problems with
+   credmgr during auth phase
+
+0.7.6 2023-07-12 17:24:04 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - raise credmgr timeout to 60 seconds
+ - better handling of lost connections
+
+0.7.5 2023-06-19 17:20:21 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - add catch rule to STARTTLS upgrade promise
+
+0.7.4 2023-05-09 16:32:42 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - even more logging. log body size and body transfer
+
+0.7.3 2023-05-02 17:00:36 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - actively close connection on QUIT
+ - even more logging
+
+0.7.2 2023-04-24 17:00:42 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - more logging for failure cases
+ - increase stream timeout to 300s (from 15s)
+
+0.7.1 2022-11-23 14:04:16 +0100 Tobias Oetiker <tobi@oetiker.ch>
+
+ - actually enable libev event loop
+
+0.7.0 2022-11-19 00:06:36 +0100 Tobias Oetiker <tobi@oetiker.ch>
+
+ - added EV eventloop for better performance
+ - SP-1 properly release connection after connection end
+ - SP-2 log connection id, add more logging
+
+0.6.8 2022-08-29 11:24:26 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - after forwarding a message, report the upstream server response
+
+0.6.7 2022-08-29 10:48:52 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - added test to verify that the fix in 0.6.6 actually works
+   it works ... 
+
+0.6.6 2022-08-29 10:01:09 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - SECURITY! SMTP-Proxy did NOT clear the recipients list when
+   several mails were sent over the same connection. So successive
+   mails were sent to all previous recipients in mails submitted
+   in the previous connection
+
+0.6.5 2022-05-17 14:04:58 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - log more detail with authentication fails
+
+0.6.4 2022-05-17 11:54:21 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - initial log must happen AFTER privilege drop
+
+0.6.3 2022-05-17 11:40:28 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - update useragent implementation to be in sync with latest mojo recommentation
+
+0.6.2 2022-05-16 16:10:21 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - fix 0.6.0 regression ... return should return the rejection!
+
+0.6.1 2022-05-12 15:23:55 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - AUTH LOGIN should be Username: and Password: both with a colon at the end.
+
+0.6.0 2021-04-06 Fritz Zaucker <fritz.zaucker@oetiker.ch>
+
+ - updated build environment
+ - fixed tests
+ - write $apiResult->{authId} to log file on successful mail relay
+ - fix some documentation typos
+
+0.5.1 2019-06-04 12:10:28 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - update documentation
+
+0.5.0 2019-06-04 12:05:58 +0200 Tobias Oetiker <tobi@oetiker.ch>
+
+ - support --listen option instead of --listenhost and --listenport
+   --listen=ip:port can be used multiple times
+
+0.2.0 2018-06-14 Fritz Zaucker
+
+* first test version for HIN
+
+
+0.0.1 2018-05-29
+
+* initial version
