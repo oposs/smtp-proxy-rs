@@ -5,9 +5,12 @@ fn bin() -> Command {
     Command::cargo_bin("smtp-proxy").unwrap()
 }
 
+#[path = "common/certs.rs"]
+mod generated_certs;
+
 /// The flags a started proxy needs, minus whatever the test wants to vary.
 fn certs() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/certs")
+    generated_certs::dir().to_path_buf()
 }
 
 /// The upstream probe is spawned, not awaited (spec 6: it must not block
