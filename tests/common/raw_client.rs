@@ -97,17 +97,26 @@ impl RawClient {
         .expect("timed out waiting for a reply")
     }
 
-    /// Returns true if the server closed the connection without sending more.
+    /// Returns true if the server closed the connection, draining whatever
+    /// arrives first. tokio-rustls 0.26.5 does a "last-gasp write" that
+    /// flushes a fatal TLS alert before the handshake error reaches the
+    /// caller, so after a failed handshake the next read yields alert
+    /// bytes, not an immediate EOF. Demanding that the very first read be
+    /// zero-length would report a spurious failure; instead keep reading
+    /// (discarding whatever arrives) until EOF, a reset, or a timeout.
     pub async fn expect_close(&mut self) -> bool {
-        let mut chunk = [0u8; 64];
-        matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.stream.read(&mut chunk)
-            )
-            .await,
-            Ok(Ok(0))
-        )
+        let mut chunk = [0u8; 4096];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match self.stream.read(&mut chunk).await {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return true,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn auth_plain(&mut self, username: &str, password: &str) -> String {
@@ -127,9 +136,22 @@ impl RawClient {
     /// The TLS half of STARTTLS on its own, for tests that send the command
     /// by hand (pipelining a command behind it, for instance).
     pub async fn upgrade(&mut self) {
+        self.upgrade_with_versions(rustls::DEFAULT_VERSIONS).await;
+    }
+
+    /// Like `upgrade`, but restricted to TLS 1.2, to prove the server's
+    /// floor protocol version still handshakes (spec 11.2).
+    pub async fn upgrade_tls12(&mut self) {
+        self.upgrade_with_versions(&[&rustls::version::TLS12]).await;
+    }
+
+    async fn upgrade_with_versions(
+        &mut self,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) {
         let provider = rustls::crypto::aws_lc_rs::default_provider();
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(versions)
             .unwrap()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
