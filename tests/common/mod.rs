@@ -5,6 +5,7 @@
 pub mod fake_api;
 pub mod fake_handler;
 pub mod raw_client;
+pub mod upstream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
