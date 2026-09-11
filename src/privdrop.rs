@@ -11,3 +11,18 @@ pub fn drop_to(user: &str) -> anyhow::Result<()> {
     tracing::info!("Dropped privileges to user {user}");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unresolvable name fails before `setgid`/`setuid` are reached, so
+    /// this needs no root and changes nothing about the test process. The
+    /// successful drop is deliberately not tested: it is irreversible and
+    /// would poison every later test in the binary.
+    #[test]
+    fn unknown_user_is_reported_by_name() {
+        let e = drop_to("no-such-user-xyz").unwrap_err();
+        assert!(e.to_string().contains("Cannot resolve username"), "{e:#}");
+    }
+}

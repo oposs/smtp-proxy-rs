@@ -113,7 +113,9 @@ pub fn parse_listen(s: &str) -> anyhow::Result<SocketAddr> {
 }
 
 /// What `pod2usage` does for a bad command line: the complaint, the usage,
-/// and exit status 1.
+/// and exit status 1. Only for the checks this module makes by hand -- a
+/// clap error already renders its own usage, and passing one through here
+/// would print a second, differently worded one.
 fn usage_exit(message: &str) -> ! {
     eprintln!("{message}");
     eprintln!("{}", Cli::command().render_usage());
@@ -127,7 +129,13 @@ fn usage_exit(message: &str) -> ! {
 pub fn parse_args() -> Config {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e) if e.use_stderr() => usage_exit(&e.to_string()),
+        // clap's own rendering is already the complaint, a `Usage:` block
+        // and a hint, and it ends in a newline -- `eprint!`, so that it is
+        // not followed by a blank line and a second usage block.
+        Err(e) if e.use_stderr() => {
+            eprint!("{e}");
+            std::process::exit(1)
+        }
         Err(e) => e.exit(), // --help, --man, --version
     };
     let listen = if cli.listen.is_empty() {

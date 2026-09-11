@@ -85,6 +85,121 @@ fn missing_mandatory_flag_exits_1_with_usage() {
         .stderr(predicates::str::contains("--tohost"));
 }
 
+/// Every mandatory flag but the one under test, so that a usage error is
+/// the only thing that can go wrong.
+fn complete_args() -> Vec<String> {
+    let certs = certs();
+    [
+        "--listen",
+        "127.0.0.1:0",
+        "--tohost",
+        "127.0.0.1",
+        "--toport",
+        "1",
+        "--api",
+        "http://127.0.0.1:1/check",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([
+        "--tls_cert".to_string(),
+        certs.join("server.crt").display().to_string(),
+        "--tls_key".to_string(),
+        certs.join("server.key").display().to_string(),
+    ])
+    .collect()
+}
+
+/// Runs the binary and returns (exit code, stdout, stderr).
+fn run(args: &[String]) -> (i32, String, String) {
+    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// Each bad command line exits 1, complains on stderr, and says nothing on
+/// stdout. The `Usage:` count is the point: it must never be more than one.
+/// Passing a clap error through `usage_exit` used to print a second,
+/// differently worded usage block after clap's own.
+///
+/// The expected count is per case because clap is not uniform about it: an
+/// unknown argument renders a `Usage:` block, while a bad *value* for a
+/// known flag renders only the complaint and the `--man` hint. Both are
+/// clap's own output and neither is the defect this test pins shut.
+#[test]
+fn usage_errors_exit_1_with_at_most_one_usage_block() {
+    for (name, args, expected, usage_blocks) in [
+        (
+            "unknown flag",
+            vec!["--bogus".to_string()],
+            "unexpected argument '--bogus'",
+            1,
+        ),
+        (
+            "unparseable port",
+            {
+                let mut a = complete_args();
+                let i = a.iter().position(|x| x == "--toport").unwrap();
+                a[i + 1] = "notanumber".to_string();
+                a
+            },
+            "invalid value 'notanumber' for '--toport <TOPORT>'",
+            0,
+        ),
+        (
+            "malformed listen address",
+            {
+                let mut a = complete_args();
+                let i = a.iter().position(|x| x == "--listen").unwrap();
+                a[i + 1] = "nonsense".to_string();
+                a
+            },
+            "Could not parse nonsense",
+            1,
+        ),
+        (
+            "missing mandatory flag",
+            vec!["--listen".to_string(), "127.0.0.1:0".to_string()],
+            "--tohost is required",
+            1,
+        ),
+    ] {
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 1, "{name}: exit code\nstderr:\n{stderr}");
+        assert_eq!(stdout, "", "{name}: nothing belongs on stdout");
+        assert!(
+            stderr.contains(expected),
+            "{name}: expected {expected:?} in stderr:\n{stderr}"
+        );
+        assert_eq!(
+            stderr.matches("Usage:").count(),
+            usage_blocks,
+            "{name}: wrong number of Usage: blocks in stderr:\n{stderr}"
+        );
+    }
+}
+
+/// `--man` is a help action, so it succeeds and prints the long about to
+/// stdout. Grouped here because it is the one flag of this family that
+/// must *not* look like a usage error.
+#[test]
+fn man_exits_0_with_the_long_description() {
+    let (code, stdout, stderr) = run(&["--man".to_string()]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(stderr, "", "nothing belongs on stderr");
+    assert!(
+        stdout.contains("Starts an SMTP server on the listen host and port."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("--max_message_size"), "{stdout}");
+}
+
 #[test]
 fn starts_binds_and_announces() {
     use std::io::{BufRead, BufReader};
