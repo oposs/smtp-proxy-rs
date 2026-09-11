@@ -9,5 +9,9 @@ RUN cargo build --release --locked -j 4 && \
 FROM scratch
 COPY --from=build /src/target/release/smtp-proxy /app/bin/smtp-proxy
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+# --user resolves the name with getpwnam, which reads these two files. The
+# Perl image was alpine and had them; a scratch image has nothing, so the
+# flag would abort every start with "Cannot resolve username".
+COPY --from=build /etc/passwd /etc/group /etc/
 EXPOSE 3000/tcp
 ENTRYPOINT ["/app/bin/smtp-proxy"]

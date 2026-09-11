@@ -5,6 +5,9 @@
  - TLS 1.0 and 1.1 are no longer offered (rustls)
  - new: --max_message_size, default 1 GiB; a larger message is answered 552
  - new: --version
+ - new: a command line that reaches 64 KiB without ending is answered
+   500 Line too long and the connection is closed; the Perl grew its
+   command buffer without a limit
  - debug-level data dumps are JSON instead of Perl dumper output
 
 0.8.0 2026-09-10 14:24:32 +0200 Tobias Oetiker <tobi@oetiker.ch>

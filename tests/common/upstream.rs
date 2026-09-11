@@ -18,11 +18,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
 pub struct RecordingUpstream {
+    /// Where a TCP client reaches this upstream. `127.0.0.1:0` for an
+    /// [`RecordingUpstream::in_memory`] one, which has no listener at all.
     pub addr: SocketAddr,
     inner: Arc<Mutex<Inner>>,
 }
@@ -35,7 +37,14 @@ type Transcript = Arc<Mutex<Vec<String>>>;
 struct Inner {
     extensions: Vec<String>,
     connections: Vec<Transcript>,
-    messages: Vec<String>,
+    /// Exactly the bytes the relay wrote between `354` and the terminating
+    /// dot, dot-stuffing and line endings included. Recorded verbatim: a
+    /// fake that re-normalises what it stores cannot see a relay that fails
+    /// to normalise what it sends.
+    messages: Vec<Vec<u8>>,
+    /// Reply to EHLO with this 5xx text instead of the extension list, so
+    /// the HELO fallback can be reached.
+    reject_ehlo: Option<String>,
     /// Reply to MAIL FROM with this 5xx text instead of 250.
     reject_mail: Option<String>,
     /// Reply to the final dot with this text after `250 `.
@@ -60,19 +69,26 @@ struct Inner {
     data_pace: Option<(usize, Duration, usize)>,
 }
 
-impl RecordingUpstream {
-    pub async fn start(extensions: &[&str]) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let inner = Arc::new(Mutex::new(Inner {
+impl Inner {
+    fn new(extensions: &[&str]) -> Self {
+        Self {
             extensions: extensions.iter().map(|s| s.to_string()).collect(),
             connections: Vec::new(),
             messages: Vec::new(),
+            reject_ehlo: None,
             reject_mail: None,
             accept_text: "OK message accepted".into(),
             data_stall: None,
             data_pace: None,
-        }));
+        }
+    }
+}
+
+impl RecordingUpstream {
+    pub async fn start(extensions: &[&str]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let inner = Arc::new(Mutex::new(Inner::new(extensions)));
         let state = inner.clone();
         tokio::spawn(async move {
             loop {
@@ -81,6 +97,26 @@ impl RecordingUpstream {
             }
         });
         Self { addr, inner }
+    }
+
+    /// An upstream with no listener, reached only through
+    /// [`RecordingUpstream::connect_duplex`].
+    pub fn in_memory(extensions: &[&str]) -> Self {
+        Self {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            inner: Arc::new(Mutex::new(Inner::new(extensions))),
+        }
+    }
+
+    /// A connection carried by `tokio::io::duplex` rather than by TCP: at
+    /// most `capacity` bytes sit in flight before a write blocks, which is
+    /// what makes a write-side timing test deterministic. The kernel's
+    /// socket buffers are tuned per host and can swallow tens of megabytes,
+    /// so a TCP-backed timing test is at their mercy.
+    pub fn connect_duplex(&self, capacity: usize) -> tokio::io::DuplexStream {
+        let (client, server) = tokio::io::duplex(capacity);
+        tokio::spawn(serve_one(server, self.inner.clone()));
+        client
     }
 
     /// The transcript of the latest connection only.
@@ -102,12 +138,26 @@ impl RecordingUpstream {
             .collect()
     }
 
+    /// Every message as text. Lossy, so an assertion about the exact bytes
+    /// of a line ending belongs on [`RecordingUpstream::raw_messages`].
     pub fn messages(&self) -> Vec<String> {
+        self.raw_messages()
+            .iter()
+            .map(|m| String::from_utf8_lossy(m).into_owned())
+            .collect()
+    }
+
+    /// Every message exactly as it came off the wire.
+    pub fn raw_messages(&self) -> Vec<Vec<u8>> {
         self.inner.lock().unwrap().messages.clone()
     }
 
     pub fn set_extensions(&self, extensions: &[&str]) {
         self.inner.lock().unwrap().extensions = extensions.iter().map(|s| s.to_string()).collect();
+    }
+
+    pub fn reject_ehlo(&self, text: Option<&str>) {
+        self.inner.lock().unwrap().reject_ehlo = text.map(String::from);
     }
 
     pub fn reject_mail(&self, text: Option<&str>) {
@@ -139,11 +189,16 @@ impl RecordingUpstream {
     }
 }
 
-async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
+/// Generic over the transport so the same recording server can be reached
+/// over TCP or over a `tokio::io::duplex` pair.
+async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
+    stream: S,
+    state: Arc<Mutex<Inner>>,
+) {
     let transcript: Transcript = Arc::new(Mutex::new(Vec::new()));
     state.lock().unwrap().connections.push(transcript.clone());
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
+    let (r, mut w) = tokio::io::split(stream);
+    let mut reader = BufReader::new(r);
     if w.write_all(b"220 recording.upstream ESMTP ready\r\n")
         .await
         .is_err()
@@ -151,13 +206,20 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
         return;
     }
     let mut in_data = false;
-    let mut message = String::new();
+    let mut message: Vec<u8> = Vec::new();
     let mut since_pause = 0usize;
     let mut pauses_done = 0usize;
     let mut stall_after_reply: Option<Duration> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
+    loop {
+        // `read_until` rather than `lines()`: the body has to be recorded
+        // byte for byte, terminators included.
+        let mut raw: Vec<u8> = Vec::new();
+        match reader.read_until(b'\n', &mut raw).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
         if in_data {
-            if line == "." {
+            if raw == b".\r\n" || raw == b".\n" {
                 in_data = false;
                 since_pause = 0;
                 pauses_done = 0;
@@ -173,9 +235,8 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
                     return;
                 }
             } else {
-                message.push_str(&line);
-                message.push_str("\r\n");
-                since_pause += line.len() + 2;
+                since_pause += raw.len();
+                message.extend_from_slice(&raw);
                 let pace = state.lock().unwrap().data_pace;
                 if let Some((bytes, pause, times)) = pace
                     && pauses_done < times
@@ -188,19 +249,29 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
             }
             continue;
         }
+        let line = String::from_utf8_lossy(&raw)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
         transcript.lock().unwrap().push(line.clone());
         let upper = line.to_ascii_uppercase();
         let reply = if upper.starts_with("EHLO") {
-            let ext = state.lock().unwrap().extensions.clone();
-            let mut r = String::from("250-recording.upstream\r\n");
-            for (i, e) in ext.iter().enumerate() {
-                let sep = if i + 1 == ext.len() { ' ' } else { '-' };
-                r.push_str(&format!("250{sep}{e}\r\n"));
+            let (rejection, ext) = {
+                let s = state.lock().unwrap();
+                (s.reject_ehlo.clone(), s.extensions.clone())
+            };
+            if let Some(text) = rejection {
+                format!("500 {text}\r\n")
+            } else {
+                let mut r = String::from("250-recording.upstream\r\n");
+                for (i, e) in ext.iter().enumerate() {
+                    let sep = if i + 1 == ext.len() { ' ' } else { '-' };
+                    r.push_str(&format!("250{sep}{e}\r\n"));
+                }
+                if ext.is_empty() {
+                    r.push_str("250 HELP\r\n");
+                }
+                r
             }
-            if ext.is_empty() {
-                r.push_str("250 HELP\r\n");
-            }
-            r
         } else if upper.starts_with("MAIL") {
             let rejection = state.lock().unwrap().reject_mail.clone();
             match rejection {

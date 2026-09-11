@@ -14,8 +14,11 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
+    // Built by hand rather than with `#[tokio::main]` so that the logging
+    // is up before anything can log, and so that a configuration error
+    // exits before a runtime is even started. The worker count is tokio's
+    // default, one per core.
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
         .enable_all()
         .build()
         .expect("tokio runtime");

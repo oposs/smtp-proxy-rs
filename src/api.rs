@@ -130,7 +130,10 @@ impl ApiClient {
     /// client, since only the caller has the connection id.
     pub async fn check(&self, request: &CheckRequest) -> Result<CheckResponse, ApiError> {
         let result = self.post(request).await;
-        if let Err(ApiError::Transport(_) | ApiError::Status(_, _)) = &result {
+        // A body that is not the agreed JSON is a failure the operator has
+        // to be able to see the request for, exactly like a 500 or a
+        // refused connection.
+        if let Err(ApiError::Transport(_) | ApiError::Status(_, _) | ApiError::Json(_)) = &result {
             tracing::debug!("{}", request.redacted_json());
         }
         result
@@ -139,6 +142,13 @@ impl ApiClient {
     async fn post(&self, request: &CheckRequest) -> Result<CheckResponse, ApiError> {
         let response = self.client.post(&self.url).json(request).send().await?;
         let status = response.status();
+        // The Perl logs this on every call (`SMTPProxy/API.pm:16`). It is
+        // the only line that says the API answered at all, and with what.
+        tracing::debug!(
+            "validation call to {} returned {}",
+            self.url,
+            status.as_u16()
+        );
         if !status.is_success() {
             return Err(ApiError::Status(status.as_u16(), status_reason(status)));
         }

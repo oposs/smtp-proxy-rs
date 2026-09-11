@@ -253,6 +253,61 @@ async fn api_can_change_the_envelope_sender_but_not_inject_commands() {
     assert!(r.upstream.commands().is_empty());
 }
 
+/// M1. The Perl's `$apiResult->{from} || $mail{from}` is a truthiness test,
+/// so an API that answers with an empty sender leaves the client's own
+/// sender in place. Relaying `MAIL FROM:<>` instead would send every bounce
+/// for that message somewhere else.
+#[tokio::test]
+async fn an_empty_api_sender_keeps_the_client_sender() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .respond(serde_json::json!({ "allow": true, "from": "", "headers": [] }));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert!(
+        send_mail(
+            &mut c,
+            "sender@foobar.com",
+            &["receiver@foobaz.com"],
+            MESSAGE
+        )
+        .await
+        .starts_with("250")
+    );
+    assert_eq!(r.upstream.commands()[1], "MAIL FROM:<sender@foobar.com>");
+}
+
+/// M2, end to end: a header the Perl could not parse reaches neither the
+/// API nor the upstream.
+#[tokio::test]
+async fn a_header_with_an_empty_value_reaches_neither_the_api_nor_the_upstream() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let message = "From: sender@foobar.com\r\nX-Empty:\r\nSubject: Hello\r\n\r\nHello there\r\n";
+    assert!(
+        send_mail(
+            &mut c,
+            "sender@foobar.com",
+            &["receiver@foobaz.com"],
+            message
+        )
+        .await
+        .starts_with("250")
+    );
+    assert_eq!(
+        r.api.calls()[0]["headers"],
+        serde_json::json!([
+            {"name": "From", "value": "sender@foobar.com"},
+            {"name": "Subject", "value": "Hello"},
+        ])
+    );
+    assert_eq!(
+        r.upstream.messages()[0],
+        "From: sender@foobar.com\r\nSubject: Hello\r\n\r\nHello there\r\n"
+    );
+}
+
 #[tokio::test]
 async fn relay_error_reaches_the_client() {
     let r = rig(&["DSN"]).await;

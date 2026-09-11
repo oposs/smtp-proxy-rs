@@ -115,11 +115,14 @@ pub struct ProxyHandler {
 }
 
 /// Splits at CRLF followed by a non-blank (folded lines stay whole), then at
-/// the first colon. A line without a colon is logged and dropped (spec 5.2).
+/// the first colon. A line without a colon, and a line with nothing at all
+/// behind the colon, is logged and dropped (spec 5.2).
 pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
     let mut lines: Vec<String> = Vec::new();
     for raw in block.split_inclusive("\r\n") {
-        let continuation = raw.starts_with([' ', '\t']);
+        // The Perl splits on `/\r\n(?=$|\S)/`, whose `\S` counts the
+        // vertical tab and the form feed as continuation as well.
+        let continuation = raw.starts_with([' ', '\t', '\x0b', '\x0c']);
         match lines.last_mut() {
             Some(last) if continuation => last.push_str(raw),
             _ => lines.push(raw.to_string()),
@@ -129,14 +132,33 @@ pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
     for line in lines {
         let line = line.trim_end_matches("\r\n");
         match line.split_once(':') {
-            Some((name, value)) if !name.is_empty() => out.push(RequestHeader {
+            // `[^:]+` needs a name and `(.+)` needs at least one character
+            // behind the colon, so `Subject:` does not parse.
+            Some((name, rest)) if !name.is_empty() && !rest.is_empty() => out.push(RequestHeader {
                 name: name.to_string(),
-                value: value.trim_start().to_string(),
+                value: perl_header_value(rest),
             }),
             _ => warn!("Could not parse header '{line}'"),
         }
     }
     out
+}
+
+/// The value half of the Perl's `/^([^:]+):\s*(.+)$/s` (`SMTPProxy.pm:96`).
+/// `\s*` is greedy, so leading whitespace -- the CRLF and indent of a folded
+/// line included -- is stripped. But `(.+)` needs one character, so when
+/// everything behind the colon is whitespace the regex backtracks by exactly
+/// one: `Subject:  ` yields a single space, not the empty string. Faithful
+/// here because the header list goes to the customer's API as it is.
+fn perl_header_value(rest: &str) -> String {
+    let trimmed = rest.trim_start();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    rest.chars()
+        .next_back()
+        .map(String::from)
+        .unwrap_or_default()
 }
 
 /// Spec 5.4: remove every header the API names, then append those it gave a
@@ -196,6 +218,11 @@ impl ProxyHandler {
         let from = outcome
             .from
             .clone()
+            // The Perl is `$apiResult->{from} || $mail{from}`, and an empty
+            // string is false there, so it keeps the client's sender rather
+            // than relaying the null return path and sending the bounces
+            // somewhere else.
+            .filter(|f| !f.is_empty())
             .unwrap_or_else(|| self.transaction.from.clone());
         let envelope = Envelope {
             from: &from,
@@ -221,6 +248,10 @@ impl ProxyHandler {
             Err(e) => {
                 info!("Mail refused by relay server ({e}) for {}", self.client);
                 debug!("Mail {}", self.check_request().redacted_json());
+                // The Perl dumps the API result next to the mail: it is what
+                // says whether the refused message carried injected headers
+                // or a substituted sender.
+                debug!("ApiResult {outcome:?}");
                 Err(e.to_string())
             }
         }
@@ -335,6 +366,37 @@ mod tests {
                 h("Subject", "long\r\n  folded line"),
                 h("To", "x@y.com")
             ]
+        );
+    }
+
+    /// M2. The Perl's `(.+)` needs a character behind the colon, so a
+    /// header with nothing there is dropped -- from the API request and
+    /// from the relayed message alike. One with only whitespace behind the
+    /// colon keeps exactly one of those characters.
+    #[test]
+    fn a_header_with_nothing_behind_the_colon_is_dropped() {
+        let parsed = parse_headers(
+            "Subject:\r\nX-Empty:\r\nX-Space: \r\nX-Spaces:   \r\nX-Tab:\t\r\nTo: x@y.com\r\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                h("X-Space", " "),
+                h("X-Spaces", " "),
+                h("X-Tab", "\t"),
+                h("To", "x@y.com"),
+            ]
+        );
+    }
+
+    /// M7. The Perl's `\S` lookahead treats the vertical tab and the form
+    /// feed as continuation, not as the start of a new header.
+    #[test]
+    fn vertical_tab_and_form_feed_continue_a_header() {
+        let parsed = parse_headers("Subject: a\r\n\x0bb\r\n\x0cc\r\nTo: x@y.com\r\n");
+        assert_eq!(
+            parsed,
+            vec![h("Subject", "a\r\n\x0bb\r\n\x0cc"), h("To", "x@y.com")]
         );
     }
 

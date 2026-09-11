@@ -129,6 +129,10 @@ this is then relayed to the client.
   1.3).
 - A message larger than 1 GiB is refused with 552; the limit is configurable
   with `--max_message_size`.
+- A command line that reaches 64 KiB without ending is answered
+  `500 Line too long` and the connection is closed. The Perl grew its command
+  buffer without any limit. RFC 5321 4.5.3.1.4 caps a command line at 512
+  octets, so no working client can reach this.
 - Debug-level data dumps are JSON rather than Perl `Data::Dumper` output.
 - Two new flags: `--version` and `--max_message_size`.
 - Exit codes differ from the Perl proxy on two paths, both measured against

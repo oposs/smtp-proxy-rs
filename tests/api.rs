@@ -1,9 +1,46 @@
 //! Integration tests for the API client against `FakeApi` (spec 5.3).
 mod common;
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use common::fake_api::FakeApi;
 use smtp_proxy::api::{ApiClient, ApiError, CheckRequest, Recipient, RequestHeader};
 use smtp_proxy::smtp::params::Param;
+use tracing_subscriber::prelude::*;
+
+/// Every line this binary logs. It has to be installed *globally* and
+/// before any test has evaluated one of the callsites under assertion:
+/// `tracing` caches each callsite's interest process wide, so a callsite
+/// first reached with no subscriber stays disabled for every later test. So
+/// every test in this binary calls this, not only the one that reads it.
+fn captured_log() -> &'static Mutex<Vec<u8>> {
+    static LOG: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let sink = buffer.clone();
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || Capture(sink.clone()))
+                    .with_filter(tracing::level_filters::LevelFilter::DEBUG),
+            )
+            .init();
+        buffer
+    })
+}
+
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 fn request() -> CheckRequest {
     CheckRequest {
@@ -40,6 +77,7 @@ fn request() -> CheckRequest {
 
 #[tokio::test]
 async fn request_body_matches_the_contract() {
+    captured_log();
     let api = FakeApi::start().await;
     let client = ApiClient::new(api.url.clone()).unwrap();
     let resp = client.check(&request()).await.unwrap();
@@ -74,6 +112,7 @@ async fn request_body_matches_the_contract() {
 
 #[tokio::test]
 async fn deny_and_optional_fields() {
+    captured_log();
     let api = FakeApi::start().await;
     api.respond(serde_json::json!({ "allow": false, "reason": "sorry, not telling" }));
     let client = ApiClient::new(api.url.clone()).unwrap();
@@ -95,6 +134,7 @@ async fn deny_and_optional_fields() {
 
 #[tokio::test]
 async fn non_2xx_is_an_error_carrying_the_reason_phrase() {
+    captured_log();
     let api = FakeApi::start().await;
     api.fail_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     let client = ApiClient::new(api.url.clone()).unwrap();
@@ -106,11 +146,42 @@ async fn non_2xx_is_an_error_carrying_the_reason_phrase() {
 
 #[tokio::test]
 async fn unreachable_api_is_a_transport_error() {
+    captured_log();
     let client = ApiClient::new("http://127.0.0.1:1/check".into()).unwrap();
     assert!(matches!(
         client.check(&request()).await,
         Err(ApiError::Transport(_))
     ));
+}
+
+/// M4 and M6. Every call logs that the API answered and with what code,
+/// and a body that is not the agreed JSON gets the spec-5.3 redacted
+/// request dump that a 500 or a refused connection already got.
+#[tokio::test]
+async fn invalid_json_is_an_error_and_still_dumps_the_redacted_request() {
+    let log = captured_log();
+    let api = FakeApi::start().await;
+    api.respond_raw("<html>not json at all</html>", "text/html");
+    let client = ApiClient::new(api.url.clone()).unwrap();
+    // Unique to this test, so its lines can be picked out of a log that
+    // every other test in this binary writes to as well.
+    let mut request = request();
+    request.from = "json-error-probe@b.com".into();
+    let result = client.check(&request).await;
+    assert!(matches!(result, Err(ApiError::Json(_))), "{result:?}");
+    let text = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+    let dumps: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("json-error-probe@b.com"))
+        .collect();
+    assert_eq!(dumps.len(), 1, "{text}");
+    assert!(dumps[0].contains("*******"), "{}", dumps[0]);
+    assert!(!dumps[0].contains("secret"), "{}", dumps[0]);
+    let calls: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(&format!("validation call to {} returned 200", api.url)))
+        .collect();
+    assert_eq!(calls.len(), 1, "{text}");
 }
 
 #[test]

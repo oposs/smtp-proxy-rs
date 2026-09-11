@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
@@ -16,6 +18,9 @@ pub struct FakeApi {
 
 pub struct FakeApiState {
     pub response: serde_json::Value,
+    /// Answer with this body verbatim instead of `response`, so a test can
+    /// send something that is not the agreed JSON at all.
+    pub raw_response: Option<(String, String)>,
     pub status: StatusCode,
     pub calls: Vec<serde_json::Value>,
 }
@@ -23,16 +28,25 @@ pub struct FakeApiState {
 async fn handle(
     State(state): State<Arc<Mutex<FakeApiState>>>,
     Json(body): Json<serde_json::Value>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let mut s = state.lock().unwrap();
     s.calls.push(body);
-    (s.status, Json(s.response.clone()))
+    match &s.raw_response {
+        Some((body, content_type)) => (
+            s.status,
+            [(CONTENT_TYPE, content_type.clone())],
+            body.clone(),
+        )
+            .into_response(),
+        None => (s.status, Json(s.response.clone())).into_response(),
+    }
 }
 
 impl FakeApi {
     pub async fn start() -> Self {
         let state = Arc::new(Mutex::new(FakeApiState {
             response: serde_json::json!({ "allow": true, "headers": [] }),
+            raw_response: None,
             status: StatusCode::OK,
             calls: Vec::new(),
         }));
@@ -48,6 +62,14 @@ impl FakeApi {
     pub fn respond(&self, response: serde_json::Value) {
         let mut s = self.state.lock().unwrap();
         s.response = response;
+        s.raw_response = None;
+        s.status = StatusCode::OK;
+    }
+
+    /// Answer 200 with this exact body, whatever it is.
+    pub fn respond_raw(&self, body: &str, content_type: &str) {
+        let mut s = self.state.lock().unwrap();
+        s.raw_response = Some((body.into(), content_type.into()));
         s.status = StatusCode::OK;
     }
 

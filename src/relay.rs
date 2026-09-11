@@ -2,9 +2,10 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split,
+};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::{debug, warn};
 
 use crate::api::Recipient;
@@ -49,7 +50,9 @@ pub struct Envelope<'a> {
 /// Outcome of a relayed message.
 #[derive(Clone, Debug)]
 pub struct Relayed {
-    /// Text of the 250 reply to the final dot (the upstream queue id).
+    /// Text of the 250 reply to the final dot (the upstream queue id). A
+    /// multi-line reply arrives here with its lines joined by `\n`;
+    /// `smtp::reply::sanitize` folds those away before a client sees it.
     pub message: String,
     pub upstream_dsn: bool,
 }
@@ -97,16 +100,48 @@ pub fn dsn_suffix(params: &[Param], keep: fn(&str) -> bool, upstream_dsn: bool) 
         .collect()
 }
 
-/// Doubles a leading dot on every line (RFC 5321 4.5.2).
-pub fn dot_stuff(message: &[u8]) -> Vec<u8> {
+/// Rewrites every `\r?\n` to `\r\n` and doubles a dot that follows one
+/// (RFC 5321 4.5.2), in a single pass. This is the Perl's
+///
+/// ```text
+/// s/\015?\012(\.?)/\015\012$1$1/g
+/// ```
+///
+/// (`Mojo/SMTP/Client.pm:517`) written out. The order matters: the Perl
+/// decides the terminator from the *normalised* payload (`_has_nl`,
+/// `Client.pm:594`), so a body that ends in a bare `\n` already ends in CRLF
+/// by the time that decision is made and gains no extra blank line.
+///
+/// A dot at offset 0 is stuffed here where the Perl's non-coderef branch
+/// leaves it alone. The two cannot differ in this proxy -- the payload
+/// always begins with a header name or with the header/body blank line --
+/// and RFC 5321 4.5.2 asks for the stuffing, so it stays.
+pub fn normalize_and_stuff(message: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(message.len() + 16);
-    let mut at_line_start = true;
-    for &b in message {
-        if at_line_start && b == b'.' {
-            out.push(b'.');
+    if message.first() == Some(&b'.') {
+        out.push(b'.');
+    }
+    let mut i = 0;
+    while i < message.len() {
+        let eol = match message[i] {
+            b'\n' => Some(1),
+            b'\r' if message.get(i + 1) == Some(&b'\n') => Some(2),
+            _ => None,
+        };
+        match eol {
+            Some(len) => {
+                out.extend_from_slice(b"\r\n");
+                i += len;
+                if message.get(i) == Some(&b'.') {
+                    out.extend_from_slice(b"..");
+                    i += 1;
+                }
+            }
+            None => {
+                out.push(message[i]);
+                i += 1;
+            }
         }
-        out.push(b);
-        at_line_start = b == b'\n';
     }
     out
 }
@@ -120,9 +155,24 @@ pub fn dot_stuff(message: &[u8]) -> Vec<u8> {
 /// upstream for about 1 KB/s, which no working relay fails.
 const WRITE_CHUNK: usize = 64 * 1024;
 
-struct Upstream {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+/// The name in every EHLO and HELO this proxy sends upstream.
+///
+/// `Mojo::SMTP::Client` has `has hello => 'localhost.localdomain'`
+/// (`Client.pm:54`) and only ever supplies that default (`Client.pm:134`);
+/// neither `_relayMail` nor `probeUpstream` passes a `hello` of its own, so
+/// every greeting the Perl proxy ever sent carried this name. Sending the
+/// machine's hostname instead would be refused by any upstream that
+/// allow-lists the greeting name -- and in the `FROM scratch` image that
+/// hostname is whatever the container runtime invented.
+const HELLO: &str = "localhost.localdomain";
+
+/// Generic over the transport so the timing tests can drive a whole relay
+/// session through `tokio::io::duplex`, where the number of bytes that fit
+/// in flight is one the test chose rather than one the host's TCP buffers
+/// decided. `server::session` carries the same seam for the client side.
+struct Upstream<S> {
+    reader: BufReader<ReadHalf<S>>,
+    writer: WriteHalf<S>,
     timeout: Duration,
 }
 
@@ -135,20 +185,14 @@ struct UpstreamReply {
     raw: String,
 }
 
-impl Upstream {
-    async fn connect(config: &RelayConfig) -> Result<Self, RelayError> {
-        let stream = tokio::time::timeout(
-            config.timeout,
-            TcpStream::connect((config.host.as_str(), config.port)),
-        )
-        .await
-        .map_err(|_| RelayError::Timeout)??;
-        let (r, w) = stream.into_split();
-        Ok(Self {
+impl<S: AsyncRead + AsyncWrite> Upstream<S> {
+    fn new(stream: S, timeout: Duration) -> Self {
+        let (r, w) = split(stream);
+        Self {
             reader: BufReader::new(r),
             writer: w,
-            timeout: config.timeout,
-        })
+            timeout,
+        }
     }
 
     async fn read_reply(&mut self) -> Result<UpstreamReply, RelayError> {
@@ -228,11 +272,10 @@ impl Upstream {
                 text: greeting.text,
             });
         }
-        let host = local_hostname();
-        match self.command("EHLO", format!("EHLO {host}"), 2).await {
+        match self.command("EHLO", format!("EHLO {HELLO}"), 2).await {
             Ok(reply) => Ok(parse_extensions(&reply.raw)),
             Err(RelayError::Rejected { code, .. }) if code / 100 == 5 => {
-                self.command("HELO", format!("HELO {host}"), 2).await?;
+                self.command("HELO", format!("HELO {HELLO}"), 2).await?;
                 Ok(HashSet::new())
             }
             Err(e) => Err(e),
@@ -255,16 +298,26 @@ impl Upstream {
     }
 }
 
-fn local_hostname() -> String {
-    nix::unistd::gethostname()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "localhost".into())
+async fn connect(config: &RelayConfig) -> Result<TcpStream, RelayError> {
+    Ok(tokio::time::timeout(
+        config.timeout,
+        TcpStream::connect((config.host.as_str(), config.port)),
+    )
+    .await
+    .map_err(|_| RelayError::Timeout)??)
 }
 
 /// EHLO + QUIT. Returns whether the upstream announces DSN.
 pub async fn probe(config: &RelayConfig) -> Result<bool, RelayError> {
-    let mut up = Upstream::connect(config).await?;
+    probe_over(connect(config).await?, config.timeout).await
+}
+
+/// [`probe`] over a stream the caller supplies. See [`Upstream`].
+pub async fn probe_over<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    timeout: Duration,
+) -> Result<bool, RelayError> {
+    let mut up = Upstream::new(stream, timeout);
     let extensions = up.open().await?;
     up.quit().await;
     Ok(extensions.contains("DSN"))
@@ -276,11 +329,27 @@ pub async fn relay(
     envelope: Envelope<'_>,
     message: &[u8],
 ) -> Result<Relayed, RelayError> {
+    // Before the connection, so that an address the API substituted cannot
+    // even cost a TCP handshake.
     assert_relayable(envelope.from)?;
     for r in envelope.recipients {
         assert_relayable(&r.address)?;
     }
-    let mut up = Upstream::connect(config).await?;
+    relay_over(connect(config).await?, config.timeout, envelope, message).await
+}
+
+/// [`relay`] over a stream the caller supplies. See [`Upstream`].
+pub async fn relay_over<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    timeout: Duration,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    assert_relayable(envelope.from)?;
+    for r in envelope.recipients {
+        assert_relayable(&r.address)?;
+    }
+    let mut up = Upstream::new(stream, timeout);
     let extensions = up.open().await?;
     let upstream_dsn = extensions.contains("DSN");
     let mail = format!(
@@ -298,7 +367,7 @@ pub async fn relay(
         up.command("RCPT", rcpt, 2).await?;
     }
     up.command("DATA", "DATA".into(), 3).await?;
-    let mut payload = dot_stuff(message);
+    let mut payload = normalize_and_stuff(message);
     if !payload.ends_with(b"\r\n") {
         payload.extend_from_slice(b"\r\n");
     }
@@ -358,8 +427,24 @@ mod tests {
 
     #[test]
     fn dot_stuffing_on_the_way_out() {
-        assert_eq!(dot_stuff(b"a\r\n.\r\n..x\r\n"), b"a\r\n..\r\n...x\r\n");
-        assert_eq!(dot_stuff(b".start"), b"..start");
-        assert_eq!(dot_stuff(b"no dots\r\n"), b"no dots\r\n");
+        assert_eq!(
+            normalize_and_stuff(b"a\r\n.\r\n..x\r\n"),
+            b"a\r\n..\r\n...x\r\n"
+        );
+        assert_eq!(normalize_and_stuff(b".start"), b"..start");
+        assert_eq!(normalize_and_stuff(b"no dots\r\n"), b"no dots\r\n");
+    }
+
+    /// The Perl's one regex does both jobs, so a bare LF never reaches the
+    /// upstream and a dot behind one is stuffed just the same.
+    #[test]
+    fn bare_lf_is_normalised_on_the_way_out() {
+        assert_eq!(normalize_and_stuff(b"a\nb\n"), b"a\r\nb\r\n");
+        assert_eq!(normalize_and_stuff(b"a\n.b\n"), b"a\r\n..b\r\n");
+        assert_eq!(normalize_and_stuff(b"a\r\nb\n.\r\n"), b"a\r\nb\r\n..\r\n");
+        // A lone CR is not a line ending: `\015?\012` needs the LF.
+        assert_eq!(normalize_and_stuff(b"a\rb"), b"a\rb");
+        assert_eq!(normalize_and_stuff(b"a\r\r\n"), b"a\r\r\n");
+        assert_eq!(normalize_and_stuff(b""), b"");
     }
 }
