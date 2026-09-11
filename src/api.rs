@@ -1,5 +1,6 @@
 //! The authentication and header API (spec 5.3): one POST per message,
 //! asking the customer's HTTP endpoint whether the mail may be sent.
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ pub struct Recipient {
 
 /// The body of the API call. Field order is the wire contract (spec 5.3)
 /// and follows declaration order under `derive(Serialize)`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CheckRequest {
     pub username: String,
     pub password: String,
@@ -42,6 +43,24 @@ pub struct CheckRequest {
     pub mail_parameters: Vec<Param>,
     #[serde(rename = "rcptParameters")]
     pub rcpt_parameters: Vec<Recipient>,
+}
+
+/// Hand-written rather than derived: the password must never reach a log
+/// through a stray `{:?}`, `tracing::debug!(?request)`, or a panicking
+/// `.expect()` on a `Result` that holds this struct — not just through the
+/// one call site this module happens to log from today.
+impl fmt::Debug for CheckRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckRequest")
+            .field("username", &self.username)
+            .field("password", &"*******")
+            .field("from", &self.from)
+            .field("to", &self.to)
+            .field("headers", &self.headers)
+            .field("mail_parameters", &self.mail_parameters)
+            .field("rcpt_parameters", &self.rcpt_parameters)
+            .finish()
+    }
 }
 
 impl CheckRequest {
@@ -121,12 +140,22 @@ impl ApiClient {
         let response = self.client.post(&self.url).json(request).send().await?;
         let status = response.status();
         if !status.is_success() {
-            let reason = status.canonical_reason().unwrap_or_default().to_string();
-            return Err(ApiError::Status(status.as_u16(), reason));
+            return Err(ApiError::Status(status.as_u16(), status_reason(status)));
         }
         let body = response.text().await?;
         serde_json::from_str(&body).map_err(|e| ApiError::Json(e.to_string()))
     }
+}
+
+/// The text logged for a non-2xx status (spec 5.3, Perl: `$tx->result->message`).
+/// Hyper discards the server's own HTTP/1.1 reason phrase, so the best we can
+/// do for a code we don't recognise is the numeric status rather than an
+/// empty `()` in the log line.
+fn status_reason(status: reqwest::StatusCode) -> String {
+    status
+        .canonical_reason()
+        .map(str::to_string)
+        .unwrap_or_else(|| status.as_u16().to_string())
 }
 
 #[cfg(test)]
@@ -166,6 +195,23 @@ mod tests {
         let json = request().redacted_json();
         assert!(json.contains("\"password\":\"*******\""), "{json}");
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn debug_hides_the_password() {
+        let printed = format!("{:?}", request());
+        assert!(printed.contains("*******"), "{printed}");
+        assert!(!printed.contains("secret"), "{printed}");
+    }
+
+    #[test]
+    fn status_reason_falls_back_to_the_numeric_code_when_unrecognised() {
+        assert_eq!(
+            status_reason(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+            "Internal Server Error"
+        );
+        let non_standard = reqwest::StatusCode::from_u16(599).unwrap();
+        assert_eq!(status_reason(non_standard), "599");
     }
 
     #[test]
