@@ -1,4 +1,5 @@
 //! SMTP authentication and header injection proxy.
+pub mod api;
 pub mod logging;
 pub mod server;
 pub mod smtp;

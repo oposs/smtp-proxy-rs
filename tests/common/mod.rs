@@ -2,6 +2,7 @@
 //! different subset, so the module as a whole is exempt from dead-code
 //! warnings.
 #![allow(dead_code)]
+pub mod fake_api;
 pub mod fake_handler;
 pub mod raw_client;
 
