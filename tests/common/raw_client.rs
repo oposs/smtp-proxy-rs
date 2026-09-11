@@ -97,14 +97,32 @@ impl RawClient {
         .expect("timed out waiting for a reply")
     }
 
-    /// Returns true if the server closed the connection, draining whatever
-    /// arrives first. tokio-rustls 0.26.5 does a "last-gasp write" that
-    /// flushes a fatal TLS alert before the handshake error reaches the
-    /// caller, so after a failed handshake the next read yields alert
-    /// bytes, not an immediate EOF. Demanding that the very first read be
-    /// zero-length would report a spurious failure; instead keep reading
-    /// (discarding whatever arrives) until EOF, a reset, or a timeout.
+    /// Returns true if the server closed the connection without sending more.
+    /// Strict on purpose: a server that leaks stray bytes before closing
+    /// must fail this check, so the QUIT-close and line-too-long-close
+    /// callers keep their original guarantee.
     pub async fn expect_close(&mut self) -> bool {
+        let mut chunk = [0u8; 64];
+        matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.stream.read(&mut chunk)
+            )
+            .await,
+            Ok(Ok(0))
+        )
+    }
+
+    /// Like `expect_close`, but for the one case where trailing bytes are
+    /// legitimate: after a failed TLS handshake, tokio-rustls 0.26.5 does a
+    /// "last-gasp write" that flushes a fatal alert before the handshake
+    /// error reaches the caller, so the next read yields alert bytes, not
+    /// an immediate EOF. This drains whatever arrives (discarding it) until
+    /// EOF, a reset, or the timeout. It is deliberately not used for a
+    /// clean-close case: it cannot distinguish a legitimate TLS alert from
+    /// any other stray byte the server might leak, so it must not replace
+    /// the strict `expect_close` there.
+    pub async fn expect_close_after_failed_handshake(&mut self) -> bool {
         let mut chunk = [0u8; 4096];
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

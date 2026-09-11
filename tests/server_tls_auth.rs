@@ -139,7 +139,7 @@ async fn failed_tls_handshake_closes_the_connection() {
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("STARTTLS").await, "220 Go ahead\r\n");
     c.write_raw("this is not a TLS ClientHello\r\n").await;
-    assert!(c.expect_close().await);
+    assert!(c.expect_close_after_failed_handshake().await);
     // The server still accepts new clients.
     let (mut c2, g) = RawClient::connect(addr).await;
     assert!(g.starts_with("220"));
