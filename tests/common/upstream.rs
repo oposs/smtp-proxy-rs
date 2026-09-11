@@ -16,6 +16,7 @@
 //! holding a single QUIT.
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -39,6 +40,24 @@ struct Inner {
     reject_mail: Option<String>,
     /// Reply to the final dot with this text after `250 `.
     accept_text: String,
+    /// Stop reading for this long right after `354`, before taking a single
+    /// byte of the body: an upstream that has gone away mid-transfer.
+    data_stall: Option<Duration>,
+    /// While reading the body, pause for `pause` after every `bytes`
+    /// consumed, at most `times` times: an upstream that accepts the body
+    /// slowly but steadily. Once the socket buffers fill, the relay's writes
+    /// block until the next drain, which is what makes the difference
+    /// between an inactivity timer and a whole-payload deadline observable.
+    ///
+    /// `times` is what keeps such a test honest. When the relay's last write
+    /// returns, megabytes are still sitting unread in the socket buffers,
+    /// and the relay is by then waiting for the `250` under a *single*
+    /// timer. Pacing that tail would put a run of pauses inside that one
+    /// wait and time it out for a reason the test does not mean to
+    /// exercise. So a test paces an early prefix of the body only, and picks
+    /// a body several times bigger than the buffers can hold, which puts
+    /// every pause safely inside the transfer.
+    data_pace: Option<(usize, Duration, usize)>,
 }
 
 impl RecordingUpstream {
@@ -51,6 +70,8 @@ impl RecordingUpstream {
             messages: Vec::new(),
             reject_mail: None,
             accept_text: "OK message accepted".into(),
+            data_stall: None,
+            data_pace: None,
         }));
         let state = inner.clone();
         tokio::spawn(async move {
@@ -97,6 +118,18 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().accept_text = text.into();
     }
 
+    /// Read nothing at all for `pause` after answering `354`.
+    pub fn stall_data(&self, pause: Duration) {
+        self.inner.lock().unwrap().data_stall = Some(pause);
+    }
+
+    /// Consume the body in steps of `bytes`, pausing for `pause` between
+    /// them, for the first `times` steps only. See `Inner::data_pace` for
+    /// why the pacing has to stop before the body does.
+    pub fn pace_data(&self, bytes: usize, pause: Duration, times: usize) {
+        self.inner.lock().unwrap().data_pace = Some((bytes, pause, times));
+    }
+
     /// Drops every recorded connection and message. The startup probe's own
     /// EHLO and QUIT would otherwise shift every later command index.
     pub fn clear(&self) {
@@ -119,10 +152,15 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
     }
     let mut in_data = false;
     let mut message = String::new();
+    let mut since_pause = 0usize;
+    let mut pauses_done = 0usize;
+    let mut stall_after_reply: Option<Duration> = None;
     while let Ok(Some(line)) = lines.next_line().await {
         if in_data {
             if line == "." {
                 in_data = false;
+                since_pause = 0;
+                pauses_done = 0;
                 let text = {
                     let mut s = state.lock().unwrap();
                     s.messages.push(std::mem::take(&mut message));
@@ -137,6 +175,16 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
             } else {
                 message.push_str(&line);
                 message.push_str("\r\n");
+                since_pause += line.len() + 2;
+                let pace = state.lock().unwrap().data_pace;
+                if let Some((bytes, pause, times)) = pace
+                    && pauses_done < times
+                    && since_pause >= bytes
+                {
+                    since_pause = 0;
+                    pauses_done += 1;
+                    tokio::time::sleep(pause).await;
+                }
             }
             continue;
         }
@@ -167,6 +215,7 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
             "250 OK\r\n".into()
         } else if upper.starts_with("DATA") {
             in_data = true;
+            stall_after_reply = state.lock().unwrap().data_stall;
             "354 Go ahead\r\n".into()
         } else if upper.starts_with("QUIT") {
             let _ = w.write_all(b"221 Bye\r\n").await;
@@ -176,6 +225,9 @@ async fn serve_one(stream: tokio::net::TcpStream, state: Arc<Mutex<Inner>>) {
         };
         if w.write_all(reply.as_bytes()).await.is_err() {
             return;
+        }
+        if let Some(pause) = stall_after_reply.take() {
+            tokio::time::sleep(pause).await;
         }
     }
 }

@@ -2,17 +2,38 @@
 //! address guard. Ported from the relay half of the Perl `dsn.t`.
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{Envelope, RelayConfig, RelayError, probe, relay};
 use smtp_proxy::smtp::params::Param;
 
-fn config(up: &RecordingUpstream) -> RelayConfig {
+fn config_with_timeout(up: &RecordingUpstream, timeout: Duration) -> RelayConfig {
     RelayConfig {
         host: "127.0.0.1".into(),
         port: up.addr.port(),
-        timeout: std::time::Duration::from_secs(5),
+        timeout,
     }
+}
+
+fn config(up: &RecordingUpstream) -> RelayConfig {
+    config_with_timeout(up, Duration::from_secs(5))
+}
+
+/// A body of exactly `len` bytes in 1 KiB CRLF-terminated lines. `len` must
+/// be a multiple of 1024.
+fn body(len: usize) -> Vec<u8> {
+    let line = format!("{}\r\n", "x".repeat(1022));
+    line.repeat(len / line.len()).into_bytes()
+}
+
+/// Only the recipient differs between the timing tests and the rest.
+fn one_recipient() -> Vec<Recipient> {
+    vec![Recipient {
+        address: "x@baz.com".into(),
+        parameters: vec![],
+    }]
 }
 
 fn p(k: &str, v: Option<&str>) -> Param {
@@ -34,7 +55,7 @@ async fn probe_reports_dsn() {
         probe(&RelayConfig {
             host: "127.0.0.1".into(),
             port: 1,
-            timeout: std::time::Duration::from_secs(1)
+            timeout: Duration::from_secs(1)
         })
         .await
         .is_err()
@@ -133,6 +154,71 @@ async fn upstream_rejection_carries_its_text() {
         }) => assert_eq!(text, "Sorry, I don't send from there"),
         other => panic!("{other:?}"),
     }
+}
+
+/// Spec 6's 60 s is an *inactivity* timeout. A body several times bigger
+/// than the socket buffers, handed to an upstream that drains it in steps,
+/// must go through as long as every gap is shorter than the timeout — even
+/// though the transfer as a whole takes far longer than the timeout. With a
+/// single deadline over the whole payload this fails with
+/// `RelayError::Timeout`, which is exactly the bug being guarded against.
+#[tokio::test]
+async fn a_slow_but_steady_upstream_is_not_timed_out() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    // Six pauses of 50 ms while the first 6 MiB go in: each gap is a
+    // quarter of the timeout, their sum is one and a half times it. The
+    // measured worst case for one 64 KiB chunk under this pacing is ~110 ms,
+    // so the passing margin is about 2x.
+    up.pace_data(1 << 20, Duration::from_millis(50), 6);
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_millis(200);
+    // 24 MiB is well past the ~10 MiB the loopback socket buffers can hold
+    // even fully auto-tuned, so the relay's writes really do block on the
+    // upstream's reads, and the upstream is certain to have passed the sixth
+    // pause long before the last write returns.
+    let size = 24 << 20;
+    let started = Instant::now();
+    let out = relay(&config_with_timeout(&up, timeout), env, &body(size))
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(out.message, "OK message accepted");
+    assert_eq!(up.messages()[0].len(), size);
+    assert!(
+        elapsed > timeout,
+        "the upstream drained too fast for this to prove anything: {elapsed:?}"
+    );
+}
+
+/// The other half of the same coin: an upstream that stops reading
+/// altogether for longer than the timeout must still be given up on, so the
+/// chunking has not simply removed the protection.
+#[tokio::test]
+async fn an_upstream_that_stops_reading_still_times_out() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    up.stall_data(Duration::from_secs(1));
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    // Big enough that the write cannot simply disappear into the socket
+    // buffers, so it is the write that gives up, not the wait for the 250.
+    let err = relay(
+        &config_with_timeout(&up, Duration::from_millis(200)),
+        env,
+        &body(24 << 20),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, RelayError::Timeout), "{err:?}");
+    assert!(up.messages().is_empty());
 }
 
 #[tokio::test]

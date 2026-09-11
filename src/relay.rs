@@ -111,6 +111,15 @@ pub fn dot_stuff(message: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The message body is written in pieces of this size, each under its own
+/// timer. Spec 6 gives the relay an *inactivity* timeout, so what has to
+/// hold is "some progress within the timeout", not "the whole body within
+/// the timeout": a single deadline over the payload would abort a healthy
+/// but merely slow upstream, and at the default 1 GiB message cap it would
+/// demand a sustained 17 MB/s. At 64 KiB a chunk the 60 s default asks the
+/// upstream for about 1 KB/s, which no working relay fails.
+const WRITE_CHUNK: usize = 64 * 1024;
+
 struct Upstream {
     reader: BufReader<OwnedReadHalf>,
     writer: OwnedWriteHalf,
@@ -230,6 +239,17 @@ impl Upstream {
         }
     }
 
+    /// Writes the message body, restarting the inactivity timer for every
+    /// chunk. See [`WRITE_CHUNK`].
+    async fn write_body(&mut self, payload: &[u8]) -> Result<(), RelayError> {
+        for chunk in payload.chunks(WRITE_CHUNK) {
+            tokio::time::timeout(self.timeout, self.writer.write_all(chunk))
+                .await
+                .map_err(|_| RelayError::Timeout)??;
+        }
+        Ok(())
+    }
+
     async fn quit(&mut self) {
         let _ = self.command("QUIT", "QUIT".into(), 2).await;
     }
@@ -283,9 +303,7 @@ pub async fn relay(
         payload.extend_from_slice(b"\r\n");
     }
     payload.extend_from_slice(b".\r\n");
-    tokio::time::timeout(config.timeout, up.writer.write_all(&payload))
-        .await
-        .map_err(|_| RelayError::Timeout)??;
+    up.write_body(&payload).await?;
     let accepted = up.read_reply().await?;
     if accepted.code / 100 != 2 {
         return Err(RelayError::Rejected {
