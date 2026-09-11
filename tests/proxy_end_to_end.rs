@@ -489,3 +489,64 @@ async fn the_api_debug_dump_carries_the_connection_id() {
         "no matching handler line for [{cid}] in:\n{text}"
     );
 }
+
+/// Port of the Perl `t/api-log-redaction.t` (spec 11.2). The SMTP password
+/// travels to the auth API as an ordinary request argument, and a non-2xx
+/// answer makes the client dump the request it sent so an operator can see
+/// what was refused. That dump lands in the main log, which is *not* the
+/// `--credentials`-gated smtplog, so a plaintext password there would sit
+/// outside the containment boundary the design draws around credentials.
+/// The stock log level is `debug`, so this is the default configuration and
+/// not one somebody had to turn on.
+#[tokio::test]
+async fn api_log_redaction() {
+    // Unique to this test, so its absence from the shared log is this
+    // test's own evidence and not some other test's luck.
+    const PASSWORD: &str = "Sup3rSecretPassw0rd";
+    const USERNAME: &str = "redaction-testuser";
+    let r = rig(&["DSN"]).await;
+    r.api
+        .fail_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login(USERNAME, PASSWORD).await;
+    let from = "redaction-probe@foobar.com";
+    let reply = send_mail(&mut c, from, &["receiver@foobaz.com"], MESSAGE).await;
+    assert_eq!(reply, "550 authentication service failed\r\n");
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    // 1. The leak itself: no plaintext password on any line, at any level.
+    assert!(
+        !text.contains(PASSWORD),
+        "plaintext password reached the main log:\n{text}"
+    );
+
+    // The remaining four properties belong to this connection, so they are
+    // read off every line this connection logged rather than off one picked
+    // line -- and cannot be satisfied by a sibling test running in parallel.
+    let dumps: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains(&format!("\"from\":\"{from}\"")))
+        .collect();
+    assert_eq!(dumps.len(), 1, "expected one request dump in:\n{text}");
+    let cid = cid_of(dumps[0]).unwrap_or_else(|| panic!("no [cid] on: {}", dumps[0]));
+    let ours: String = text
+        .lines()
+        .filter(|l| cid_of(l) == Some(cid))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // 2. The failure is still reported (spec 5.3).
+    assert!(
+        ours.contains("Failed to call API (Internal Server Error) for "),
+        "the failed call is not reported in:\n{ours}"
+    );
+    // 3. The field is still shown as having been sent.
+    assert!(ours.contains("password"), "no password field in:\n{ours}");
+    // 4. Its value is replaced by the redaction marker.
+    assert!(ours.contains("*******"), "no redaction marker in:\n{ours}");
+    // 5. The rest of the request is what makes the dump worth having.
+    assert!(
+        ours.contains(USERNAME),
+        "the username is gone, so the dump is no longer diagnostic:\n{ours}"
+    );
+}
