@@ -2,8 +2,10 @@
 //! address guard. Ported from the relay half of the Perl `dsn.t`.
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
@@ -481,6 +483,66 @@ async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
             .await
             .unwrap()
     );
+}
+
+/// A message big enough that the last [`smtp_proxy`] write chunk cannot fit
+/// into the duplex in one go: 255 KiB of body plus the terminating dot line
+/// is 261123 bytes, so the final chunk is 64515 bytes against a transport
+/// that takes 8 KiB. Whatever a `write_all` fails to push out is left in
+/// rustls' send buffer, which is exactly the condition under test.
+const BLOCKING_BODY: usize = 255 * 1024;
+
+/// The client half of an implicit-TLS connection to `up`, carried by a
+/// duplex pair of `DUPLEX_CAPACITY` bytes.
+async fn tls_over_duplex(up: &RecordingUpstream) -> impl smtp_proxy::relay::Io + 'static {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, up.connect_duplex(DUPLEX_CAPACITY))
+        .await
+        .unwrap()
+}
+
+/// A body whose tail is still inside rustls when the last `write_all`
+/// returns has to be pushed out before the relay waits for the `250`.
+///
+/// `tokio_rustls` reports plaintext as written as soon as it is in rustls'
+/// send buffer, even when the socket took none of the ciphertext, and
+/// nothing on the read path pushes that buffer out. Without the flush in
+/// `write_body` the upstream never sees the terminating dot, the relay waits
+/// for a reply to a message it has not finished sending, and the inactivity
+/// timeout turns a deliverable message into a `550`.
+///
+/// The transport is a duplex pair and not TCP on purpose: "the socket
+/// blocks" has to be a property of the test rather than of the host's socket
+/// buffers, which auto-tune into the megabytes and could swallow the whole
+/// body.
+#[tokio::test]
+async fn a_tls_body_is_pushed_out_before_the_relay_waits_for_the_reply() {
+    let up = RecordingUpstream::in_memory_implicit_tls(&["DSN"]);
+    let stream = tls_over_duplex(&up).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let payload = body(BLOCKING_BODY);
+    relay_over(stream, Duration::from_secs(5), env, &payload)
+        .await
+        .unwrap();
+    // Byte for byte, so a flush that dropped or reordered the tail is not
+    // mistaken for a delivery.
+    assert_eq!(up.raw_messages(), vec![payload]);
+    // The session really was a TLS one; a plaintext duplex would not have
+    // exercised any of this.
+    assert!(up.tls_commands().iter().any(|c| c.starts_with("MAIL")));
 }
 
 /// Mode Off is what part 1 did, and it has to stay that even in front of an

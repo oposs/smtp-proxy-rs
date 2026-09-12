@@ -145,6 +145,19 @@ impl RecordingUpstream {
         }
     }
 
+    /// [`RecordingUpstream::in_memory`], speaking TLS from the first byte.
+    /// The pairing a write-side TLS test needs: TLS, and a transport whose
+    /// capacity the test picked rather than the host's socket buffers.
+    pub fn in_memory_implicit_tls(extensions: &[&str]) -> Self {
+        let mut inner = Inner::new(extensions);
+        inner.tls = Some(super::test_tls());
+        inner.implicit = true;
+        Self {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
     /// A connection carried by `tokio::io::duplex` rather than by TCP: at
     /// most `capacity` bytes sit in flight before a write blocks, which is
     /// what makes a write-side timing test deterministic. The kernel's

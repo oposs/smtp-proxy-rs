@@ -386,6 +386,7 @@ impl Upstream {
         )
         .await
         .map_err(|_| RelayError::Timeout)??;
+        self.flush().await?;
         let reply = self.read_reply().await?;
         debug!(
             "upstream -> {} {}",
@@ -467,13 +468,45 @@ impl Upstream {
         Ok(())
     }
 
+    /// Hands everything written so far to the transport, under the
+    /// inactivity timeout like every other step.
+    ///
+    /// Not a formality on a TLS connection. `tokio_rustls`' `poll_write`
+    /// takes the plaintext into rustls' send buffer and then pushes as much
+    /// ciphertext at the socket as the socket will take; when the socket
+    /// blocks it still reports the plaintext as written
+    /// (`common/mod.rs:296-306`). So `write_all` can return `Ok` with the
+    /// tail of the message still sitting in rustls. Nothing on the read path
+    /// pushes it out -- `poll_fill_buf` only ever calls `read_io` -- so
+    /// without this flush a large message to a slow upstream would end with
+    /// the relay waiting for a `250` for bytes the upstream has not been
+    /// sent, until the inactivity timer turned a deliverable message into a
+    /// `550`. `server::session` flushes the client-facing leg for the same
+    /// reason.
+    async fn flush(&mut self) -> Result<(), RelayError> {
+        tokio::time::timeout(self.timeout, self.stream.flush())
+            .await
+            .map_err(|_| RelayError::Timeout)??;
+        Ok(())
+    }
+
     /// Writes the message body, restarting the inactivity timer for every
     /// chunk. See [`WRITE_CHUNK`].
+    ///
+    /// Every chunk is flushed before the next one is written, rather than
+    /// once at the end. On a TLS connection the leftovers of each chunk
+    /// would otherwise pile up in rustls' send buffer, which has no bound:
+    /// at the 1 GiB message cap a slow upstream could leave most of the
+    /// message in memory and then have to drain it all inside the single
+    /// timer of one final flush. Per chunk, what is in flight stays one
+    /// chunk and each flush gets its own timer, which is the inactivity
+    /// semantics [`WRITE_CHUNK`] describes.
     async fn write_body(&mut self, payload: &[u8]) -> Result<(), RelayError> {
         for chunk in payload.chunks(WRITE_CHUNK) {
             tokio::time::timeout(self.timeout, self.stream.write_all(chunk))
                 .await
                 .map_err(|_| RelayError::Timeout)??;
+            self.flush().await?;
         }
         Ok(())
     }
