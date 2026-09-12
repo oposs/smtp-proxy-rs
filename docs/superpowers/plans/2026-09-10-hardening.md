@@ -789,6 +789,276 @@ git add -A && git commit -m "Perl conformance gate running the original end-to-e
 
 ---
 
+### Task 22: Carried-over hardening from part 1 (five items, divergence approved)
+
+User ruling, 2026-09-12: **fix all five** carried-over items, and **divergence
+from the Perl is acceptable** where a fix requires it. This overrides part 1's
+"faithful to the Perl, do not fix" entry for the case-sensitive header merge,
+the opaque bare-LF header block, and the missing `setgroups`.
+
+**Files:**
+- Modify: `src/relay.rs` (item 1), `src/proxy.rs` (items 2, 3, 5), `src/privdrop.rs` (item 4), `README.md`
+- Modify tests: `tests/relay.rs`, `tests/proxy_end_to_end.rs`
+
+**Interfaces:**
+- Produces in `relay.rs`: `const MAX_REPLY_LINE: usize = 4096;` and `const MAX_REPLY_TOTAL: usize = 65536;`
+- Produces in `proxy.rs`: `pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String>`
+- Produces in `privdrop.rs`: `trait PrivOps` with `init_groups`, `set_gid`, `set_uid`, so the syscall *order* is testable without root.
+
+---
+
+#### Item 1 — bound the upstream reply (`src/relay.rs`, `read_reply`)
+
+Today both dimensions are unbounded: one `read_line` can consume an endless
+line, and the multi-line loop can accumulate endless lines. Cap both.
+
+- [ ] **Step 1: Tests** (in `tests/relay.rs`, over `tokio::io::duplex` like the
+      existing timing tests — never a real socket)
+
+```rust
+#[tokio::test]
+async fn endless_reply_line_is_refused_not_buffered() {
+    // Upstream sends "220 " then 1 MiB of 'x' with no newline.
+    // Assert: the relay returns an error, and does so after reading at most
+    // MAX_REPLY_LINE + a small slack, not after consuming the whole stream.
+}
+
+#[tokio::test]
+async fn endless_multiline_reply_is_refused() {
+    // Upstream sends "220-a\r\n" repeatedly and never a final "220 a\r\n".
+    // Assert: the relay returns an error once the accumulated reply passes
+    // MAX_REPLY_TOTAL.
+}
+```
+
+Both tests MUST be run under a memory cap when first executed:
+`systemd-run --user --scope -p MemoryMax=2G -- cargo test --test relay`.
+A red version of either test that OOMs instead of failing is a broken test.
+
+- [ ] **Step 2: Implement**
+
+Replace the bare `self.reader.read_line(&mut line)` with a bounded read:
+
+```rust
+use tokio::io::AsyncReadExt;
+let n = tokio::time::timeout(
+    self.timeout,
+    (&mut self.reader).take(MAX_REPLY_LINE as u64).read_line(&mut line),
+).await.map_err(|_| RelayError::Timeout)??;
+```
+
+After the read, if `line` reached the cap without ending in `\n`, fail with
+`std::io::ErrorKind::InvalidData` and the message
+`upstream reply line exceeds 4096 bytes`. Track the accumulated `raw.len()`
+across loop iterations and fail the same way with
+`upstream reply exceeds 65536 bytes` once it passes `MAX_REPLY_TOTAL`.
+
+Note: `Take` must be released between iterations (`take` consumes `&mut`), so
+re-wrap per line rather than holding one `Take` across the loop.
+
+---
+
+#### Item 2 — case-insensitive header merge (`src/proxy.rs`, `merge_headers`)
+
+`a.name == h.name` is case-sensitive, so an API answering `subject` while the
+client sent `Subject` emits **both**. RFC 5322 says header names are
+case-insensitive. **Divergence from the Perl, approved.**
+
+- [ ] **Step 1: Test**
+
+```rust
+#[test]
+fn api_header_replaces_client_header_regardless_of_case() {
+    let existing = vec![h("Subject", "client"), h("To", "x@y.com")];
+    let api = vec![rh("subject", Some("api"))];
+    let merged = merge_headers(existing, &api);
+    assert_eq!(merged, vec![h("To", "x@y.com"), h("subject", "api")]);
+}
+```
+
+(`rh` builds a `ResponseHeader`; add the helper if the test module lacks it.)
+Also assert that a `None` API value still *removes* the client header
+case-insensitively — that path exists today and must keep working.
+
+- [ ] **Step 2: Implement** — change the filter to
+`!api.iter().any(|a| a.name.eq_ignore_ascii_case(&h.name))`. ASCII is correct:
+RFC 5322 field names are printable ASCII.
+
+---
+
+#### Item 3 — bare-LF header blocks (`src/proxy.rs`, `parse_headers`)
+
+`block.split_inclusive("\r\n")` only splits on CRLF, so a header block that
+uses bare LF arrives as a **single opaque header** whose value carries every
+remaining header. API-side header policy is therefore evadable by sending bare
+LF. `DataReader` already accepts bare-LF line terminators
+(`src/server/data.rs`, `bare_lf_terminators_are_accepted`), so the block
+genuinely reaches here in that shape. **Divergence from the Perl, approved.**
+
+- [ ] **Step 1: Tests**
+
+```rust
+#[test]
+fn bare_lf_header_block_splits_into_headers() {
+    let parsed = parse_headers("From: a@b.com\nSubject: hi\nTo: x@y.com\n");
+    assert_eq!(parsed, vec![
+        h("From", "a@b.com"), h("Subject", "hi"), h("To", "x@y.com"),
+    ]);
+}
+
+#[test]
+fn bare_lf_folding_still_folds() {
+    let parsed = parse_headers("Subject: long\n  folded\nTo: x@y.com\n");
+    assert_eq!(parsed, vec![h("Subject", "long\n  folded"), h("To", "x@y.com")]);
+}
+
+#[test]
+fn mixed_crlf_and_lf_block_splits_on_both() {
+    let parsed = parse_headers("A: 1\r\nB: 2\nC: 3\r\n");
+    assert_eq!(parsed, vec![h("A", "1"), h("B", "2"), h("C", "3")]);
+}
+```
+
+**Every existing `parse_headers` test must stay green unchanged** — in
+particular `headers_split_at_unfolded_crlf` and
+`a_header_with_nothing_behind_the_colon_is_dropped`. If one turns red, that is
+a finding, not a test to edit.
+
+- [ ] **Step 2: Implement** — split on `'\n'` inclusive instead of `"\r\n"`,
+keep the same continuation test (`raw.starts_with([' ', '\t', '\x0b', '\x0c'])`),
+and trim the terminator with `trim_end_matches(['\r', '\n'])` instead of
+`trim_end_matches("\r\n")`. The folded value keeps its embedded line break
+verbatim, exactly as it does today for CRLF, and `perl_header_value` is
+unchanged.
+
+---
+
+#### Item 4 — `setgroups` before `setuid` (`src/privdrop.rs`)
+
+No `setgroups`/`initgroups` call, so a proxy started as root keeps **root's
+supplementary groups** after dropping to the unprivileged user. Matches the
+Perl (`SMTPProxy.pm:212-217`); fix anyway. **Divergence from the Perl, approved.**
+
+**Ruling: use `initgroups`, not `setgroups(&[])`.** `initgroups(user, gid)`
+gives the target user exactly the groups they would have on login, which is
+what a conventional daemon `--user` flag does. Dropping all supplementary
+groups would be more restrictive but would silently break an operator who
+grants cert-file read access through a group.
+
+- [ ] **Step 1: Tests**
+
+The success path is irreversible and cannot be exercised in-process — part 1
+deliberately did not test it. So make the **order** testable instead: extract
+the three syscalls behind a small trait.
+
+```rust
+pub(crate) trait PrivOps {
+    fn init_groups(&self, user: &std::ffi::CStr, gid: Gid) -> nix::Result<()>;
+    fn set_gid(&self, gid: Gid) -> nix::Result<()>;
+    fn set_uid(&self, uid: Uid) -> nix::Result<()>;
+}
+```
+
+`drop_to` resolves the user and delegates to `drop_with(ops, user, entry)`.
+Tests use a recording double:
+
+```rust
+#[test]
+fn privileges_drop_in_the_order_groups_gid_uid() {
+    // Assert the recorded call sequence is exactly
+    // ["init_groups", "set_gid", "set_uid"].
+}
+
+#[test]
+fn a_failing_initgroups_aborts_before_setgid() {
+    // Double fails init_groups; assert set_gid and set_uid were never called
+    // and the error names the operation.
+}
+```
+
+Keep `unknown_user_is_reported_by_name` exactly as it is.
+
+- [ ] **Step 2: Implement** — `nix::unistd::initgroups(&CString::new(user)?, entry.gid)`
+before `setgid`. Enable the `nix` feature the call needs if it is not already
+on. Error text follows the existing style:
+`Failed to initgroups for '{user}': {e}`. Update the doc comment at the top of
+the file: the ordering comment must now name all three calls.
+
+---
+
+#### Item 5 — refuse an unfolded line break in a relayed header (`src/proxy.rs`)
+
+`format_message` interpolates `h.value` unchecked, so a value carrying
+`\r\n\r\n` splits the relayed message and forges a body. Envelope addresses are
+already guarded by `assert_relayable`; header values are not. **Divergence from
+the Perl, approved.**
+
+**Ruling on the exact rule:** a line break inside a value is legal only as a
+proper fold — a `\r\n` or `\n` immediately followed by a space or tab. Anything
+else is refused. A *name* may contain no `\r`, `\n` or `:` at all. This precise
+rule is required, not merely "reject any CRLF": client-supplied folded headers
+arrive here with their embedded break intact (see Item 3) and must keep
+relaying.
+
+- [ ] **Step 1: Tests**
+
+```rust
+#[test]
+fn a_folded_value_is_still_relayable() {
+    assert!(assert_header_relayable(&[h("Subject", "long\r\n  folded")]).is_ok());
+    assert!(assert_header_relayable(&[h("Subject", "long\n\tfolded")]).is_ok());
+}
+
+#[test]
+fn an_unfolded_break_in_a_value_is_refused() {
+    assert!(assert_header_relayable(&[h("X", "a\r\n\r\nforged body")]).is_err());
+    assert!(assert_header_relayable(&[h("X", "a\r\nInjected: yes")]).is_err());
+    assert!(assert_header_relayable(&[h("X", "a\nInjected: yes")]).is_err());
+    assert!(assert_header_relayable(&[h("X", "trailing\r\n")]).is_err());
+}
+
+#[test]
+fn a_break_or_colon_in_a_name_is_refused() {
+    assert!(assert_header_relayable(&[h("X\r\nY", "v")]).is_err());
+    assert!(assert_header_relayable(&[h("X: Y", "v")]).is_err());
+}
+```
+
+Plus one end-to-end test in `tests/proxy_end_to_end.rs`: an API response whose
+header value contains `\r\n\r\n` gets the mail rejected and **nothing relayed**
+— assert the `RecordingUpstream` saw no message. Do not relax `RecordingUpstream`.
+
+- [ ] **Step 2: Implement**
+
+Call it from `relay_message`, on the **merged** list, before `format_message`:
+
+```rust
+let headers = merge_headers(self.transaction.headers.clone(), &outcome.headers);
+if let Err(which) = assert_header_relayable(&headers) {
+    warn!("Refusing to relay header '{which}' for {}: unfolded line break", self.client);
+    return Err("authentication service failed".into());
+}
+```
+
+`Err` carries the offending header **name only** — never the value, which may
+hold customer content. The client therefore sees
+`550 authentication service failed`, an existing verbatim reply text: **no new
+reply string is introduced by this item.**
+
+---
+
+- [ ] **Step 3: README and commit**
+
+Add all five to the README's "Differences from the Perl version" list: items 2,
+3 and 5 change observable behaviour, item 1 changes it only against a hostile
+upstream, and item 4 changes the process's group set. Say for each that the
+Perl does not do it and why we do.
+
+Gates: `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+`cargo fmt --check`, then one commit.
+
+---
+
 ## Self-review against the spec (part 2)
 
 | Spec section | Task |
@@ -800,14 +1070,21 @@ git add -A && git commit -m "Perl conformance gate running the original end-to-e
 | 9.3 rate limits | 18 |
 | 10 deb, release, Makefile | 20 |
 | 11.3 conformance gate | 21 |
+| part-1 carry-over (5 items, user ruling 2026-09-12) | 22 |
 | 12 known differences documented | README in Task 20 |
 
-## Carried over from part 1 — items this plan does not currently cover
+## Carried over from part 1 — now covered by Task 22
 
 Raised during part 1's execution and its final whole-branch review, and ruled
 into part 2 rather than fixed on that branch. Each says why it was deferred and
 what it costs. Items 1, 3, 4 and 5 are security-relevant; none is a regression,
 because the Perl behaves the same way in every case.
+
+> **User ruling, 2026-09-12: fix all five, and divergence from the Perl is
+> acceptable.** This section is now the rationale; **Task 22 is the work**. The
+> ruling overrides part 1's "faithful to the Perl, do not fix" entry for items
+> 2, 3 and 4, and settles the sole objection to item 5 (that it diverges from
+> the Perl on wire output in a drop-in release).
 
 1. **Bound the upstream `read_reply`** (`src/relay.rs`). Unbounded today, as in
    the Perl. A hostile or compromised upstream can feed an endless reply and
@@ -834,6 +1111,15 @@ because the Perl behaves the same way in every case.
 ### Known divergences for Task 21's conformance gate
 
 These are deliberate. The gate will report them; they are not defects.
+
+- **Task 22's five items (user ruling, 2026-09-12).** Three change observable
+  behaviour against the Perl and the gate will see them: the header merge is
+  case-insensitive, a bare-LF header block splits into individual headers
+  instead of one opaque header, and a relayed header carrying an unfolded line
+  break is refused with `550 authentication service failed`. Two more diverge
+  without changing a conforming exchange: the upstream reply is capped at
+  4096 bytes per line and 65536 total, and the privilege drop calls
+  `initgroups` before `setgid`.
 
 - **Exit codes.** The Perl does missing-mandatory → 2 on stderr and `--help` → 1
   on stdout (`pod2usage()` vs `pod2usage(1)`, measured). Ours does
