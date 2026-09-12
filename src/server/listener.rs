@@ -50,14 +50,13 @@ impl ConnectionLimits {
     }
 
     /// Tries to reserve one slot for `ip`. On success, the returned permit
-    /// releases both counters when it is dropped. This happens whenever
-    /// tokio drops the session task's future -- on normal completion, on a
-    /// panic inside it, and on `JoinHandle::abort()` -- because in every one
-    /// of those cases tokio's own task harness (`poll_future`'s `Guard`,
-    /// which runs on unwind too) calls `drop_future_or_output()` on the
-    /// task's stored future, and `_permit` sits in that future's state,
-    /// not on any stack frame. A future graceful-drain rewrite of this
-    /// accept loop that aborts idle sessions is therefore still covered.
+    /// releases both counters when it is dropped. `_permit` lives in the
+    /// session task's stored future (it is moved in as `let _permit =
+    /// permit;` at the top of that future), not on any stack frame, and
+    /// that future is guaranteed to be dropped -- releasing the permit --
+    /// whether the session ends normally, panics, or the task is aborted.
+    /// The abort case matters here: a future graceful-drain rewrite of this
+    /// accept loop that aborts idle sessions is still covered.
     pub fn try_acquire(&self, ip: IpAddr) -> Result<ConnectionPermit, &'static str> {
         let total = match &self.total {
             Some(sem) => match Arc::clone(sem).try_acquire_owned() {
