@@ -50,10 +50,14 @@ impl ConnectionLimits {
     }
 
     /// Tries to reserve one slot for `ip`. On success, the returned permit
-    /// releases both counters when it is dropped -- including on a session
-    /// panic, since it lives on the session task's stack and normal Rust
-    /// unwinding runs its `Drop` before tokio's `catch_unwind` boundary is
-    /// reached.
+    /// releases both counters when it is dropped. This happens whenever
+    /// tokio drops the session task's future -- on normal completion, on a
+    /// panic inside it, and on `JoinHandle::abort()` -- because in every one
+    /// of those cases tokio's own task harness (`poll_future`'s `Guard`,
+    /// which runs on unwind too) calls `drop_future_or_output()` on the
+    /// task's stored future, and `_permit` sits in that future's state,
+    /// not on any stack frame. A future graceful-drain rewrite of this
+    /// accept loop that aborts idle sessions is therefore still covered.
     pub fn try_acquire(&self, ip: IpAddr) -> Result<ConnectionPermit, &'static str> {
         let total = match &self.total {
             Some(sem) => match Arc::clone(sem).try_acquire_owned() {
@@ -174,4 +178,32 @@ pub async fn serve<F: HandlerFactory>(
         });
     }
     while tasks.join_next().await.is_some() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    /// Pins the invariant a refusal depends on: `or_insert(0)` inside
+    /// `try_acquire` can never itself trip `count >= per_ip_max` (that
+    /// branch only runs when `per_ip_max != 0`), so a refused connection
+    /// never leaves an orphan zero entry behind, and every granted permit's
+    /// release brings the count back down to exactly zero -- removing the
+    /// map entry rather than leaving it to accumulate.
+    #[test]
+    fn per_ip_map_is_empty_once_every_permit_drops() {
+        let limits = ConnectionLimits::new(0, 2);
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        let p1 = limits.try_acquire(ip).unwrap();
+        let p2 = limits.try_acquire(ip).unwrap();
+        assert_eq!(limits.try_acquire(ip).err(), Some("per-ip"));
+        assert_eq!(limits.per_ip.lock().unwrap().get(&ip), Some(&2));
+
+        drop(p1);
+        assert_eq!(limits.per_ip.lock().unwrap().get(&ip), Some(&1));
+        drop(p2);
+        assert!(limits.per_ip.lock().unwrap().is_empty());
+    }
 }

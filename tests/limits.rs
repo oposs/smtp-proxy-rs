@@ -56,6 +56,36 @@ async fn per_ip_connection_limit() {
 }
 
 #[tokio::test]
+async fn per_ip_slot_is_released_after_quit() {
+    let mut config = server_config(false, false);
+    config.max_connections_per_ip = 1;
+    let addr = start_server(config, ScriptedFactory::default()).await;
+    let (mut c1, g1) = RawClient::connect(addr).await;
+    assert!(g1.starts_with("220"));
+    let quit_reply = c1.command("QUIT").await;
+    assert!(quit_reply.starts_with("221"));
+    assert!(c1.expect_close().await);
+    drop(c1);
+
+    // Same reasoning as `total_connection_limit`'s poll: the permit
+    // releases once the session task notices QUIT closed the connection,
+    // not on any margin this test could safely guess.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (c2, g2) = RawClient::connect(addr).await;
+        if g2.starts_with("220") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "per-ip slot was not freed within 5s of QUIT"
+        );
+        drop(c2);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
 async fn zero_means_unlimited() {
     let mut config = server_config(false, false);
     config.max_connections = 0;
