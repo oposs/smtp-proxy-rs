@@ -27,6 +27,8 @@ pub fn server_config(require_starttls: bool, require_auth: bool) -> ServerConfig
         max_message_size: 1 << 30,
         smtplog: None,
         tls_idle_timeout: std::time::Duration::from_secs(600),
+        max_connections: 0,
+        max_connections_per_ip: 0,
     }
 }
 

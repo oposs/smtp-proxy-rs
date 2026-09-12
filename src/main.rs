@@ -53,6 +53,8 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         max_message_size: config.max_message_size,
         smtplog,
         tls_idle_timeout: Duration::from_secs(600),
+        max_connections: config.max_connections,
+        max_connections_per_ip: config.max_connections_per_ip,
     });
     let listeners = listener::bind(&config.listen).await?;
     if let Some(user) = &config.user {

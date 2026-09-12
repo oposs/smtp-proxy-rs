@@ -95,6 +95,18 @@ pub struct Cli {
         help = "do not verify the upstream certificate at all"
     )]
     pub upstream_tls_insecure: bool,
+    #[arg(
+        long = "max_connections",
+        default_value_t = 1000,
+        help = "total concurrent connections allowed; 0 means unlimited"
+    )]
+    pub max_connections: usize,
+    #[arg(
+        long = "max_connections_per_ip",
+        default_value_t = 50,
+        help = "concurrent connections allowed from a single client IP; 0 means unlimited"
+    )]
+    pub max_connections_per_ip: usize,
 }
 
 /// The command line after the mandatory flags have been checked and the
@@ -115,6 +127,8 @@ pub struct Config {
     pub upstream_tls: UpstreamTlsMode,
     pub upstream_tls_ca: Option<PathBuf>,
     pub upstream_tls_insecure: bool,
+    pub max_connections: usize,
+    pub max_connections_per_ip: usize,
 }
 
 /// `ip:port`, where the ip may be IPv4 or IPv6 and the port is the text
@@ -196,6 +210,8 @@ pub fn parse_args() -> Config {
         upstream_tls: cli.upstream_tls,
         upstream_tls_ca: cli.upstream_tls_ca.clone(),
         upstream_tls_insecure: cli.upstream_tls_insecure,
+        max_connections: cli.max_connections,
+        max_connections_per_ip: cli.max_connections_per_ip,
     }
 }
 

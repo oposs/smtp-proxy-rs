@@ -51,6 +51,10 @@ pub struct ServerConfig {
     pub smtplog: Option<Arc<crate::smtplog::SmtpLog>>,
     /// Inactivity timeout once TLS is up. Perl: 600 s.
     pub tls_idle_timeout: std::time::Duration,
+    /// Total concurrent connections across all listeners. 0 means unlimited.
+    pub max_connections: usize,
+    /// Concurrent connections from a single client IP. 0 means unlimited.
+    pub max_connections_per_ip: usize,
 }
 
 impl ServerConfig {
