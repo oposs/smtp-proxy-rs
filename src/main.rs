@@ -4,7 +4,7 @@ use std::time::Duration;
 use smtp_proxy::api::ApiClient;
 use smtp_proxy::config::parse_args;
 use smtp_proxy::proxy::{ProxyConfig, ProxyFactory};
-use smtp_proxy::relay::RelayConfig;
+use smtp_proxy::relay::{RelayConfig, UpstreamTls};
 use smtp_proxy::server::{ServerConfig, listener};
 use smtp_proxy::smtplog::SmtpLog;
 
@@ -31,6 +31,13 @@ fn main() {
 
 async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     let tls = ServerConfig::load_tls(&config.tls_cert, &config.tls_key)?;
+    // Before the listeners: a bad CA file or an unusable trust store has to
+    // be a startup error, not a surprise on the first message.
+    let upstream_tls = UpstreamTls::build(
+        config.upstream_tls,
+        config.upstream_tls_ca.as_deref(),
+        config.upstream_tls_insecure,
+    )?;
     let smtplog = match &config.smtplog {
         Some(path) => Some(Arc::new(
             SmtpLog::open(path, config.credentials)
@@ -58,6 +65,8 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
             host: config.tohost.clone(),
             port: config.toport,
             timeout: Duration::from_secs(60),
+            tls: upstream_tls,
+            tls_server_name: None,
         },
     });
     // Spec 6: the probe runs after the privilege drop and does not block

@@ -4,55 +4,18 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+/// The transport seam and the permissive verifier both live in the relay,
+/// which needs them for the upstream leg; the tests use the very same ones
+/// rather than a second copy that could drift.
+pub use smtp_proxy::relay::{Io, NoVerify};
 
 pub struct RawClient {
     stream: Box<dyn Io>,
     buf: Vec<u8>,
-}
-
-/// Accepts any server certificate; the test certificate is self-signed.
-#[derive(Debug)]
-struct NoVerify(rustls::crypto::CryptoProvider);
-
-impl rustls::client::danger::ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _: &rustls::pki_types::CertificateDer<'_>,
-        _: &[rustls::pki_types::CertificateDer<'_>],
-        _: &rustls::pki_types::ServerName<'_>,
-        _: &[u8],
-        _: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        m: &[u8],
-        c: &rustls::pki_types::CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        m: &[u8],
-        c: &rustls::pki_types::CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
 }
 
 impl RawClient {
@@ -167,8 +130,8 @@ impl RawClient {
         &mut self,
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) {
-        let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(versions)
             .unwrap()
             .dangerous()

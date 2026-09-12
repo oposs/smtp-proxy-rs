@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser};
 
+use crate::relay::UpstreamTlsMode;
+
 const LONG_ABOUT: &str = "Starts an SMTP server on the listen host and port. When a connection is \
 established, communicates with the client up to the point it has both the envelope and the mail \
 data headers. It requires STARTTLS to be used, and takes authentication details using the PLAIN \
@@ -74,6 +76,25 @@ pub struct Cli {
         help = "largest message accepted, in bytes"
     )]
     pub max_message_size: usize,
+    #[arg(
+        long = "upstream_tls",
+        value_enum,
+        default_value_t = UpstreamTlsMode::Opportunistic,
+        help = "TLS on the connection to the upstream: off, opportunistic (STARTTLS when \
+                offered), required (STARTTLS always), implicit (TLS from the first byte)"
+    )]
+    pub upstream_tls: UpstreamTlsMode,
+    #[arg(
+        long = "upstream_tls_ca",
+        help = "additional CA certificates (PEM) to trust for the upstream, on top of the \
+                system store"
+    )]
+    pub upstream_tls_ca: Option<PathBuf>,
+    #[arg(
+        long = "upstream_tls_insecure",
+        help = "do not verify the upstream certificate at all"
+    )]
+    pub upstream_tls_insecure: bool,
 }
 
 /// The command line after the mandatory flags have been checked and the
@@ -91,6 +112,9 @@ pub struct Config {
     pub smtplog: Option<PathBuf>,
     pub credentials: bool,
     pub max_message_size: usize,
+    pub upstream_tls: UpstreamTlsMode,
+    pub upstream_tls_ca: Option<PathBuf>,
+    pub upstream_tls_insecure: bool,
 }
 
 /// `ip:port`, where the ip may be IPv4 or IPv6 and the port is the text
@@ -169,6 +193,9 @@ pub fn parse_args() -> Config {
         smtplog: cli.smtplog.clone(),
         credentials: cli.credentials,
         max_message_size: cli.max_message_size,
+        upstream_tls: cli.upstream_tls,
+        upstream_tls_ca: cli.upstream_tls_ca.clone(),
+        upstream_tls_insecure: cli.upstream_tls_insecure,
     }
 }
 

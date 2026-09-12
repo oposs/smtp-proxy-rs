@@ -18,8 +18,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+
+use super::raw_client::Io;
 
 #[derive(Clone)]
 pub struct RecordingUpstream {
@@ -67,6 +70,18 @@ struct Inner {
     /// a body several times bigger than the buffers can hold, which puts
     /// every pause safely inside the transfer.
     data_pace: Option<(usize, Duration, usize)>,
+    /// `Some` for an upstream that can do TLS. Then `STARTTLS` is announced
+    /// and answered, or, with `implicit`, the connection is a TLS one from
+    /// its first byte and STARTTLS is neither announced nor accepted.
+    tls: Option<Arc<rustls::ServerConfig>>,
+    implicit: bool,
+    /// Extensions the EHLO *inside* TLS announces. `None` means the same
+    /// list as outside.
+    tls_extensions: Option<Vec<String>>,
+    /// Every command that arrived inside TLS, across all connections since
+    /// the last `clear()` -- so a test can tell an envelope that went out
+    /// encrypted from one that went out in the clear.
+    tls_commands: Vec<String>,
 }
 
 impl Inner {
@@ -80,20 +95,42 @@ impl Inner {
             accept_text: "OK message accepted".into(),
             data_stall: None,
             data_pace: None,
+            tls: None,
+            implicit: false,
+            tls_extensions: None,
+            tls_commands: Vec::new(),
         }
     }
 }
 
 impl RecordingUpstream {
     pub async fn start(extensions: &[&str]) -> Self {
+        Self::listen(Inner::new(extensions)).await
+    }
+
+    /// A TLS-capable upstream, using the test certificate. With `implicit`
+    /// the connection is TLS from its first byte; otherwise the EHLO
+    /// announces STARTTLS and the command upgrades the session.
+    pub async fn start_tls(extensions: &[&str], implicit: bool) -> Self {
+        let mut inner = Inner::new(extensions);
+        inner.tls = Some(super::test_tls());
+        inner.implicit = implicit;
+        Self::listen(inner).await
+    }
+
+    async fn listen(inner: Inner) -> Self {
+        // 127.0.0.1 and not `localhost`: the address a test connects to must
+        // not depend on how the host resolves a name. What the certificate
+        // is checked against is `RelayConfig::tls_server_name`, which is a
+        // separate string for exactly this reason.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let inner = Arc::new(Mutex::new(Inner::new(extensions)));
+        let inner = Arc::new(Mutex::new(inner));
         let state = inner.clone();
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                tokio::spawn(serve_one(stream, state.clone()));
+                tokio::spawn(serve_one(Box::new(stream), state.clone()));
             }
         });
         Self { addr, inner }
@@ -115,7 +152,7 @@ impl RecordingUpstream {
     /// so a TCP-backed timing test is at their mercy.
     pub fn connect_duplex(&self, capacity: usize) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(capacity);
-        tokio::spawn(serve_one(server, self.inner.clone()));
+        tokio::spawn(serve_one(Box::new(server), self.inner.clone()));
         client
     }
 
@@ -152,8 +189,22 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().messages.clone()
     }
 
+    /// Every command that arrived inside TLS, across all connections since
+    /// the last `clear()`. Compare [`RecordingUpstream::commands`], which is
+    /// the latest connection only.
+    pub fn tls_commands(&self) -> Vec<String> {
+        self.inner.lock().unwrap().tls_commands.clone()
+    }
+
     pub fn set_extensions(&self, extensions: &[&str]) {
         self.inner.lock().unwrap().extensions = extensions.iter().map(|s| s.to_string()).collect();
+    }
+
+    /// The extensions the EHLO inside TLS announces. Without this call the
+    /// list is the same inside and outside.
+    pub fn set_tls_extensions(&self, extensions: &[&str]) {
+        self.inner.lock().unwrap().tls_extensions =
+            Some(extensions.iter().map(|s| s.to_string()).collect());
     }
 
     pub fn reject_ehlo(&self, text: Option<&str>) {
@@ -186,20 +237,39 @@ impl RecordingUpstream {
         let mut i = self.inner.lock().unwrap();
         i.connections.clear();
         i.messages.clear();
+        i.tls_commands.clear();
     }
 }
 
-/// Generic over the transport so the same recording server can be reached
-/// over TCP or over a `tokio::io::duplex` pair.
-async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
-    stream: S,
-    state: Arc<Mutex<Inner>>,
-) {
+/// The transport is a trait object so that the same recording server can be
+/// reached over TCP or over a `tokio::io::duplex` pair, and so that STARTTLS
+/// can replace it mid-session. Buffered on the read side and written
+/// through, which is what lets the stream be taken back out for the
+/// handshake.
+async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
     let transcript: Transcript = Arc::new(Mutex::new(Vec::new()));
-    state.lock().unwrap().connections.push(transcript.clone());
-    let (r, mut w) = tokio::io::split(stream);
-    let mut reader = BufReader::new(r);
-    if w.write_all(b"220 recording.upstream ESMTP ready\r\n")
+    let (tls_config, implicit) = {
+        let mut s = state.lock().unwrap();
+        s.connections.push(transcript.clone());
+        (s.tls.clone(), s.implicit)
+    };
+    let mut in_tls = false;
+    let mut io = if implicit {
+        let config = tls_config
+            .clone()
+            .expect("an implicit-TLS upstream needs a TLS configuration");
+        match TlsAcceptor::from(config).accept(stream).await {
+            Ok(tls) => {
+                in_tls = true;
+                BufReader::new(Box::new(tls) as Box<dyn Io>)
+            }
+            Err(_) => return,
+        }
+    } else {
+        BufReader::new(stream)
+    };
+    if io
+        .write_all(b"220 recording.upstream ESMTP ready\r\n")
         .await
         .is_err()
     {
@@ -214,7 +284,7 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
         // `read_until` rather than `lines()`: the body has to be recorded
         // byte for byte, terminators included.
         let mut raw: Vec<u8> = Vec::new();
-        match reader.read_until(b'\n', &mut raw).await {
+        match io.read_until(b'\n', &mut raw).await {
             Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
@@ -231,7 +301,8 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
                     s.messages.push(std::mem::take(&mut message));
                     s.accept_text.clone()
                 };
-                if w.write_all(format!("250 {text}\r\n").as_bytes())
+                if io
+                    .write_all(format!("250 {text}\r\n").as_bytes())
                     .await
                     .is_err()
                 {
@@ -256,11 +327,24 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
             .trim_end_matches(['\r', '\n'])
             .to_string();
         transcript.lock().unwrap().push(line.clone());
+        if in_tls {
+            state.lock().unwrap().tls_commands.push(line.clone());
+        }
         let upper = line.to_ascii_uppercase();
         let reply = if upper.starts_with("EHLO") {
             let (rejection, ext) = {
                 let s = state.lock().unwrap();
-                (s.reject_ehlo.clone(), s.extensions.clone())
+                let mut ext = match (in_tls, &s.tls_extensions) {
+                    (true, Some(inside)) => inside.clone(),
+                    _ => s.extensions.clone(),
+                };
+                // RFC 3207 4.2: STARTTLS is announced only while the session
+                // is still in the clear, and an implicit-TLS port never
+                // announces it at all.
+                if !in_tls && s.tls.is_some() && !s.implicit {
+                    ext.insert(0, "STARTTLS".into());
+                }
+                (s.reject_ehlo.clone(), ext)
             };
             if let Some(text) = rejection {
                 format!("500 {text}\r\n")
@@ -291,13 +375,39 @@ async fn serve_one<S: AsyncRead + AsyncWrite + Send + 'static>(
             in_data = true;
             stall_after_reply = state.lock().unwrap().data_stall;
             "354 Go ahead\r\n".into()
+        } else if upper.starts_with("STARTTLS") && !in_tls && tls_config.is_some() && !implicit {
+            if io.write_all(b"220 Go ahead\r\n").await.is_err() {
+                return;
+            }
+            // Nothing may be buffered here: whatever a client pipelines
+            // behind STARTTLS is plaintext that must not be taken for part
+            // of the TLS session (RFC 3207 4.2). A fake that quietly
+            // swallowed it would hide exactly that bug in the relay.
+            assert!(
+                io.buffer().is_empty(),
+                "the client pipelined {:?} behind STARTTLS",
+                String::from_utf8_lossy(io.buffer())
+            );
+            let placeholder: Box<dyn Io> = Box::new(tokio::io::empty());
+            let plain = std::mem::replace(&mut io, BufReader::new(placeholder)).into_inner();
+            let config = tls_config.clone().unwrap();
+            match TlsAcceptor::from(config).accept(plain).await {
+                Ok(tls) => {
+                    io = BufReader::new(Box::new(tls) as Box<dyn Io>);
+                    in_tls = true;
+                }
+                // A handshake the client failed to complete, which is what
+                // an untrusted certificate looks like from this side.
+                Err(_) => return,
+            }
+            continue;
         } else if upper.starts_with("QUIT") {
-            let _ = w.write_all(b"221 Bye\r\n").await;
+            let _ = io.write_all(b"221 Bye\r\n").await;
             return;
         } else {
             "502 Command not implemented\r\n".into()
         };
-        if w.write_all(reply.as_bytes()).await.is_err() {
+        if io.write_all(reply.as_bytes()).await.is_err() {
             return;
         }
         if let Some(pause) = stall_after_reply.take() {

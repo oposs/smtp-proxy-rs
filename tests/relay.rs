@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
-use smtp_proxy::relay::{Envelope, RelayConfig, RelayError, probe, relay, relay_over};
+use smtp_proxy::relay::{
+    Envelope, RelayConfig, RelayError, UpstreamTls, UpstreamTlsMode, probe, relay, relay_over,
+};
 use smtp_proxy::smtp::params::Param;
 
 /// How many bytes may sit in flight on the in-memory connections the timing
@@ -19,11 +21,30 @@ fn config_with_timeout(up: &RecordingUpstream, timeout: Duration) -> RelayConfig
         host: "127.0.0.1".into(),
         port: up.addr.port(),
         timeout,
+        tls: UpstreamTls::off(),
+        tls_server_name: None,
     }
 }
 
 fn config(up: &RecordingUpstream) -> RelayConfig {
     config_with_timeout(up, Duration::from_secs(5))
+}
+
+/// The TLS counterpart of [`config`]. The connection goes to 127.0.0.1 like
+/// every other test's, while the certificate is checked against `localhost`,
+/// the only name the generated test certificate carries. Keeping the two
+/// apart is what makes this test independent of how the host resolves
+/// `localhost` -- which of `127.0.0.1` and `::1` comes first differs per
+/// host, and the recording upstream listens on the IPv4 address only.
+fn tls_config(up: &RecordingUpstream, mode: UpstreamTlsMode, insecure: bool) -> RelayConfig {
+    let ca = common::certs::dir().join("server.crt");
+    RelayConfig {
+        host: "127.0.0.1".into(),
+        port: up.addr.port(),
+        timeout: Duration::from_secs(5),
+        tls: UpstreamTls::build(mode, if insecure { None } else { Some(&ca) }, insecure).unwrap(),
+        tls_server_name: Some("localhost".into()),
+    }
 }
 
 /// A body of exactly `len` bytes in 1 KiB CRLF-terminated lines. `len` must
@@ -60,7 +81,9 @@ async fn probe_reports_dsn() {
         probe(&RelayConfig {
             host: "127.0.0.1".into(),
             port: 1,
-            timeout: Duration::from_secs(1)
+            timeout: Duration::from_secs(1),
+            tls: UpstreamTls::off(),
+            tls_server_name: None,
         })
         .await
         .is_err()
@@ -345,4 +368,135 @@ async fn addresses_with_line_breaks_are_refused_before_any_write() {
         Err(RelayError::Address(_))
     ));
     assert!(up.commands().is_empty());
+}
+
+#[tokio::test]
+async fn opportunistic_uses_starttls_when_offered() {
+    let up = RecordingUpstream::start_tls(&["DSN"], false).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    relay(
+        &tls_config(&up, UpstreamTlsMode::Opportunistic, false),
+        env,
+        b"x\r\n",
+    )
+    .await
+    .unwrap();
+    let cmds = up.commands();
+    assert!(cmds[0].starts_with("EHLO"));
+    assert_eq!(cmds[1], "STARTTLS");
+    assert!(cmds[2].starts_with("EHLO"));
+    // The envelope went out inside the TLS session, not before it.
+    assert!(up.tls_commands().iter().any(|c| c.starts_with("MAIL")));
+}
+
+#[tokio::test]
+async fn opportunistic_stays_plain_without_starttls_but_required_fails() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    relay(
+        &tls_config(&up, UpstreamTlsMode::Opportunistic, false),
+        env,
+        b"x\r\n",
+    )
+    .await
+    .unwrap();
+    assert!(!up.commands().contains(&"STARTTLS".to_string()));
+    assert!(up.tls_commands().is_empty());
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    assert!(matches!(
+        relay(
+            &tls_config(&up, UpstreamTlsMode::Required, false),
+            env,
+            b"x\r\n"
+        )
+        .await,
+        Err(RelayError::NoStartTls)
+    ));
+    // Required gives up before the envelope: nothing went out in the clear.
+    assert!(!up.commands().iter().any(|c| c.starts_with("MAIL")));
+}
+
+#[tokio::test]
+async fn certificate_failure_does_not_fall_back_to_plain() {
+    let up = RecordingUpstream::start_tls(&["DSN"], false).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    // No extra CA: the self-signed test certificate is not trusted.
+    let mut cfg = tls_config(&up, UpstreamTlsMode::Opportunistic, false);
+    cfg.tls = UpstreamTls::build(UpstreamTlsMode::Opportunistic, None, false).unwrap();
+    assert!(matches!(
+        relay(&cfg, env, b"x\r\n").await,
+        Err(RelayError::Tls(_))
+    ));
+    assert!(!up.commands().iter().any(|c| c.starts_with("MAIL")));
+    assert!(up.tls_commands().is_empty());
+    // Insecure mode accepts it.
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    relay(
+        &tls_config(&up, UpstreamTlsMode::Opportunistic, true),
+        env,
+        b"x\r\n",
+    )
+    .await
+    .unwrap();
+    assert!(up.tls_commands().iter().any(|c| c.starts_with("MAIL")));
+}
+
+#[tokio::test]
+async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
+    let up = RecordingUpstream::start_tls(&["DSN"], true).await;
+    assert!(
+        probe(&tls_config(&up, UpstreamTlsMode::Implicit, false))
+            .await
+            .unwrap()
+    );
+    // An upstream that announces DSN only inside TLS: reading the extension
+    // list from the first EHLO would miss it.
+    let up = RecordingUpstream::start_tls(&[], false).await;
+    up.set_tls_extensions(&["DSN"]);
+    assert!(
+        probe(&tls_config(&up, UpstreamTlsMode::Opportunistic, false))
+            .await
+            .unwrap()
+    );
+}
+
+/// Mode Off is what part 1 did, and it has to stay that even in front of an
+/// upstream that would happily upgrade: `--upstream_tls off` is the escape
+/// hatch for a deployment whose upstream announces STARTTLS but cannot
+/// actually complete it.
+#[tokio::test]
+async fn off_ignores_an_offered_starttls() {
+    let up = RecordingUpstream::start_tls(&["DSN"], false).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    relay(&config(&up), env, b"x\r\n").await.unwrap();
+    assert!(!up.commands().contains(&"STARTTLS".to_string()));
+    assert!(up.tls_commands().is_empty());
 }

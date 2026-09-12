@@ -1,11 +1,12 @@
 //! A minimal SMTP client for the upstream: one session per message.
 use std::collections::HashSet;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf, split,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::api::Recipient;
@@ -13,12 +14,144 @@ use crate::smtp::dsn::{is_mail_dsn_keyword, is_rcpt_dsn_keyword};
 use crate::smtp::extensions::parse_extensions;
 use crate::smtp::params::Param;
 
+/// Any transport a session can run over. The upstream connection changes
+/// type in the middle of a session (STARTTLS), so it is held as a trait
+/// object rather than as a type parameter.
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
+
+/// How much TLS the outbound leg asks for (spec 6.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum UpstreamTlsMode {
+    /// Plain SMTP, STARTTLS never sent.
+    Off,
+    /// STARTTLS when the upstream announces it, plain when it does not.
+    #[default]
+    Opportunistic,
+    /// STARTTLS always; an upstream that does not announce it is an error.
+    Required,
+    /// TLS from the first byte, before the greeting (submissions, port 465).
+    Implicit,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpstreamTls {
+    pub mode: UpstreamTlsMode,
+    /// None only for mode Off.
+    pub client_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+/// Accepts any server certificate. Only reachable through
+/// `--upstream_tls_insecure` and through the tests' own client.
+#[derive(Debug)]
+pub struct NoVerify(pub Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+impl UpstreamTls {
+    pub fn off() -> Self {
+        Self {
+            mode: UpstreamTlsMode::Off,
+            client_config: None,
+        }
+    }
+
+    /// System roots plus `extra_ca` (PEM bundle). `insecure` disables
+    /// verification.
+    pub fn build(
+        mode: UpstreamTlsMode,
+        extra_ca: Option<&Path>,
+        insecure: bool,
+    ) -> anyhow::Result<Self> {
+        if mode == UpstreamTlsMode::Off {
+            return Ok(Self::off());
+        }
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()?;
+        let config = if insecure {
+            warn!("--upstream_tls_insecure is set; the upstream certificate is not verified");
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerify(provider)))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(cert);
+            }
+            if let Some(path) = extra_ca {
+                use rustls_pki_types::pem::PemObject;
+                for cert in rustls_pki_types::CertificateDer::pem_file_iter(path)
+                    .map_err(|e| anyhow::anyhow!("cannot read CA file {}: {e}", path.display()))?
+                {
+                    roots.add(cert.map_err(|e| {
+                        anyhow::anyhow!("bad certificate in {}: {e}", path.display())
+                    })?)?;
+                }
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        Ok(Self {
+            mode,
+            client_config: Some(Arc::new(config)),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
     pub host: String,
     pub port: u16,
     /// Perl: 60 s inactivity.
     pub timeout: Duration,
+    pub tls: UpstreamTls,
+    /// Name the upstream certificate has to be valid for. `None` means
+    /// `host`, which is what a plain deployment wants. It is separate from
+    /// `host` because the address one connects to and the name one validates
+    /// are not always the same string: an upstream reached by IP address, or
+    /// through a local forwarder, still presents the certificate of the mail
+    /// service it is.
+    pub tls_server_name: Option<String>,
+}
+
+impl RelayConfig {
+    fn server_name(&self) -> &str {
+        self.tls_server_name.as_deref().unwrap_or(&self.host)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +172,10 @@ pub enum RelayError {
     Address(String),
     #[error("timeout talking to the upstream")]
     Timeout,
+    #[error("TLS to the upstream failed: {0}")]
+    Tls(String),
+    #[error("upstream does not offer STARTTLS")]
+    NoStartTls,
 }
 
 pub struct Envelope<'a> {
@@ -166,13 +303,18 @@ const WRITE_CHUNK: usize = 64 * 1024;
 /// hostname is whatever the container runtime invented.
 const HELLO: &str = "localhost.localdomain";
 
-/// Generic over the transport so the timing tests can drive a whole relay
-/// session through `tokio::io::duplex`, where the number of bytes that fit
-/// in flight is one the test chose rather than one the host's TCP buffers
-/// decided. `server::session` carries the same seam for the client side.
-struct Upstream<S> {
-    reader: BufReader<ReadHalf<S>>,
-    writer: WriteHalf<S>,
+/// The transport is a trait object for two reasons. STARTTLS replaces it in
+/// the middle of a session, and the timing tests drive a whole relay session
+/// through `tokio::io::duplex`, where the number of bytes that fit in flight
+/// is one the test chose rather than one the host's TCP buffers decided.
+/// `server::session` carries the same seam for the client side.
+///
+/// Reads and writes are strictly alternating here, so the stream is buffered
+/// on the read side only and written through -- and that is what makes the
+/// STARTTLS upgrade possible at all, since a `split` cannot be undone
+/// without both halves back in hand.
+struct Upstream {
+    stream: BufReader<Box<dyn Io>>,
     timeout: Duration,
 }
 
@@ -185,12 +327,10 @@ struct UpstreamReply {
     raw: String,
 }
 
-impl<S: AsyncRead + AsyncWrite> Upstream<S> {
-    fn new(stream: S, timeout: Duration) -> Self {
-        let (r, w) = split(stream);
+impl Upstream {
+    fn new(stream: Box<dyn Io>, timeout: Duration) -> Self {
         Self {
-            reader: BufReader::new(r),
-            writer: w,
+            stream: BufReader::new(stream),
             timeout,
         }
     }
@@ -200,7 +340,7 @@ impl<S: AsyncRead + AsyncWrite> Upstream<S> {
         let mut texts = Vec::new();
         loop {
             let mut line = String::new();
-            let n = tokio::time::timeout(self.timeout, self.reader.read_line(&mut line))
+            let n = tokio::time::timeout(self.timeout, self.stream.read_line(&mut line))
                 .await
                 .map_err(|_| RelayError::Timeout)??;
             if n == 0 {
@@ -242,7 +382,7 @@ impl<S: AsyncRead + AsyncWrite> Upstream<S> {
         debug!("upstream <- {line}");
         tokio::time::timeout(
             self.timeout,
-            self.writer.write_all(format!("{line}\r\n").as_bytes()),
+            self.stream.write_all(format!("{line}\r\n").as_bytes()),
         )
         .await
         .map_err(|_| RelayError::Timeout)??;
@@ -262,8 +402,17 @@ impl<S: AsyncRead + AsyncWrite> Upstream<S> {
         Ok(reply)
     }
 
-    /// Greeting and EHLO (HELO fallback on 5xx). Returns the extension set.
-    async fn open(&mut self) -> Result<HashSet<String>, RelayError> {
+    /// Greeting and EHLO (HELO fallback on 5xx), then STARTTLS if the mode
+    /// asks for it. Returns the extension set -- the one from the EHLO
+    /// inside TLS when the session was upgraded, because that is the only
+    /// one that counts: an upstream may announce DSN, SIZE or AUTH only to
+    /// a client that has authenticated the channel (RFC 3207 4.2 requires
+    /// the client to discard what it learned before the handshake).
+    async fn open(
+        &mut self,
+        tls: &UpstreamTls,
+        server_name: &str,
+    ) -> Result<HashSet<String>, RelayError> {
         let greeting = self.read_reply().await?;
         if greeting.code / 100 != 2 {
             return Err(RelayError::Rejected {
@@ -272,21 +421,57 @@ impl<S: AsyncRead + AsyncWrite> Upstream<S> {
                 text: greeting.text,
             });
         }
-        match self.command("EHLO", format!("EHLO {HELLO}"), 2).await {
-            Ok(reply) => Ok(parse_extensions(&reply.raw)),
+        let mut extensions = match self.command("EHLO", format!("EHLO {HELLO}"), 2).await {
+            Ok(reply) => parse_extensions(&reply.raw),
             Err(RelayError::Rejected { code, .. }) if code / 100 == 5 => {
                 self.command("HELO", format!("HELO {HELLO}"), 2).await?;
-                Ok(HashSet::new())
+                HashSet::new()
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+        let want_tls = match tls.mode {
+            // Implicit has handshaken before the greeting; Off never does.
+            UpstreamTlsMode::Off | UpstreamTlsMode::Implicit => false,
+            UpstreamTlsMode::Opportunistic => extensions.contains("STARTTLS"),
+            UpstreamTlsMode::Required => {
+                if !extensions.contains("STARTTLS") {
+                    return Err(RelayError::NoStartTls);
+                }
+                true
+            }
+        };
+        if want_tls {
+            self.command("STARTTLS", "STARTTLS".into(), 2).await?;
+            self.upgrade(tls, server_name).await?;
+            extensions =
+                parse_extensions(&self.command("EHLO", format!("EHLO {HELLO}"), 2).await?.raw);
         }
+        Ok(extensions)
+    }
+
+    /// The TLS handshake of STARTTLS, on a connection that has just been
+    /// answered 220.
+    async fn upgrade(&mut self, tls: &UpstreamTls, server_name: &str) -> Result<(), RelayError> {
+        // Anything already buffered arrived before the handshake and would
+        // be read as if it had come from inside it (RFC 3207 4.2). Dropping
+        // it silently is how a plaintext injection survives an upgrade, so
+        // the session ends instead.
+        if !self.stream.buffer().is_empty() {
+            return Err(RelayError::Tls(
+                "the upstream sent data after its reply to STARTTLS".into(),
+            ));
+        }
+        let placeholder: Box<dyn Io> = Box::new(tokio::io::empty());
+        let plain = std::mem::replace(&mut self.stream, BufReader::new(placeholder)).into_inner();
+        self.stream = BufReader::new(handshake(plain, tls, server_name, self.timeout).await?);
+        Ok(())
     }
 
     /// Writes the message body, restarting the inactivity timer for every
     /// chunk. See [`WRITE_CHUNK`].
     async fn write_body(&mut self, payload: &[u8]) -> Result<(), RelayError> {
         for chunk in payload.chunks(WRITE_CHUNK) {
-            tokio::time::timeout(self.timeout, self.writer.write_all(chunk))
+            tokio::time::timeout(self.timeout, self.stream.write_all(chunk))
                 .await
                 .map_err(|_| RelayError::Timeout)??;
         }
@@ -298,27 +483,68 @@ impl<S: AsyncRead + AsyncWrite> Upstream<S> {
     }
 }
 
-async fn connect(config: &RelayConfig) -> Result<TcpStream, RelayError> {
-    Ok(tokio::time::timeout(
+/// The rustls client handshake, under the inactivity timeout like every
+/// other step of the session.
+async fn handshake(
+    stream: Box<dyn Io>,
+    tls: &UpstreamTls,
+    server_name: &str,
+    timeout: Duration,
+) -> Result<Box<dyn Io>, RelayError> {
+    let client_config = tls
+        .client_config
+        .clone()
+        .ok_or_else(|| RelayError::Tls("no TLS client configuration".into()))?;
+    // `ServerName` takes an IP address as readily as a DNS name, so an
+    // upstream given as `--tohost 10.0.0.5` is validated against the IP
+    // addresses in the certificate rather than refused here.
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+        .map_err(|e| RelayError::Tls(format!("invalid server name '{server_name}': {e}")))?;
+    let stream = tokio::time::timeout(
+        timeout,
+        TlsConnector::from(client_config).connect(name, stream),
+    )
+    .await
+    .map_err(|_| RelayError::Timeout)?
+    .map_err(|e| RelayError::Tls(e.to_string()))?;
+    Ok(Box::new(stream))
+}
+
+/// The TCP connection, with the implicit-TLS handshake already done when the
+/// mode asks for it.
+async fn connect(config: &RelayConfig) -> Result<Box<dyn Io>, RelayError> {
+    let tcp = tokio::time::timeout(
         config.timeout,
         TcpStream::connect((config.host.as_str(), config.port)),
     )
     .await
-    .map_err(|_| RelayError::Timeout)??)
+    .map_err(|_| RelayError::Timeout)??;
+    if config.tls.mode == UpstreamTlsMode::Implicit {
+        handshake(
+            Box::new(tcp),
+            &config.tls,
+            config.server_name(),
+            config.timeout,
+        )
+        .await
+    } else {
+        Ok(Box::new(tcp))
+    }
 }
 
 /// EHLO + QUIT. Returns whether the upstream announces DSN.
 pub async fn probe(config: &RelayConfig) -> Result<bool, RelayError> {
-    probe_over(connect(config).await?, config.timeout).await
+    let mut up = Upstream::new(connect(config).await?, config.timeout);
+    let extensions = up.open(&config.tls, config.server_name()).await?;
+    up.quit().await;
+    Ok(extensions.contains("DSN"))
 }
 
-/// [`probe`] over a stream the caller supplies. See [`Upstream`].
-pub async fn probe_over<S: AsyncRead + AsyncWrite>(
-    stream: S,
-    timeout: Duration,
-) -> Result<bool, RelayError> {
-    let mut up = Upstream::new(stream, timeout);
-    let extensions = up.open().await?;
+/// [`probe`] over a stream the caller supplies, without TLS. See
+/// [`Upstream`].
+pub async fn probe_over<S: Io + 'static>(stream: S, timeout: Duration) -> Result<bool, RelayError> {
+    let mut up = Upstream::new(Box::new(stream), timeout);
+    let extensions = up.open(&UpstreamTls::off(), "").await?;
     up.quit().await;
     Ok(extensions.contains("DSN"))
 }
@@ -335,11 +561,14 @@ pub async fn relay(
     for r in envelope.recipients {
         assert_relayable(&r.address)?;
     }
-    relay_over(connect(config).await?, config.timeout, envelope, message).await
+    let mut up = Upstream::new(connect(config).await?, config.timeout);
+    let extensions = up.open(&config.tls, config.server_name()).await?;
+    transact(up, extensions, envelope, message).await
 }
 
-/// [`relay`] over a stream the caller supplies. See [`Upstream`].
-pub async fn relay_over<S: AsyncRead + AsyncWrite>(
+/// [`relay`] over a stream the caller supplies, without TLS. See
+/// [`Upstream`].
+pub async fn relay_over<S: Io + 'static>(
     stream: S,
     timeout: Duration,
     envelope: Envelope<'_>,
@@ -349,8 +578,18 @@ pub async fn relay_over<S: AsyncRead + AsyncWrite>(
     for r in envelope.recipients {
         assert_relayable(&r.address)?;
     }
-    let mut up = Upstream::new(stream, timeout);
-    let extensions = up.open().await?;
+    let mut up = Upstream::new(Box::new(stream), timeout);
+    let extensions = up.open(&UpstreamTls::off(), "").await?;
+    transact(up, extensions, envelope, message).await
+}
+
+/// Everything after the greeting: MAIL, RCPT.., DATA, message, QUIT.
+async fn transact(
+    mut up: Upstream,
+    extensions: HashSet<String>,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
     let upstream_dsn = extensions.contains("DSN");
     let mail = format!(
         "MAIL FROM:<{}>{}",

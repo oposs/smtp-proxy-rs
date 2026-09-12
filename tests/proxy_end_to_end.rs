@@ -75,6 +75,8 @@ async fn rig(upstream_extensions: &[&str]) -> Rig {
             host: "127.0.0.1".into(),
             port: upstream.addr.port(),
             timeout: std::time::Duration::from_secs(5),
+            tls: smtp_proxy::relay::UpstreamTls::off(),
+            tls_server_name: None,
         },
     });
     factory.probe_upstream().await;
