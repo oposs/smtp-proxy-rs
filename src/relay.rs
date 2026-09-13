@@ -197,6 +197,19 @@ impl RelayError {
     ///
     /// `Address` stays `550`. That is *our* refusal of a malformed address,
     /// it is permanent, and it is not the upstream's opinion at all.
+    ///
+    /// # Invariant
+    ///
+    /// **Everything this returns has to be a code the client can actually be
+    /// sent.** A reply code outside `200..=599` cannot go on the wire at all
+    /// -- it aborts the session and answers the client nothing, which is
+    /// worse than any wrong-but-sendable code. `Rejected` is the one place an
+    /// outside-supplied code enters that path: it is three digits an upstream
+    /// chose, `000` to `999`, and this function is the only thing standing
+    /// between those and the client. So the range test below is load-bearing,
+    /// not cosmetic: widening it past `599`, or dropping it and returning
+    /// `*code`, hands a broken or hostile upstream a way to kill sessions.
+    /// The edges are tested, and so is the property itself.
     pub fn client_code(&self) -> u16 {
         match self {
             // An upstream that answered outside the expected class with a
@@ -831,5 +844,31 @@ mod tests {
     fn a_reply_outside_the_rejection_range_does_not_become_the_clients_code() {
         assert_eq!(rejected(250).client_code(), 451);
         assert_eq!(rejected(354).client_code(), 451);
+    }
+
+    /// The exact edges of the pass-through range, because it is the only
+    /// thing keeping an unsendable code away from the client. An off-by-one
+    /// on either boundary is invisible in every other test here.
+    #[test]
+    fn the_pass_through_range_holds_at_its_edges() {
+        assert_eq!(rejected(399).client_code(), 451);
+        assert_eq!(rejected(400).client_code(), 400);
+        assert_eq!(rejected(599).client_code(), 599);
+        assert_eq!(rejected(600).client_code(), 451);
+    }
+
+    /// The invariant itself, asserted across the module boundary rather than
+    /// only described in both: whatever three digits an upstream answers, the
+    /// code handed to the client is one `smtp::reply` can put on the wire.
+    /// Anything else panics the session task instead of replying.
+    #[test]
+    fn every_client_code_is_sendable() {
+        for upstream in [0, 1, 199, 200, 250, 354, 399, 400, 451, 550, 599, 600, 999] {
+            let code = rejected(upstream).client_code();
+            assert!(
+                crate::smtp::reply::format_reply(code, &["text"]).is_ok(),
+                "an upstream {upstream} produced {code}, which cannot be sent"
+            );
+        }
     }
 }

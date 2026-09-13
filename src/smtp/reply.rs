@@ -74,10 +74,23 @@ impl Reply {
         Self { code, lines }
     }
 
-    /// Every code in this crate is a literal, so an invalid one is a bug.
+    /// The wire form.
+    ///
+    /// **A code outside `200..=599` panics here rather than reaching the
+    /// client, so every caller has to have established that its code is in
+    /// range before it builds the `Reply`.** There is no recovery this far
+    /// down: the session task dies and the client is answered nothing at all,
+    /// which is worse than any wrong-but-sendable code would have been.
+    ///
+    /// Most codes are literals in this crate and satisfy that for free. One
+    /// does not: a code derived from outside this process -- an upstream's
+    /// own reply -- can be any three digits, and it is the deriving code's
+    /// job to constrain it. See [`crate::relay::RelayError::client_code`],
+    /// which is the only such path today.
     pub fn wire(&self) -> String {
         let refs: Vec<&str> = self.lines.iter().map(String::as_str).collect();
-        format_reply(self.code, &refs).expect("reply code is a literal in our source")
+        format_reply(self.code, &refs)
+            .expect("callers constrain a reply code to 200..=599 before building a Reply")
     }
 }
 
