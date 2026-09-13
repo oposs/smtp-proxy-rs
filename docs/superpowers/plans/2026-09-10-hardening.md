@@ -789,7 +789,7 @@ git add -A && git commit -m "Perl conformance gate running the original end-to-e
 
 ---
 
-### Task 22: Carried-over hardening from part 1 (five items, divergence approved)
+### Task 22: Carried-over hardening from part 1 (six items, divergence approved)
 
 User ruling, 2026-09-12: **fix all five** carried-over items, and **divergence
 from the Perl is acceptable** where a fix requires it. This overrides part 1's
@@ -797,8 +797,8 @@ from the Perl is acceptable** where a fix requires it. This overrides part 1's
 the opaque bare-LF header block, and the missing `setgroups`.
 
 **Files:**
-- Modify: `src/relay.rs` (item 1), `src/proxy.rs` (items 2, 3, 5), `src/privdrop.rs` (item 4), `README.md`
-- Modify tests: `tests/relay.rs`, `tests/proxy_end_to_end.rs`
+- Modify: `src/relay.rs` (items 1, 6), `src/proxy.rs` (items 2, 3, 5, 6), `src/privdrop.rs` (item 4), `src/server/session.rs` and `src/server/mod.rs` (item 6), `README.md`
+- Modify tests: `tests/relay.rs`, `tests/proxy_end_to_end.rs`, `tests/common/fake_handler.rs`
 
 **Interfaces:**
 - Produces in `relay.rs`: `const MAX_REPLY_LINE: usize = 4096;` and `const MAX_REPLY_TOTAL: usize = 65536;`
@@ -1047,9 +1047,109 @@ reply string is introduced by this item.**
 
 ---
 
-- [ ] **Step 3: README and commit**
+#### Item 6 — relay the upstream's own reply code instead of overwriting it with 550 (`src/proxy.rs`, `src/server/session.rs`)
 
-Add all five to the README's "Differences from the Perl version" list: items 2,
+User ruling, 2026-09-13, raised by the user against the controller's weaker
+framing of the same problem. **Divergence from the Perl, approved.**
+
+`RelayError::Rejected` carries the upstream's real code, but its `Display` is
+`#[error("{text}")]` — text only — and `relay_message` returns
+`Err(e.to_string())`, which `session.rs` maps unconditionally to `(550, t)`.
+The `code` field is never read on that path.
+
+The client is still connected the whole time: the proxy relays synchronously
+and only answers the client once the upstream has answered it. So the upstream's
+own code is in hand and there is nothing to invent.
+
+**This currently produces a reply that contradicts itself.** `read_reply` stores
+the text as everything after the code, so an upstream `451 4.3.2 Service not
+available` reaches the client as:
+
+```
+550 4.3.2 Service not available
+```
+
+A permanent reply code wrapping a transient enhanced status code. A client
+reading the enhanced code queues and retries; one reading the reply code deletes
+the mail. That is a wire-format defect, not a trade-off. The Perl does the same
+(`Connection.pm:682` is an unconditional 550), so it is not a regression.
+
+**Ruling on the shape: pass the code through verbatim, do not normalise it to a
+class.** Verbatim is simpler and says exactly what the upstream said. The
+distinction matters only for codes we would otherwise have to re-map, and there
+is no case where we know better than the upstream what its own rejection meant.
+
+**Ruling on the no-answer cases.** `Io`, `Timeout`, `Tls` and `NoStartTls` carry
+no upstream code — the upstream never answered. `relay()` opens a fresh
+connection per message, so a mail server restarting between two messages lands
+here. These become **`451`**, because nothing about the message was wrong and
+the client should retry rather than discard. `RelayError::Address` stays **550**:
+that is *our* refusal of a malformed address, it is permanent, and it is not the
+upstream's opinion at all.
+
+**Not in scope, do not change:** the API-rejection path (`!outcome.allow`) keeps
+its 550 — a policy refusal is permanent and correct. `"authentication service
+failed"` also keeps its 550 for now, even though an API outage is arguably
+transient; that is a separate question and the user has not ruled on it. Record
+it in the ledger, do not fix it here.
+
+- [ ] **Step 1: Reuse Task 18's `Rejection`**
+
+Task 18 introduces `pub struct Rejection { pub code: u16, pub text: String }` in
+`server/mod.rs` for `Handler::mail` and `Handler::rcpt`. Task 22 runs after
+Task 18, so reuse it rather than inventing a parallel type: change
+`Handler::message` to return `Result<String, Rejection>`, and have `session.rs`
+send `Reply::new(rej.code, rej.text)` instead of hard-coding 550. Update
+`tests/common/fake_handler.rs` accordingly.
+
+- [ ] **Step 2: Tests**
+
+In `tests/proxy_end_to_end.rs` (use the existing `rig()`, which calls
+`captured_log()` — the global-subscriber-behind-`OnceLock` pattern this project
+needs, because `tracing` caches callsite interest process-wide):
+
+```rust
+#[tokio::test]
+async fn an_upstream_4xx_reaches_the_client_as_4xx() {
+    // Upstream rejects the final dot with "451 4.3.2 Service not available".
+    // Assert the client sees exactly "451 4.3.2 Service not available
+"
+    // -- the code AND the enhanced status agree.
+}
+
+#[tokio::test]
+async fn an_upstream_5xx_still_reaches_the_client_as_that_5xx() {
+    // Upstream rejects with "552 5.3.4 Message too big for system".
+    // Assert the client sees 552, not 550: the code is passed through
+    // verbatim, not merely reduced to its class.
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_is_a_451_not_a_550() {
+    // No upstream listening at all (or one that closes before the greeting).
+    // Assert 451, so the client queues and retries rather than discarding.
+}
+```
+
+The second test is the one that discriminates verbatim pass-through from
+class-normalisation. Without it, a 5xx->550 collapse would pass unnoticed.
+
+Every existing test that asserts a 550 from a relay rejection must be re-read,
+not blindly updated: if one now expects the wrong code, changing it is correct;
+if one turns red for a different reason, that is a finding.
+
+- [ ] **Step 3: Implement**
+
+`RelayError` gains a method giving the client-facing code — `Rejected` yields its
+own `code`; `Io`/`Timeout`/`Tls`/`NoStartTls` yield 451; `Address` yields 550.
+`relay_message` returns `Rejection { code, text }` built from it. Keep the log
+line `Mail refused by relay server ({e}) for {client}` verbatim.
+
+---
+
+- [ ] **Step 4: README and commit**
+
+Add all six to the README's "Differences from the Perl version" list: items 2,
 3 and 5 change observable behaviour, item 1 changes it only against a hostile
 upstream, and item 4 changes the process's group set. Say for each that the
 Perl does not do it and why we do.
@@ -1071,6 +1171,7 @@ Gates: `cargo test`, `cargo clippy --all-targets -- -D warnings`,
 | 10 deb, release, Makefile | 20 |
 | 11.3 conformance gate | 21 |
 | part-1 carry-over (5 items, user ruling 2026-09-12) | 22 |
+| upstream reply-code passthrough (user ruling 2026-09-13) | 22 |
 | 12 known differences documented | README in Task 20 |
 
 ## Carried over from part 1 — now covered by Task 22
@@ -1112,8 +1213,15 @@ because the Perl behaves the same way in every case.
 
 These are deliberate. The gate will report them; they are not defects.
 
-- **Task 22's five items (user ruling, 2026-09-12).** Three change observable
-  behaviour against the Perl and the gate will see them: the header merge is
+- **Task 22 item 6 (user ruling, 2026-09-13): the upstream's reply code is
+  relayed verbatim instead of being overwritten with 550.** The Perl always
+  answers 550 (`Connection.pm:682`), so the gate WILL see this wherever a Perl
+  test drives an upstream rejection that is not a 550. It is also the one item
+  that fixes a self-contradicting reply rather than adding a policy: today an
+  upstream `451 4.3.2 ...` reaches the client as `550 4.3.2 ...`. An unreachable
+  upstream becomes 451; our own malformed-address refusal stays 550.
+- **Task 22's five original items (user ruling, 2026-09-12).** Three change
+  observable behaviour against the Perl and the gate will see them: the header merge is
   case-insensitive, a bare-LF header block splits into individual headers
   instead of one opaque header, and a relayed header carrying an unfolded line
   break is refused with `550 authentication service failed`. Two more diverge
