@@ -789,7 +789,7 @@ git add -A && git commit -m "Perl conformance gate running the original end-to-e
 
 ---
 
-### Task 22: Carried-over hardening from part 1 (six items, divergence approved)
+### Task 22: Carried-over hardening from part 1 (seven items, divergence approved)
 
 User ruling, 2026-09-12: **fix all five** carried-over items, and **divergence
 from the Perl is acceptable** where a fix requires it. This overrides part 1's
@@ -797,7 +797,7 @@ from the Perl is acceptable** where a fix requires it. This overrides part 1's
 the opaque bare-LF header block, and the missing `setgroups`.
 
 **Files:**
-- Modify: `src/relay.rs` (items 1, 6), `src/proxy.rs` (items 2, 3, 5, 6), `src/privdrop.rs` (item 4), `src/server/session.rs` and `src/server/mod.rs` (item 6), `README.md`
+- Modify: `src/relay.rs` (items 1, 6), `src/proxy.rs` (items 2, 3, 5, 6), `src/privdrop.rs` (item 4), `src/server/session.rs` and `src/server/mod.rs` (item 6), `src/server/auth.rs` (item 7), `README.md`
 - Modify tests: `tests/relay.rs`, `tests/proxy_end_to_end.rs`, `tests/common/fake_handler.rs`
 
 **Interfaces:**
@@ -1209,10 +1209,57 @@ because the Perl behaves the same way in every case.
    refusal costs nothing; it was not applied in part 1 only because it would
    diverge from the Perl on wire output in a drop-in release.
 
+
+#### Item 7 — bound the AUTH username at 256 bytes (`src/server/auth.rs`)
+
+**User ruling 2026-09-13. Divergence from the Perl approved.** Nothing bounds
+the length of an AUTH username. `decode_plain` and `decode_login`
+(`src/server/auth.rs:23-45`) turn whatever base64 decodes into an owned
+`String` with no length check. The only bound on that path is
+`MAX_COMMAND_BUFFER` (`src/server/session.rs:31`) at 64 KiB, whose own doc
+comment records that RFC 5321 4.5.3.1.4 caps a command line at 512 octets and
+calls 64 KiB "generous", its stated job being only to stop a client that never
+sends a newline. So a single username can be roughly 50 KiB.
+
+Why it matters, and why here: Task 18 keys its rate limiter on the AUTH
+username and retains the key for up to one prune window, so this is the one
+unverified client-supplied string the process *stores*. Task 18's fix round
+capped the bucket map at 10,000 entries, which bounds the entry count at every
+instant but not the bytes — 10,000 x max-key is about 1 MB for ordinary
+usernames and roughly 500 MB worst case. The count ceiling is the right fix in
+`ratelimit.rs`; this is the matching fix in the right place. Lowering
+`MAX_BUCKETS` instead was considered and rejected: it would trade away the
+headroom that keeps real deployments off the ceiling in order to half-mitigate
+a problem whose fix belongs in `auth.rs`.
+
+- Bound the decoded **username** (`authcid`) at **256 bytes**. 256 is far above
+  any real username and far below anything that matters for memory.
+- **Reuse the existing credential-failure reply. Invent no new reply text.** An
+  over-long username is treated exactly as malformed credentials already are
+  (`session.rs:539`, `535 Authentication credentials invalid`) — same code, same
+  text, same path. This deliberately keeps Task 21's conformance surface from
+  growing: the branch already has four new reply texts with no Perl counterpart,
+  and this adds a fifth divergence but no fifth text.
+- The bound is on the **decoded** length in bytes, not the base64 length, and it
+  applies to both `decode_plain` (SASL PLAIN) and `decode_login` (SASL LOGIN).
+- **The password stays unbounded** and that is deliberate for now: it is never
+  retained, so its cost is one transient allocation per connection, itself
+  bounded by `--max_connections`. Do not bound it in this item. It is recorded
+  as an open question for the user, not an oversight.
+- Test both SASL mechanisms: a 256-byte username is accepted, a 257-byte one is
+  refused with the existing 535, and the refusal leaves no bucket behind in the
+  rate limiter — the last of those is the point of the item and is the assertion
+  that must not be omitted.
 ### Known divergences for Task 21's conformance gate
 
 These are deliberate. The gate will report them; they are not defects.
 
+- **Task 22 item 7 (user ruling, 2026-09-13): an AUTH username longer than 256
+  decoded bytes is refused.** The Perl applies no length check, so a Perl test
+  that authenticates with an absurdly long username would pass there and be
+  refused here. It reuses the existing `535 Authentication credentials invalid`
+  rather than adding a reply text, so the gate sees a changed *outcome* for one
+  input class, not a new string. No real credential reaches 256 bytes.
 - **Task 22 item 6 (user ruling, 2026-09-13): the upstream's reply code is
   relayed verbatim instead of being overwritten with 550.** The Perl always
   answers 550 (`Connection.pm:682`), so the gate WILL see this wherever a Perl
