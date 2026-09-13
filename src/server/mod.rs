@@ -6,8 +6,56 @@ pub mod session;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::smtp::params::Param;
+
+/// The shutdown side of the server (spec 9.1). `token` is cancelled once a
+/// signal arrives: the accept loops stop and every session that is waiting
+/// for its next command answers `421` and closes. `tracker` holds one entry
+/// per live session, and nothing else, so `connections` is a truthful count
+/// and waiting on it waits for the messages that are already in flight --
+/// and only for those.
+#[derive(Clone, Default)]
+pub struct Drain {
+    pub token: CancellationToken,
+    pub tracker: TaskTracker,
+}
+
+impl Drain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sessions still running.
+    pub fn connections(&self) -> usize {
+        self.tracker.len()
+    }
+
+    /// Waits until every session has ended. `None` waits for as long as
+    /// they take, which is what `--drain_timeout 0` means: zero is "no
+    /// limit" here as it is for every other limit. Returns `false` when the
+    /// timeout expired with sessions still running, so that the caller can
+    /// say so before it exits anyway.
+    ///
+    /// Nothing is aborted on expiry. `JoinHandle::abort` only schedules
+    /// cancellation, so it could not shorten the wait it would be used for;
+    /// the process exiting is what ends those sessions.
+    pub async fn wait_drained(&self, timeout: Option<Duration>) -> bool {
+        match timeout {
+            Some(limit) => tokio::time::timeout(limit, self.tracker.wait())
+                .await
+                .is_ok(),
+            None => {
+                self.tracker.wait().await;
+                true
+            }
+        }
+    }
+}
 
 /// A handler's refusal, carrying the reply the client is to be sent. The
 /// handler picks the code, so a refusal that is not the session's own
@@ -93,6 +141,10 @@ pub struct ServerConfig {
     pub max_connections_per_ip: usize,
     /// RCPT entries accepted in one transaction. 0 means unlimited.
     pub max_recipients: usize,
+    /// None means this server never drains: the accept loops run until the
+    /// future is dropped and sessions are never asked to close (tests that
+    /// do not exercise shutdown; production always has one).
+    pub drain: Option<Drain>,
 }
 
 impl ServerConfig {
@@ -114,5 +166,57 @@ impl ServerConfig {
             .with_no_client_auth()
             .with_single_cert(certs, private_key)?;
         Ok(Arc::new(config))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Notify;
+
+    /// A drain whose tracker holds one session that is parked until the
+    /// test releases it. Parked, not slow: the delays below therefore only
+    /// bound how long the test takes, never what it observes -- a wait on
+    /// a tracker that can never empty cannot succeed on a fast host and
+    /// fail on a loaded one.
+    fn parked() -> (Drain, Arc<Notify>) {
+        let drain = Drain::new();
+        let gate = Arc::new(Notify::new());
+        let held = gate.clone();
+        drain.tracker.spawn(async move { held.notified().await });
+        drain.tracker.close();
+        (drain, gate)
+    }
+
+    #[tokio::test]
+    async fn wait_drained_returns_true_once_the_sessions_end() {
+        let (drain, gate) = parked();
+        assert_eq!(drain.connections(), 1);
+        gate.notify_one();
+        assert!(drain.wait_drained(Some(Duration::from_secs(30))).await);
+        assert_eq!(drain.connections(), 0);
+    }
+
+    #[tokio::test]
+    async fn wait_drained_gives_up_at_the_timeout() {
+        let (drain, _gate) = parked();
+        assert!(!drain.wait_drained(Some(Duration::from_millis(50))).await);
+        // Still there: the timeout reports, it does not abort.
+        assert_eq!(drain.connections(), 1);
+    }
+
+    /// `--drain_timeout 0` means no limit, not "do not wait": the wait
+    /// outlives any deadline the caller could name, and ends only when the
+    /// last session does.
+    #[tokio::test]
+    async fn a_timeout_of_none_waits_indefinitely() {
+        let (drain, gate) = parked();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), drain.wait_drained(None))
+                .await
+                .is_err()
+        );
+        gate.notify_one();
+        assert!(drain.wait_drained(None).await);
     }
 }

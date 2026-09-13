@@ -14,6 +14,10 @@ pub struct Recorded {
     pub headers: Vec<String>,
     pub bodies: Vec<Vec<u8>>,
     pub resets: usize,
+    /// Bumped on entry to `message`, before anything it might wait for. A
+    /// test that has to act while a message is in flight polls this rather
+    /// than sleeping a guessed margin.
+    pub message_started: usize,
 }
 
 #[derive(Clone)]
@@ -25,6 +29,11 @@ pub struct Script {
     pub dsn: bool,
     /// Delay before answering `message`, to simulate a slow relay.
     pub message_delay: std::time::Duration,
+    /// Holds `message` until the test releases it with `notify_one`, so a
+    /// message can be kept provably in flight without timing anything.
+    /// `Notify::notify_one` stores its permit, so releasing it before the
+    /// handler gets there is safe.
+    pub message_hold: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl Default for Script {
@@ -36,6 +45,7 @@ impl Default for Script {
             message_result: Ok("queued".into()),
             dsn: true,
             message_delay: std::time::Duration::ZERO,
+            message_hold: None,
         }
     }
 }
@@ -117,6 +127,10 @@ impl Handler for ScriptedHandler {
 
     async fn message(&mut self, body: Vec<u8>) -> Result<String, String> {
         let script = self.script();
+        self.recorded.lock().unwrap().message_started += 1;
+        if let Some(hold) = &script.message_hold {
+            hold.notified().await;
+        }
         tokio::time::sleep(script.message_delay).await;
         self.recorded.lock().unwrap().bodies.push(body);
         script.message_result

@@ -8,7 +8,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{Instrument, debug, info};
 
-use crate::server::{HandlerFactory, ServerConfig, session};
+use crate::server::{Drain, HandlerFactory, ServerConfig, session};
 use crate::smtp::reply::Reply;
 
 pub async fn bind(addrs: &[SocketAddr]) -> std::io::Result<Vec<TcpListener>> {
@@ -109,6 +109,16 @@ impl Drop for ConnectionPermit {
     }
 }
 
+/// Resolves when a drain begins, and never when this server has no `Drain`
+/// configured -- so the accept loop's `select!` arm on it is simply never
+/// taken and the loop behaves as it did before spec 9.1.
+async fn cancelled(drain: &Option<Drain>) {
+    match drain {
+        Some(d) => d.token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn serve<F: HandlerFactory>(
     listeners: Vec<TcpListener>,
     config: Arc<ServerConfig>,
@@ -125,7 +135,18 @@ pub async fn serve<F: HandlerFactory>(
         let limits = limits.clone();
         tasks.spawn(async move {
             loop {
-                let (mut stream, client) = match listener.accept().await {
+                // Spec 9.1: a drain ends the loop, and dropping `listener`
+                // with it closes the port -- new connections are refused
+                // while the sessions already running are left to finish.
+                // `biased`, so that a listener with a permanent backlog
+                // cannot starve the drain; `accept` is cancel-safe, so a
+                // connection cannot be lost half-accepted here.
+                let accepted = tokio::select! {
+                    biased;
+                    _ = cancelled(&config.drain) => break,
+                    r = listener.accept() => r,
+                };
+                let (mut stream, client) = match accepted {
                     Ok(pair) => pair,
                     Err(e) => {
                         tracing::error!("accept failed: {e}");
@@ -135,9 +156,9 @@ pub async fn serve<F: HandlerFactory>(
                 };
                 // --- connection limit gate (spec 9.2) -----------------------
                 // Total and per-IP caps, checked before the session is ever
-                // spawned. Task 19 rewrites this accept loop into a
-                // `tokio::select!` for graceful drain: keep this block intact
-                // across that rewrite, permit and all.
+                // spawned. This block survived the drain rewrite of the
+                // accept loop above unchanged, permit and all; keep it that
+                // way.
                 let permit = match limits.try_acquire(client.ip()) {
                     Ok(p) => p,
                     Err(which) => {
@@ -161,20 +182,29 @@ pub async fn serve<F: HandlerFactory>(
                 let id = new_connection_id();
                 let span = tracing::info_span!("conn", cid = %id);
                 let handler = factory.create(client, &id);
-                let config = config.clone();
-                tokio::spawn(
-                    async move {
-                        // Held until the session ends, so the permit's Drop
-                        // releases both counters at that point.
-                        let _permit = permit;
-                        debug!("New incoming connection from {client}");
-                        session::run(stream, client, id, config, handler).await;
-                        debug!("connection closed");
-                    }
-                    .instrument(span),
-                );
+                let session_config = config.clone();
+                let session = async move {
+                    // Held until the session ends, so the permit's Drop
+                    // releases both counters at that point.
+                    let _permit = permit;
+                    debug!("New incoming connection from {client}");
+                    session::run(stream, client, id, session_config, handler).await;
+                    debug!("connection closed");
+                }
+                .instrument(span);
+                // Tracked, so that shutdown can wait for exactly the live
+                // sessions and nothing else.
+                match &config.drain {
+                    Some(drain) => drain.tracker.spawn(session),
+                    None => tokio::spawn(session),
+                };
             }
         });
+    }
+    // Closing only allows `wait` to return once the tracker is empty; it
+    // does not stop the loops above from spawning into it.
+    if let Some(drain) = &config.drain {
+        drain.tracker.close();
     }
     while tasks.join_next().await.is_some() {}
 }

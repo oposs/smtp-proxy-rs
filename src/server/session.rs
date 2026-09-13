@@ -84,6 +84,8 @@ enum End {
     TlsFailed,
     /// Ended deliberately, with the reason already logged.
     Closed,
+    /// A drain began while this session was between commands (spec 9.1).
+    Drained,
 }
 
 enum Flow {
@@ -136,7 +138,7 @@ pub async fn run<H: Handler>(
         recipients: 0,
     };
     match s.serve().await {
-        End::Quit | End::Eof | End::TlsFailed | End::Closed => {}
+        End::Quit | End::Eof | End::TlsFailed | End::Closed | End::Drained => {}
         End::Timeout => tracing::error!("Timeout on stream for {}", s.client),
         End::Io(e) if is_hangup(&e) => info!("Client {} hung up: {e}", s.client),
         End::Io(e) => tracing::error!("Error on stream for {}: {e}", s.client),
@@ -153,13 +155,14 @@ impl<H: Handler> Session<H> {
             return End::Io(e);
         }
         loop {
-            let line = match self.next_line(MAX_COMMAND_BUFFER).await {
-                Ok(Line::Got(line)) => line,
-                Ok(Line::Eof) => return End::Eof,
-                Ok(Line::TooLong) => {
+            let line = match self.next_command_line().await {
+                Ok(Some(Line::Got(line))) => line,
+                Ok(Some(Line::Eof)) => return End::Eof,
+                Ok(Some(Line::TooLong)) => {
                     self.refuse_long_line().await;
                     return End::Closed;
                 }
+                Ok(None) => return self.drained().await,
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return End::Timeout,
                 Err(e) => return End::Io(e),
             };
@@ -187,6 +190,44 @@ impl<H: Handler> Session<H> {
                 Err(e) => return End::Io(e),
             }
         }
+    }
+
+    /// The next command, unless a drain begins first: `Ok(None)` says the
+    /// drain won and the session is to close with a 421.
+    ///
+    /// Only this wait is cancellable. `read_message` -- the handler call it
+    /// makes included -- reads on, so a message that is already on its way
+    /// is received and answered in full, and the drain takes effect at the
+    /// following command instead (spec 9.1).
+    async fn next_command_line(&mut self) -> std::io::Result<Option<Line>> {
+        let Some(drain) = self.config.drain.clone() else {
+            return self.next_line(MAX_COMMAND_BUFFER).await.map(Some);
+        };
+        tokio::select! {
+            // `biased`: on an already-cancelled token the first arm is
+            // ready, so a session that has just finished a message drains
+            // even when the client's next command is sitting in the buffer.
+            biased;
+            _ = drain.token.cancelled() => Ok(None),
+            line = self.next_line(MAX_COMMAND_BUFFER) => line.map(Some),
+        }
+    }
+
+    /// Spec 9.1: this session was between commands when the drain began,
+    /// so there is nothing to finish -- say why and close.
+    async fn drained(&mut self) -> End {
+        debug!("Draining connection from {}", self.client);
+        let _ = self
+            .send(Reply::new(
+                421,
+                format!(
+                    "{} Service not available, closing transmission channel",
+                    self.config.service_name
+                ),
+            ))
+            .await;
+        let _ = self.stream.shutdown().await;
+        End::Drained
     }
 
     /// One line including its terminator. After TLS, an idle connection

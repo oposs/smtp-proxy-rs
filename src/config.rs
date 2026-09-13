@@ -119,6 +119,13 @@ pub struct Cli {
         help = "recipients allowed in one message; 0 means unlimited"
     )]
     pub max_recipients: usize,
+    #[arg(
+        long = "drain_timeout",
+        default_value_t = 30,
+        help = "seconds to let messages already in flight finish after a shutdown signal; \
+                0 means wait as long as they take, and a second signal exits at once either way"
+    )]
+    pub drain_timeout: u64,
 }
 
 /// The command line after the mandatory flags have been checked and the
@@ -143,6 +150,7 @@ pub struct Config {
     pub max_connections_per_ip: usize,
     pub max_messages_per_minute: u32,
     pub max_recipients: usize,
+    pub drain_timeout: u64,
 }
 
 /// `ip:port`, where the ip may be IPv4 or IPv6 and the port is the text
@@ -228,6 +236,7 @@ pub fn parse_args() -> Config {
         max_connections_per_ip: cli.max_connections_per_ip,
         max_messages_per_minute: cli.max_messages_per_minute,
         max_recipients: cli.max_recipients,
+        drain_timeout: cli.drain_timeout,
     }
 }
 

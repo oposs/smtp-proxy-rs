@@ -5,7 +5,7 @@ use smtp_proxy::api::ApiClient;
 use smtp_proxy::config::parse_args;
 use smtp_proxy::proxy::{ProxyConfig, ProxyFactory};
 use smtp_proxy::relay::{RelayConfig, UpstreamTls};
-use smtp_proxy::server::{ServerConfig, listener};
+use smtp_proxy::server::{Drain, ServerConfig, listener};
 use smtp_proxy::smtplog::SmtpLog;
 
 /// How often the idle rate-limit buckets are swept (spec 9.3).
@@ -51,6 +51,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         )),
         None => None,
     };
+    let drain = Drain::new();
     let server_config = Arc::new(ServerConfig {
         service_name: "smtp-proxy".into(),
         require_starttls: true,
@@ -62,6 +63,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         max_connections: config.max_connections,
         max_connections_per_ip: config.max_connections_per_ip,
         max_recipients: config.max_recipients,
+        drain: Some(drain.clone()),
     });
     let listeners = listener::bind(&config.listen).await?;
     if let Some(user) = &config.user {
@@ -82,6 +84,12 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     // Spec 9.3: without this the bucket map keeps an entry for every
     // username ever seen. The first tick of an `interval` fires at once, on
     // an empty map, which costs nothing.
+    //
+    // Deliberately a plain `tokio::spawn` rather than `drain.tracker.spawn`:
+    // this loop never ends, so a tracked one would make the drain's wait
+    // never return. Only sessions are tracked, which is also what makes
+    // `drain.connections()` a connection count. The same goes for the probe
+    // below; the runtime drops both when `run` returns.
     let pruner = factory.clone();
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(RATE_LIMIT_PRUNE_INTERVAL);
@@ -105,9 +113,36 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         .collect();
     println!("Waiting for connections on {}", listen_text.join(", "));
     println!("Will forward mails to {}:{}", config.tohost, config.toport);
+    // Pinned rather than spawned, so that a panic in `serve` itself still
+    // reaches this thread as a panic instead of becoming a `JoinError` that
+    // nobody reads.
+    let mut serve = std::pin::pin!(listener::serve(listeners, server_config, factory));
     tokio::select! {
-        _ = listener::serve(listeners, server_config, factory) => {}
-        _ = shutdown_signal() => tracing::info!("Shutting down"),
+        // Every listener gave up on its own: there is nothing left to drain.
+        _ = &mut serve => return Ok(()),
+        _ = shutdown_signal() => {}
+    }
+    // Spec 9.1. Cancelling stops the accept loops -- which closes the
+    // listening sockets, so `serve` returns -- and closes every session
+    // that is waiting for a command. What is left is the messages already
+    // in flight, and those are what the wait is for.
+    tracing::info!(
+        "Shutting down; draining {} connection(s)",
+        drain.connections()
+    );
+    drain.token.cancel();
+    let timeout = (config.drain_timeout != 0).then(|| Duration::from_secs(config.drain_timeout));
+    tokio::select! {
+        drained = async {
+            serve.await;
+            drain.wait_drained(timeout).await
+        } => {
+            if !drained {
+                tracing::warn!("Drain timeout; closing {} connection(s)", drain.connections());
+            }
+        }
+        // A second signal from an operator who is not prepared to wait.
+        _ = shutdown_signal() => {}
     }
     Ok(())
 }

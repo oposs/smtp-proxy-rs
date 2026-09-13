@@ -335,3 +335,74 @@ fn logpath_writes_the_log_to_a_file() {
         "{warn}"
     );
 }
+
+/// Spec 9.1, through the real binary: SIGTERM has to drain and exit 0,
+/// rather than leave the runtime to be torn down under the sessions.
+#[test]
+fn sigterm_drains_and_exits_cleanly() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let logfile = dir.path().join("proxy.log");
+    let certs = certs();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--tohost",
+            "127.0.0.1",
+            "--toport",
+            "1",
+            "--api",
+            "http://127.0.0.1:1/check",
+            "--loglevel",
+            "info",
+        ])
+        .arg("--tls_cert")
+        .arg(certs.join("server.crt"))
+        .arg("--tls_key")
+        .arg(certs.join("server.key"))
+        .arg("--logpath")
+        .arg(&logfile)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    stdout.read_line(&mut line).unwrap();
+    assert!(
+        line.starts_with("Waiting for connections on 127.0.0.1:"),
+        "{line}"
+    );
+
+    assert!(
+        std::process::Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // No connections are open, so the drain has nothing to wait for and
+    // the timeout never comes into it.
+    wait_for(
+        "the log file",
+        "Shutting down; draining 0 connection(s)",
+        || std::fs::read_to_string(&logfile).unwrap_or_default(),
+    );
+    // Polled rather than a blocking `wait`, so that a shutdown that hangs
+    // fails this test instead of hanging it.
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            start.elapsed() < DEADLINE,
+            "the proxy did not exit within {DEADLINE:?} of SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status}");
+}
