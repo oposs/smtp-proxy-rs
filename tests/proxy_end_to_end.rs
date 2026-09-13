@@ -78,6 +78,9 @@ async fn rig(upstream_extensions: &[&str]) -> Rig {
             tls: smtp_proxy::relay::UpstreamTls::off(),
             tls_server_name: None,
         },
+        // Unlimited, so that the rate limit is exercised only where a test
+        // says so and never silently caps another test's mails.
+        messages_per_minute: 0,
     });
     factory.probe_upstream().await;
     // The probe's own EHLO and QUIT are a connection like any other; left in

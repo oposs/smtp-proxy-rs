@@ -9,13 +9,17 @@ use tracing::{Instrument, debug, info, warn};
 use crate::api::{
     ApiClient, ApiError, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
 };
+use crate::ratelimit::RateLimiter;
 use crate::relay::{Envelope, RelayConfig, probe, relay};
-use crate::server::{Handler, HandlerFactory};
+use crate::server::{Handler, HandlerFactory, Rejection};
 use crate::smtp::params::Param;
 
 pub struct ProxyConfig {
     pub api: ApiClient,
     pub relay: RelayConfig,
+    /// Messages a single authenticated username may start per minute.
+    /// 0 means unlimited.
+    pub messages_per_minute: u32,
 }
 
 #[derive(Clone)]
@@ -26,15 +30,27 @@ pub struct ProxyFactory {
     /// until asked" state. Kept apart from `upstream_dsn` so that the first
     /// answer is logged even when it is the same as the initial `false`.
     upstream_dsn_known: Arc<AtomicBool>,
+    /// Shared by every connection, because the limit is per username and a
+    /// username may arrive on any number of them.
+    limiter: Arc<RateLimiter>,
 }
 
 impl ProxyFactory {
     pub fn new(config: ProxyConfig) -> Self {
+        let limiter = Arc::new(RateLimiter::new(config.messages_per_minute));
         Self {
             config: Arc::new(config),
             upstream_dsn: Arc::new(AtomicBool::new(false)),
             upstream_dsn_known: Arc::new(AtomicBool::new(false)),
+            limiter,
         }
+    }
+
+    /// Spec 9.3: forgets the buckets of usernames not seen for `idle`,
+    /// called from a timer so that a busy relay's map does not grow with
+    /// every username that ever connected.
+    pub fn prune_rate_limits(&self, idle: std::time::Duration) {
+        self.limiter.prune(idle);
     }
 
     pub fn upstream_dsn(&self) -> Arc<AtomicBool> {
@@ -270,7 +286,19 @@ impl Handler for ProxyHandler {
         Ok(())
     }
 
-    async fn mail(&mut self, from: &str, params: &[Param]) -> Result<(), String> {
+    async fn mail(&mut self, from: &str, params: &[Param]) -> Result<(), Rejection> {
+        // Spec 9.3: at MAIL, so a client over its limit is turned away
+        // before it spends a transaction, and before the API is called. The
+        // username is the one claimed at AUTH, which nothing has verified
+        // yet -- the limit bounds API calls per claimed identity.
+        let username = self.username.clone().unwrap_or_default();
+        if !self.factory.limiter.allow(&username) {
+            info!(
+                "Message rate limit reached for user {username} from {}",
+                self.client
+            );
+            return Err(Rejection::rate_limited());
+        }
         // The session has already reset, but a handler that only clears its
         // transaction when someone else remembers to ask is a trap.
         self.reset();
@@ -279,7 +307,7 @@ impl Handler for ProxyHandler {
         Ok(())
     }
 
-    async fn rcpt(&mut self, to: &str, params: &[Param]) -> Result<(), String> {
+    async fn rcpt(&mut self, to: &str, params: &[Param]) -> Result<(), Rejection> {
         self.transaction.recipients.push(Recipient {
             address: to.to_string(),
             parameters: params.to_vec(),

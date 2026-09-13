@@ -1,4 +1,5 @@
-//! Total and per-IP connection limits (spec 9.2).
+//! Connection limits (spec 9.2), and message rate and recipient limits
+//! (spec 9.3).
 mod common;
 
 use common::fake_handler::ScriptedFactory;
@@ -97,4 +98,69 @@ async fn zero_means_unlimited() {
         assert!(g.starts_with("220"));
         clients.push(c);
     }
+}
+
+#[tokio::test]
+async fn recipient_limit_answers_452_and_keeps_the_transaction() {
+    let mut config = server_config(false, false);
+    config.max_recipients = 2;
+    let factory = ScriptedFactory::default();
+    let addr = start_server(config, factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<1@b.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<2@b.com>").await, "250 OK\r\n");
+    assert_eq!(
+        c.command("RCPT TO:<3@b.com>").await,
+        "452 4.5.3 Too many recipients\r\n"
+    );
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("S: x\r\n\r\n.\r\n").await;
+    assert!(c.read_reply().await.starts_with("250"));
+    // The handler never heard about the third recipient, so the message goes
+    // to the two the transaction kept.
+    assert_eq!(factory.recorded().rcpt.len(), 2);
+
+    // The cap is per transaction, not per connection: the next MAIL starts
+    // over with a full allowance.
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<4@b.com>").await, "250 OK\r\n");
+}
+
+#[tokio::test]
+async fn message_rate_limit_per_username() {
+    // Through the real proxy handler, which owns the limiter.
+    let api = common::fake_api::FakeApi::start().await;
+    let upstream = common::upstream::RecordingUpstream::start(&["DSN"]).await;
+    let proxy_config = smtp_proxy::proxy::ProxyConfig {
+        api: smtp_proxy::api::ApiClient::new(api.url.clone()).unwrap(),
+        relay: smtp_proxy::relay::RelayConfig {
+            host: "127.0.0.1".into(),
+            port: upstream.addr.port(),
+            timeout: std::time::Duration::from_secs(5),
+            tls: smtp_proxy::relay::UpstreamTls::off(),
+            tls_server_name: None,
+        },
+        messages_per_minute: 2,
+    };
+    let factory = smtp_proxy::proxy::ProxyFactory::new(proxy_config);
+    let addr = start_server(server_config(true, true), factory).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    c.login("alice", "pw").await;
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RSET").await, "250 OK\r\n");
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RSET").await, "250 OK\r\n");
+    assert_eq!(
+        c.command("MAIL FROM:<a@b.com>").await,
+        "450 4.7.1 Rate limit exceeded, try again later\r\n"
+    );
+    // The state stays WantMail (spec 9.3), so the session is still usable
+    // rather than wedged behind a refused command.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
+    // Another user is not affected.
+    let (mut c2, _) = RawClient::connect(addr).await;
+    c2.login("bob", "pw").await;
+    assert_eq!(c2.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
 }

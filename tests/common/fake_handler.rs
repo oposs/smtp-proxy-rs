@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use smtp_proxy::server::{Handler, HandlerFactory};
+use smtp_proxy::server::{Handler, HandlerFactory, Rejection};
 use smtp_proxy::smtp::params::Param;
 
 #[derive(Default, Debug, Clone)]
@@ -19,8 +19,8 @@ pub struct Recorded {
 #[derive(Clone)]
 pub struct Script {
     pub auth_ok: bool,
-    pub mail_error: Option<String>,
-    pub rcpt_error: Option<String>,
+    pub mail_error: Option<Rejection>,
+    pub rcpt_error: Option<Rejection>,
     pub message_result: Result<String, String>,
     pub dsn: bool,
     /// Delay before answering `message`, to simulate a slow relay.
@@ -92,7 +92,7 @@ impl Handler for ScriptedHandler {
         }
     }
 
-    async fn mail(&mut self, from: &str, params: &[Param]) -> Result<(), String> {
+    async fn mail(&mut self, from: &str, params: &[Param]) -> Result<(), Rejection> {
         self.recorded
             .lock()
             .unwrap()
@@ -101,7 +101,7 @@ impl Handler for ScriptedHandler {
         self.script().mail_error.map_or(Ok(()), Err)
     }
 
-    async fn rcpt(&mut self, to: &str, params: &[Param]) -> Result<(), String> {
+    async fn rcpt(&mut self, to: &str, params: &[Param]) -> Result<(), Rejection> {
         self.recorded
             .lock()
             .unwrap()

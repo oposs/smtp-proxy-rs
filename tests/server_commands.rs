@@ -6,6 +6,7 @@ mod common;
 use common::fake_handler::ScriptedFactory;
 use common::raw_client::RawClient;
 use common::{server_config, start_server};
+use smtp_proxy::server::Rejection;
 
 /// A connection that has been greeted. `require_starttls` and `require_auth`
 /// are both off, so the very next command falls through to `WantMail`.
@@ -113,14 +114,14 @@ async fn full_transaction_reaches_the_handler() {
 #[tokio::test]
 async fn handler_rejections_use_the_perl_texts() {
     let (mut c, factory) = open_session().await;
-    factory.set(|s| s.mail_error = Some("no".into()));
+    factory.set(|s| s.mail_error = Some(Rejection::mail("no")));
     assert_eq!(
         c.command("MAIL FROM:<x@y.com>").await,
         "553 Requested action not taken: no\r\n"
     );
     factory.set(|s| {
         s.mail_error = None;
-        s.rcpt_error = Some("bad user".into())
+        s.rcpt_error = Some(Rejection::rcpt("bad user"))
     });
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(

@@ -8,6 +8,12 @@ use smtp_proxy::relay::{RelayConfig, UpstreamTls};
 use smtp_proxy::server::{ServerConfig, listener};
 use smtp_proxy::smtplog::SmtpLog;
 
+/// How often the idle rate-limit buckets are swept (spec 9.3).
+const RATE_LIMIT_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A username's bucket is forgotten once it has been idle this long.
+const RATE_LIMIT_IDLE: Duration = Duration::from_secs(600);
+
 fn main() {
     let config = parse_args();
     if let Err(e) = smtp_proxy::logging::init(config.logpath.as_deref(), &config.loglevel) {
@@ -55,6 +61,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         tls_idle_timeout: Duration::from_secs(600),
         max_connections: config.max_connections,
         max_connections_per_ip: config.max_connections_per_ip,
+        max_recipients: config.max_recipients,
     });
     let listeners = listener::bind(&config.listen).await?;
     if let Some(user) = &config.user {
@@ -70,6 +77,18 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
             tls: upstream_tls,
             tls_server_name: None,
         },
+        messages_per_minute: config.max_messages_per_minute,
+    });
+    // Spec 9.3: without this the bucket map keeps an entry for every
+    // username ever seen. The first tick of an `interval` fires at once, on
+    // an empty map, which costs nothing.
+    let pruner = factory.clone();
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(RATE_LIMIT_PRUNE_INTERVAL);
+        loop {
+            ticks.tick().await;
+            pruner.prune_rate_limits(RATE_LIMIT_IDLE);
+        }
     });
     // Spec 6: the probe runs after the privilege drop and does not block
     // accepting connections. A client that connects before the answer is in

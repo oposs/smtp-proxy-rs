@@ -29,6 +29,7 @@ pub fn server_config(require_starttls: bool, require_auth: bool) -> ServerConfig
         tls_idle_timeout: std::time::Duration::from_secs(600),
         max_connections: 0,
         max_connections_per_ip: 0,
+        max_recipients: 0,
     }
 }
 

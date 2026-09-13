@@ -112,6 +112,9 @@ struct Session<H> {
     id: String,
     config: Arc<ServerConfig>,
     handler: H,
+    /// RCPT entries accepted in the running transaction, for
+    /// `max_recipients`. Repeats count, as the spec says (9.3).
+    recipients: usize,
 }
 
 pub async fn run<H: Handler>(
@@ -130,6 +133,7 @@ pub async fn run<H: Handler>(
         id,
         config,
         handler,
+        recipients: 0,
     };
     match s.serve().await {
         End::Quit | End::Eof | End::TlsFailed | End::Closed => {}
@@ -244,6 +248,7 @@ impl<H: Handler> Session<H> {
     }
 
     fn start_transaction(&mut self) {
+        self.recipients = 0;
         self.handler.reset();
     }
 
@@ -513,8 +518,8 @@ impl<H: Handler> Session<H> {
                 debug!("Accepted MAIL command from {}", self.client);
                 self.state = State::WantRcpt;
             }
-            Err(e) => {
-                self.send(Reply::new(553, format!("Requested action not taken: {e}")))
+            Err(rejection) => {
+                self.send(Reply::new(rejection.code, rejection.text))
                     .await?;
                 debug!("MAIL command rejected for {}", self.client);
             }
@@ -531,18 +536,28 @@ impl<H: Handler> Session<H> {
             self.send(Reply::new(501, text)).await?;
             return Ok(Flow::Continue);
         }
+        // Spec 9.3: the handler never hears about the recipient that would
+        // exceed the cap, and the transaction keeps the ones it has -- the
+        // client may still send the message to those.
+        if self.config.max_recipients > 0 && self.recipients >= self.config.max_recipients {
+            debug!(
+                "Recipient limit of {} reached for {}",
+                self.config.max_recipients, self.client
+            );
+            self.send(Reply::new(452, "4.5.3 Too many recipients"))
+                .await?;
+            return Ok(Flow::Continue);
+        }
         match self.handler.rcpt(&to, &params).await {
             Ok(()) => {
+                self.recipients += 1;
                 self.send(Reply::new(250, "OK")).await?;
                 debug!("Accepted RCPT command from {}", self.client);
                 self.state = State::WantData;
             }
-            Err(e) => {
-                self.send(Reply::new(
-                    550,
-                    format!("Will not send mail to this user: {e}"),
-                ))
-                .await?;
+            Err(rejection) => {
+                self.send(Reply::new(rejection.code, rejection.text))
+                    .await?;
                 debug!("RCPT command rejected for {}", self.client);
             }
         }

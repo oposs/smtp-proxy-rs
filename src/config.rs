@@ -107,6 +107,18 @@ pub struct Cli {
         help = "concurrent connections allowed from a single client IP; 0 means unlimited"
     )]
     pub max_connections_per_ip: usize,
+    #[arg(
+        long = "max_messages_per_minute",
+        default_value_t = 60,
+        help = "messages a single authenticated username may start per minute; 0 means unlimited"
+    )]
+    pub max_messages_per_minute: u32,
+    #[arg(
+        long = "max_recipients",
+        default_value_t = 1000,
+        help = "recipients allowed in one message; 0 means unlimited"
+    )]
+    pub max_recipients: usize,
 }
 
 /// The command line after the mandatory flags have been checked and the
@@ -129,6 +141,8 @@ pub struct Config {
     pub upstream_tls_insecure: bool,
     pub max_connections: usize,
     pub max_connections_per_ip: usize,
+    pub max_messages_per_minute: u32,
+    pub max_recipients: usize,
 }
 
 /// `ip:port`, where the ip may be IPv4 or IPv6 and the port is the text
@@ -212,6 +226,8 @@ pub fn parse_args() -> Config {
         upstream_tls_insecure: cli.upstream_tls_insecure,
         max_connections: cli.max_connections,
         max_connections_per_ip: cli.max_connections_per_ip,
+        max_messages_per_minute: cli.max_messages_per_minute,
+        max_recipients: cli.max_recipients,
     }
 }
 
