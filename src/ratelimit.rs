@@ -8,11 +8,43 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// The most distinct keys the map will hold. A key is the username claimed
+/// at AUTH, which nothing has verified by the time the bucket is created, so
+/// the map grows on unauthenticated input: without a ceiling a client that
+/// reconnects under a new name each time adds entries for as long as the ten
+/// minutes between sweeps allow.
+///
+/// Deliberately on the low side. Exceeding it costs only the idlest bucket,
+/// which the next sweep was about to drop in any case, so a deployment that
+/// somehow has more than this many distinct senders inside one prune window
+/// loses nothing that matters -- being under is cheap, being over is not.
+const MAX_BUCKETS: usize = 10_000;
+
 struct Bucket {
     tokens: f64,
     /// When the bucket was last refilled, which is also when it was last
     /// used: [`RateLimiter::prune`] reads it as the idle time.
     last: Instant,
+}
+
+/// Drops the least recently used bucket, to make room for one more.
+///
+/// Linear in the size of the map, but it runs only on an insert that would
+/// overflow a full one, which no real workload reaches.
+///
+/// Evicting rather than refusing is the point: a limiter that turned new
+/// keys away once full would let anyone able to fill the map lock out every
+/// legitimate user arriving afterwards, trading a bounded memory problem for
+/// an unbounded availability one. An evicted user gets a fresh bucket, which
+/// is exactly what [`RateLimiter::prune`] would have given them anyway.
+fn evict_idlest(buckets: &mut HashMap<String, Bucket>) {
+    let idlest = buckets
+        .iter()
+        .min_by_key(|(_, bucket)| bucket.last)
+        .map(|(key, _)| key.clone());
+    if let Some(key) = idlest {
+        buckets.remove(&key);
+    }
 }
 
 pub struct RateLimiter {
@@ -44,6 +76,11 @@ impl RateLimiter {
         }
         let capacity = f64::from(self.per_minute);
         let mut buckets = self.buckets.lock().expect("rate limiter mutex");
+        // The length test comes first so that the normal path -- a map that
+        // is nowhere near full -- pays nothing for the second lookup.
+        if buckets.len() >= MAX_BUCKETS && !buckets.contains_key(key) {
+            evict_idlest(&mut buckets);
+        }
         let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
             tokens: capacity,
             last: now,
@@ -72,6 +109,13 @@ impl RateLimiter {
             .lock()
             .expect("rate limiter mutex")
             .retain(|_, bucket| now.saturating_duration_since(bucket.last) < idle);
+    }
+
+    /// How many buckets are held, so a test can assert the ceiling itself
+    /// rather than only its visible effect.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.buckets.lock().expect("rate limiter mutex").len()
     }
 }
 
@@ -115,6 +159,33 @@ mod tests {
         assert!(l.allow_at("u", hour_later));
         assert!(l.allow_at("u", hour_later));
         assert!(!l.allow_at("u", hour_later));
+    }
+
+    /// The map is bounded even between sweeps, and the bucket it gives up to
+    /// stay bounded is the least recently used one.
+    ///
+    /// A key is an unverified AUTH username, so a client that reconnects
+    /// under a new name each time drives the inserts; without the ceiling
+    /// the map would grow for the whole ten minutes until the next sweep.
+    #[test]
+    fn the_map_is_capped_and_gives_up_its_idlest_bucket() {
+        let l = RateLimiter::new(1);
+        let t0 = Instant::now();
+        // One key, then exactly enough newer ones to fill the map and ask
+        // for one more place than there is.
+        assert!(l.allow_at("quiet", t0));
+        let busy = t0 + Duration::from_secs(1);
+        for i in 0..MAX_BUCKETS {
+            l.allow_at(&format!("k{i}"), busy);
+        }
+        assert_eq!(l.len(), MAX_BUCKETS, "the map grew past its ceiling");
+        // "quiet" was the idlest, so it is the one that went. It comes back
+        // as a fresh full bucket; had it survived it would be empty, having
+        // spent its only token above.
+        assert!(
+            l.allow_at("quiet", t0),
+            "the idlest bucket was not the one evicted"
+        );
     }
 
     /// A bucket still in use is kept, however long the process has run.
