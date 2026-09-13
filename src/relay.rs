@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -178,6 +178,54 @@ pub enum RelayError {
     NoStartTls,
 }
 
+impl RelayError {
+    /// The reply code the client is given for this failure.
+    ///
+    /// `Rejected` passes the upstream's own code through verbatim. There is
+    /// no case where we know better than the upstream what its own rejection
+    /// meant, and overwriting a `451` with a `550` -- which is what the Perl
+    /// does unconditionally (`Connection.pm:682`) -- produces a reply that
+    /// contradicts itself: `550 4.3.2 Service not available`, a permanent
+    /// code wrapping a transient enhanced status. A client reading the one
+    /// deletes the mail the other asked it to queue.
+    ///
+    /// `Io`, `Timeout`, `Tls` and `NoStartTls` carry no upstream code at all,
+    /// because the upstream never answered. [`relay`] opens a fresh
+    /// connection per message, so an upstream restarted between two messages
+    /// lands in this group: nothing about the message was wrong, so `451`
+    /// and the client comes back.
+    ///
+    /// `Address` stays `550`. That is *our* refusal of a malformed address,
+    /// it is permanent, and it is not the upstream's opinion at all.
+    pub fn client_code(&self) -> u16 {
+        match self {
+            // An upstream that answered outside the expected class with a
+            // 2xx or a 3xx did not reject anything -- it broke the protocol,
+            // and relaying its code would answer the client `250` for a
+            // message that was never accepted. Verbatim pass-through is for
+            // codes that are actually a refusal.
+            RelayError::Rejected { code, .. } if (400..600).contains(code) => *code,
+            RelayError::Address(_) => 550,
+            RelayError::Rejected { .. }
+            | RelayError::Io(_)
+            | RelayError::Timeout
+            | RelayError::Tls(_)
+            | RelayError::NoStartTls => 451,
+        }
+    }
+}
+
+/// The most bytes one reply line may hold, its terminator included. RFC 5321
+/// 4.5.3.1.5 caps a reply line at 512 octets, so this is generous; its job is
+/// only to keep a hostile or broken upstream from feeding an endless line
+/// into memory. The Perl bounds neither this nor [`MAX_REPLY_TOTAL`].
+pub const MAX_REPLY_LINE: usize = 4096;
+
+/// The most bytes a whole multi-line reply may hold. Without it an upstream
+/// that answers `220-x` for ever is exactly as unbounded as one that never
+/// sends a newline at all.
+pub const MAX_REPLY_TOTAL: usize = 65536;
+
 pub struct Envelope<'a> {
     pub from: &'a str,
     pub mail_params: &'a [Param],
@@ -340,9 +388,17 @@ impl Upstream {
         let mut texts = Vec::new();
         loop {
             let mut line = String::new();
-            let n = tokio::time::timeout(self.timeout, self.stream.read_line(&mut line))
-                .await
-                .map_err(|_| RelayError::Timeout)??;
+            // `take` borrows the reader, so the budget is re-applied per line
+            // rather than one `Take` being held across the loop -- which is
+            // also what makes it a per-line cap and not a per-reply one.
+            let n = tokio::time::timeout(
+                self.timeout,
+                (&mut self.stream)
+                    .take(MAX_REPLY_LINE as u64)
+                    .read_line(&mut line),
+            )
+            .await
+            .map_err(|_| RelayError::Timeout)??;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -350,7 +406,24 @@ impl Upstream {
                 )
                 .into());
             }
+            // A line that spent its whole budget without reaching a newline
+            // has no end in sight. One that stopped short of the budget
+            // ended at EOF instead, and is parsed as it always was.
+            if !line.ends_with('\n') && line.len() >= MAX_REPLY_LINE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("upstream reply line exceeds {MAX_REPLY_LINE} bytes"),
+                )
+                .into());
+            }
             raw.push_str(&line);
+            if raw.len() > MAX_REPLY_TOTAL {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("upstream reply exceeds {MAX_REPLY_TOTAL} bytes"),
+                )
+                .into());
+            }
             let trimmed = line.trim_end_matches(['\r', '\n']);
             let b = trimmed.as_bytes();
             if b.len() < 3 || !b[..3].iter().all(u8::is_ascii_digit) {
@@ -718,5 +791,45 @@ mod tests {
         assert_eq!(normalize_and_stuff(b"a\rb"), b"a\rb");
         assert_eq!(normalize_and_stuff(b"a\r\r\n"), b"a\r\r\n");
         assert_eq!(normalize_and_stuff(b""), b"");
+    }
+
+    fn rejected(code: u16) -> RelayError {
+        RelayError::Rejected {
+            command: "DATA_END",
+            code,
+            text: "text".into(),
+        }
+    }
+
+    /// The upstream's code reaches the client as it was sent, not reduced to
+    /// its class: a `452` stays a `452` and a `552` stays a `552`.
+    #[test]
+    fn a_rejection_keeps_the_upstream_code() {
+        assert_eq!(rejected(451).client_code(), 451);
+        assert_eq!(rejected(452).client_code(), 452);
+        assert_eq!(rejected(550).client_code(), 550);
+        assert_eq!(rejected(552).client_code(), 552);
+    }
+
+    /// Nothing the upstream said, so nothing to relay: the client is asked
+    /// to come back rather than told the message was unacceptable. Our own
+    /// address refusal is the exception -- it is permanent and it is ours.
+    #[test]
+    fn a_failure_without_an_upstream_code_is_transient() {
+        let io = RelayError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(io.client_code(), 451);
+        assert_eq!(RelayError::Timeout.client_code(), 451);
+        assert_eq!(RelayError::Tls("bad".into()).client_code(), 451);
+        assert_eq!(RelayError::NoStartTls.client_code(), 451);
+        assert_eq!(RelayError::Address("a b".into()).client_code(), 550);
+    }
+
+    /// An upstream that answers a `250` where a `354` was required has not
+    /// refused the message, it has broken the protocol. Relaying that code
+    /// would tell the client the mail was accepted.
+    #[test]
+    fn a_reply_outside_the_rejection_range_does_not_become_the_clients_code() {
+        assert_eq!(rejected(250).client_code(), 451);
+        assert_eq!(rejected(354).client_code(), 451);
     }
 }

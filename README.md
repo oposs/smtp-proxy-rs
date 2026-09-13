@@ -141,6 +141,48 @@ this is then relayed to the client.
   versus `--help` exiting 1 there. Spec section 7 mandates the exit-1 case
   for a missing mandatory option, and a `--help` that exits non-zero breaks
   scripts and Makefiles that call it, so this divergence is deliberate.
+- **The upstream's own reply code reaches the client.** The Perl answers a
+  refused message with `550` whatever the upstream said
+  (`Connection.pm:682`), so an upstream `451 4.3.2 Service not available`
+  arrived at the client as `550 4.3.2 Service not available` -- a permanent
+  reply code wrapping a transient enhanced status, which a client reading the
+  one deletes and a client reading the other queues. The code is now passed
+  through unchanged. Where the upstream never answered at all (connection
+  refused, timeout, TLS failure, no STARTTLS where it is required) the client
+  gets `451`, because a fresh connection is opened per message and nothing
+  about the message was wrong. Our own refusal of a malformed address stays
+  `550`: that one is permanent and it is not the upstream's opinion.
+- **An API-supplied header name is matched without regard to case.** The Perl
+  compares header names exactly, so an API answering `subject` while the
+  client sent `Subject` removed nothing and the relayed message carried both.
+  RFC 5322 3.6.8 makes field names case-insensitive.
+- **A header block written with bare LF is split into individual headers.**
+  The Perl splits only on CRLF, so such a block reached the API as one opaque
+  header whose value carried every remaining header -- and API-side header
+  policy could therefore be evaded by sending LF instead of CRLF. The reader
+  accepts bare LF as a line terminator in both implementations, so the block
+  genuinely arrives in that shape.
+- **A header carrying an unfolded line break is not relayed.** The Perl
+  interpolates header values unchecked, so a value holding `CRLF CRLF` split
+  the relayed message and forged a body. A line break inside a value is now
+  accepted only as a proper fold (a break followed by a space or a tab) and a
+  header name may hold no break or colon at all. The mail is refused with
+  `550 authentication service failed`, an existing reply text.
+- **The upstream's reply is bounded** at 4096 bytes per line and 65536 bytes
+  in total. The Perl bounds neither, so a hostile or compromised upstream
+  could feed an endless reply and exhaust memory. RFC 5321 4.5.3.1.5 caps a
+  reply line at 512 octets, so no working upstream reaches either bound.
+- **An AUTH username longer than 256 decoded bytes is refused** with the
+  existing `535 Authentication credentials invalid`. The Perl applies no
+  length check, and the username is the one unverified client-supplied string
+  the process stores -- the per-username rate limiter keys its buckets on it.
+  No real credential comes close to 256 bytes. The password is not bounded:
+  it is never retained.
+- **`initgroups` is called before `setgid` and `setuid`.** The Perl drops the
+  group and the user and nothing else, so a proxy started as root kept root's
+  *supplementary* groups for the life of the process. `initgroups` gives the
+  target user exactly the groups they would have on login, which keeps working
+  for an operator who grants certificate or key access through a group.
 
 The remaining differences from the Perl version -- upstream STARTTLS with
 certificate verification, connection/per-IP/rate/recipient limits, the 30

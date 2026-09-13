@@ -25,7 +25,7 @@ pub struct Script {
     pub auth_ok: bool,
     pub mail_error: Option<Rejection>,
     pub rcpt_error: Option<Rejection>,
-    pub message_result: Result<String, String>,
+    pub message_result: Result<String, Rejection>,
     pub dsn: bool,
     /// Delay before answering `message`, to simulate a slow relay.
     pub message_delay: std::time::Duration,
@@ -125,7 +125,7 @@ impl Handler for ScriptedHandler {
         Ok(())
     }
 
-    async fn message(&mut self, body: Vec<u8>) -> Result<String, String> {
+    async fn message(&mut self, body: Vec<u8>) -> Result<String, Rejection> {
         let script = self.script();
         self.recorded.lock().unwrap().message_started += 1;
         if let Some(hold) = &script.message_hold {

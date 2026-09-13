@@ -130,7 +130,10 @@ async fn handler_rejections_use_the_perl_texts() {
     );
     factory.set(|s| {
         s.rcpt_error = None;
-        s.message_result = Err("Weather too hot to email".into())
+        s.message_result = Err(smtp_proxy::server::Rejection {
+            code: 550,
+            text: "Weather too hot to email".into(),
+        })
     });
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));

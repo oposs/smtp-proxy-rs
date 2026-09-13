@@ -52,6 +52,10 @@ struct Inner {
     reject_mail: Option<String>,
     /// Reply to the final dot with this text after `250 `.
     accept_text: String,
+    /// Reply to the final dot with this code and text instead of accepting
+    /// it, so that a test can drive an upstream rejection whose code is not
+    /// a 550. The message is still recorded: the upstream did receive it.
+    reject_data_end: Option<(u16, String)>,
     /// Stop reading for this long right after `354`, before taking a single
     /// byte of the body: an upstream that has gone away mid-transfer.
     data_stall: Option<Duration>,
@@ -93,6 +97,7 @@ impl Inner {
             reject_ehlo: None,
             reject_mail: None,
             accept_text: "OK message accepted".into(),
+            reject_data_end: None,
             data_stall: None,
             data_pace: None,
             tls: None,
@@ -232,6 +237,13 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().accept_text = text.into();
     }
 
+    /// Refuse the final dot with this code and text instead of answering
+    /// `250`.
+    pub fn reject_data_end(&self, reply: Option<(u16, &str)>) {
+        self.inner.lock().unwrap().reject_data_end =
+            reply.map(|(code, text)| (code, text.to_string()));
+    }
+
     /// Read nothing at all for `pause` after answering `354`.
     pub fn stall_data(&self, pause: Duration) {
         self.inner.lock().unwrap().data_stall = Some(pause);
@@ -309,13 +321,16 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 in_data = false;
                 since_pause = 0;
                 pauses_done = 0;
-                let text = {
+                let (code, text) = {
                     let mut s = state.lock().unwrap();
                     s.messages.push(std::mem::take(&mut message));
-                    s.accept_text.clone()
+                    match &s.reject_data_end {
+                        Some((code, text)) => (*code, text.clone()),
+                        None => (250, s.accept_text.clone()),
+                    }
                 };
                 if io
-                    .write_all(format!("250 {text}\r\n").as_bytes())
+                    .write_all(format!("{code} {text}\r\n").as_bytes())
                     .await
                     .is_err()
                 {

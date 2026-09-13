@@ -111,10 +111,10 @@ impl RateLimiter {
             .retain(|_, bucket| now.saturating_duration_since(bucket.last) < idle);
     }
 
-    /// How many buckets are held, so a test can assert the ceiling itself
-    /// rather than only its visible effect.
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// How many buckets are held. Exposed so that the ceiling, and the fact
+    /// that a refused login leaves nothing behind at all, can be asserted
+    /// directly rather than only through their visible effects.
+    pub fn bucket_count(&self) -> usize {
         self.buckets.lock().expect("rate limiter mutex").len()
     }
 }
@@ -178,7 +178,11 @@ mod tests {
         for i in 0..MAX_BUCKETS {
             l.allow_at(&format!("k{i}"), busy);
         }
-        assert_eq!(l.len(), MAX_BUCKETS, "the map grew past its ceiling");
+        assert_eq!(
+            l.bucket_count(),
+            MAX_BUCKETS,
+            "the map grew past its ceiling"
+        );
         // "quiet" was the idlest, so it is the one that went. It comes back
         // as a fresh full bucket; had it survived it would be empty, having
         // spent its only token above.

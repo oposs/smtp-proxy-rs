@@ -66,6 +66,13 @@ impl std::io::Write for Capture {
 }
 
 async fn rig(upstream_extensions: &[&str]) -> Rig {
+    rig_relaying_to(upstream_extensions, None).await
+}
+
+/// [`rig`] with the relay pointed somewhere other than the recording
+/// upstream, so that a test can see what the proxy answers when there is
+/// nothing at the other end at all.
+async fn rig_relaying_to(upstream_extensions: &[&str], relay_port: Option<u16>) -> Rig {
     captured_log();
     let api = FakeApi::start().await;
     let upstream = RecordingUpstream::start(upstream_extensions).await;
@@ -73,7 +80,7 @@ async fn rig(upstream_extensions: &[&str]) -> Rig {
         api: ApiClient::new(api.url.clone()).unwrap(),
         relay: RelayConfig {
             host: "127.0.0.1".into(),
-            port: upstream.addr.port(),
+            port: relay_port.unwrap_or_else(|| upstream.addr.port()),
             timeout: std::time::Duration::from_secs(5),
             tls: smtp_proxy::relay::UpstreamTls::off(),
             tls_server_name: None,
@@ -313,6 +320,9 @@ async fn a_header_with_an_empty_value_reaches_neither_the_api_nor_the_upstream()
     );
 }
 
+/// The upstream refused MAIL FROM with a `553`, so the client is told `553`.
+/// Before the 2026-09-13 ruling this arrived as a `550`, as it still does in
+/// the Perl (`Connection.pm:682`).
 #[tokio::test]
 async fn relay_error_reaches_the_client() {
     let r = rig(&["DSN"]).await;
@@ -327,7 +337,148 @@ async fn relay_error_reaches_the_client() {
         MESSAGE,
     )
     .await;
-    assert_eq!(reply, "550 Sorry, I don't send from there\r\n");
+    assert_eq!(reply, "553 Sorry, I don't send from there\r\n");
+}
+
+/// Item 6. A transient upstream refusal reaches the client as transient. The
+/// reply used to be `550 4.3.2 Service not available`: a permanent code
+/// wrapping a transient enhanced status, so a client reading the one deleted
+/// the mail the other asked it to queue.
+#[tokio::test]
+async fn an_upstream_4xx_reaches_the_client_as_4xx() {
+    let r = rig(&["DSN"]).await;
+    r.upstream
+        .reject_data_end(Some((451, "4.3.2 Service not available")));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    // The reply code and the enhanced status agree.
+    assert_eq!(reply, "451 4.3.2 Service not available\r\n");
+}
+
+/// Item 6, and the test that tells verbatim pass-through from
+/// class-normalisation. A `552` collapsed to `550` would still be a 5xx and
+/// would go unnoticed without this.
+#[tokio::test]
+async fn an_upstream_5xx_still_reaches_the_client_as_that_5xx() {
+    let r = rig(&["DSN"]).await;
+    r.upstream
+        .reject_data_end(Some((552, "5.3.4 Message too big for system")));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    assert_eq!(reply, "552 5.3.4 Message too big for system\r\n");
+    // The session survives an upstream 552 like any other rejection: only
+    // *our* size cap discards a transaction mid-flight.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
+}
+
+/// Item 6. The upstream never answered, so there is no code to relay.
+/// `relay` opens a fresh connection per message, so an upstream restarted
+/// between two messages lands here: nothing about the message was wrong and
+/// the client should come back rather than discard it.
+#[tokio::test]
+async fn an_unreachable_upstream_is_a_451_not_a_550() {
+    // Port 1 on the loopback: privileged, unbound, and reliably refused.
+    let r = rig_relaying_to(&["DSN"], Some(1)).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    assert!(reply.starts_with("451 "), "{reply}");
+}
+
+/// Item 5. An API-supplied header value carrying `\r\n\r\n` would split the
+/// relayed message and forge a body. The mail is refused and nothing is
+/// relayed at all -- the upstream is never even connected to.
+#[tokio::test]
+async fn a_header_value_with_an_unfolded_break_is_not_relayed() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [
+            { "name": "X-Injected", "value": "harmless\r\n\r\nForged body line" }
+        ]}));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    assert_eq!(reply, "550 authentication service failed\r\n");
+    assert!(
+        r.upstream.commands().is_empty(),
+        "{:?}",
+        r.upstream.commands()
+    );
+    assert!(r.upstream.messages().is_empty());
+    // A properly folded value from the same API is relayed unchanged, so the
+    // refusal is the unfolded break and not the presence of a line ending.
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [
+            { "name": "X-Folded", "value": "first\r\n  second" }
+        ]}));
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    assert!(reply.starts_with("250"), "{reply}");
+    assert!(
+        r.upstream.messages()[0].contains("X-Folded: first\r\n  second\r\n"),
+        "{}",
+        r.upstream.messages()[0]
+    );
+}
+
+/// Item 3, end to end: a header block written with bare LF reaches the API
+/// as individual headers, so API-side header policy cannot be evaded by
+/// sending LF where CRLF was expected.
+#[tokio::test]
+async fn a_bare_lf_header_block_reaches_the_api_as_separate_headers() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let message = "From: sender@foobar.com\nSubject: Hello\nX-Policy: evade\n\nHello there\r\n";
+    assert!(
+        send_mail(
+            &mut c,
+            "sender@foobar.com",
+            &["receiver@foobaz.com"],
+            message
+        )
+        .await
+        .starts_with("250")
+    );
+    assert_eq!(
+        r.api.calls()[0]["headers"],
+        serde_json::json!([
+            {"name": "From", "value": "sender@foobar.com"},
+            {"name": "Subject", "value": "Hello"},
+            {"name": "X-Policy", "value": "evade"},
+        ])
+    );
 }
 
 #[tokio::test]

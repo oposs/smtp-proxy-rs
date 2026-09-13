@@ -113,8 +113,11 @@ pub trait Handler: Send + 'static {
     ) -> impl Future<Output = Result<(), Rejection>> + Send;
     /// Header block complete; body still arriving.
     fn headers(&mut self, headers: String) -> impl Future<Output = Result<(), String>> + Send;
-    /// Terminator arrived. Ok: text for `250 OK: <text>`. Err: text for `550 <text>`.
-    fn message(&mut self, body: Vec<u8>) -> impl Future<Output = Result<String, String>> + Send;
+    /// Terminator arrived. Ok: text for `250 OK: <text>`. Err: the whole
+    /// reply, code included -- the session does not choose one. An upstream
+    /// that refused the message with a `451` has to reach the client as a
+    /// `451`, and only the handler knows what the upstream said.
+    fn message(&mut self, body: Vec<u8>) -> impl Future<Output = Result<String, Rejection>> + Send;
     /// RSET, or EHLO/HELO while a transaction is running.
     fn reset(&mut self);
     fn dsn_available(&self) -> bool;

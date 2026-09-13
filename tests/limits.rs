@@ -128,9 +128,16 @@ async fn recipient_limit_answers_452_and_keeps_the_transaction() {
     assert_eq!(c.command("RCPT TO:<4@b.com>").await, "250 OK\r\n");
 }
 
-#[tokio::test]
-async fn message_rate_limit_per_username() {
-    // Through the real proxy handler, which owns the limiter.
+/// A real proxy handler, which is what owns the rate limiter, in front of a
+/// recording upstream and a fake API.
+async fn rate_limited_proxy(
+    messages_per_minute: u32,
+) -> (
+    smtp_proxy::proxy::ProxyFactory,
+    std::net::SocketAddr,
+    common::fake_api::FakeApi,
+    common::upstream::RecordingUpstream,
+) {
     let api = common::fake_api::FakeApi::start().await;
     let upstream = common::upstream::RecordingUpstream::start(&["DSN"]).await;
     let proxy_config = smtp_proxy::proxy::ProxyConfig {
@@ -142,10 +149,16 @@ async fn message_rate_limit_per_username() {
             tls: smtp_proxy::relay::UpstreamTls::off(),
             tls_server_name: None,
         },
-        messages_per_minute: 2,
+        messages_per_minute,
     };
     let factory = smtp_proxy::proxy::ProxyFactory::new(proxy_config);
-    let addr = start_server(server_config(true, true), factory).await;
+    let addr = start_server(server_config(true, true), factory.clone()).await;
+    (factory, addr, api, upstream)
+}
+
+#[tokio::test]
+async fn message_rate_limit_per_username() {
+    let (_factory, addr, _api, _upstream) = rate_limited_proxy(2).await;
     let (mut c, _) = RawClient::connect(addr).await;
     c.login("alice", "pw").await;
     assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
@@ -163,4 +176,83 @@ async fn message_rate_limit_per_username() {
     let (mut c2, _) = RawClient::connect(addr).await;
     c2.login("bob", "pw").await;
     assert_eq!(c2.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+}
+
+/// Spec 9.3 keys a rate-limit bucket on the username claimed at AUTH and
+/// holds it for up to a prune window, so the username is the one unverified
+/// client-supplied string this process *stores*. Bounding it at 256 decoded
+/// bytes (`server::auth`) is what stops a client filling the map with 50 KiB
+/// keys, and the bound only works if the refusal happens before the handler
+/// ever sees the name.
+///
+/// **Divergence from the Perl, approved 2026-09-13:** the Perl applies no
+/// length check. The refusal reuses the existing
+/// `535 Authentication credentials invalid`, so no reply text is added.
+#[tokio::test]
+async fn an_over_long_username_is_refused_and_leaves_no_rate_limit_bucket() {
+    let (factory, addr, _api, _upstream) = rate_limited_proxy(2).await;
+
+    // 257 decoded bytes: one past the bound, and nowhere near the 64 KiB
+    // command-line cap that used to be the only limit on this path.
+    let too_long = "u".repeat(257);
+
+    // SASL PLAIN carries the username in the AUTH command itself.
+    let (mut plain, _) = RawClient::connect(addr).await;
+    ready_for_auth(&mut plain).await;
+    assert_eq!(
+        plain.auth_plain(&too_long, "pw").await,
+        "535 Authentication credentials invalid\r\n"
+    );
+    // A bucket is created at MAIL, not at AUTH, so the transaction has to be
+    // attempted for the absence of one to mean anything.
+    assert_eq!(
+        plain.command("MAIL FROM:<a@b.com>").await,
+        "530 Authentication required\r\n"
+    );
+
+    // SASL LOGIN carries it in its own continuation line: a second way in,
+    // on its own connection because a successful AUTH would put the first
+    // session past the point where a second one is even a valid command.
+    let (mut login, _) = RawClient::connect(addr).await;
+    ready_for_auth(&mut login).await;
+    assert_eq!(login.command("AUTH LOGIN").await, "334 VXNlcm5hbWU6\r\n");
+    assert!(login.command(&b64(&too_long)).await.starts_with("334"));
+    assert_eq!(
+        login.command(&b64("pw")).await,
+        "535 Authentication credentials invalid\r\n"
+    );
+    assert_eq!(
+        login.command("MAIL FROM:<a@b.com>").await,
+        "530 Authentication required\r\n"
+    );
+
+    // The point of the item: neither refusal retained anything. With the
+    // bound gone both sessions authenticate, both MAILs are accepted, and a
+    // bucket keyed on 257 bytes of client-supplied name appears right here.
+    assert_eq!(
+        factory.rate_limit_buckets(),
+        0,
+        "a refused login left a bucket behind"
+    );
+
+    // The control, so the assertion above is measuring something that can be
+    // non-zero: a username at the bound authenticates and does leave one.
+    let at_bound = "u".repeat(256);
+    let (mut ok, _) = RawClient::connect(addr).await;
+    ok.login(&at_bound, "pw").await;
+    assert_eq!(ok.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    assert_eq!(factory.rate_limit_buckets(), 1);
+}
+
+/// EHLO, STARTTLS, EHLO: everything before AUTH, for a test that sends the
+/// AUTH by hand rather than through `RawClient::login`.
+async fn ready_for_auth(c: &mut RawClient) {
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    c.starttls().await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+}
+
+fn b64(s: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(s)
 }

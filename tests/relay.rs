@@ -3,13 +3,15 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
-    Envelope, RelayConfig, RelayError, UpstreamTls, UpstreamTlsMode, probe, relay, relay_over,
+    Envelope, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamTls,
+    UpstreamTlsMode, probe, probe_over, relay, relay_over,
 };
 use smtp_proxy::smtp::params::Param;
 
@@ -561,4 +563,92 @@ async fn off_ignores_an_offered_starttls() {
     relay(&config(&up), env, b"x\r\n").await.unwrap();
     assert!(!up.commands().contains(&"STARTTLS".to_string()));
     assert!(up.tls_commands().is_empty());
+}
+
+/// How much a hostile upstream is given the chance to send in the two tests
+/// below. An unbounded reader swallows all of it; a bounded one gives up
+/// three orders of magnitude earlier.
+const HOSTILE_REPLY: usize = 1 << 20;
+
+/// Feeds `chunk` into a duplex pair until [`HOSTILE_REPLY`] bytes have gone
+/// in or the relay drops its end, and reports how many bytes it managed to
+/// write. That count is the assertion: it says how much of the endless reply
+/// the relay actually consumed.
+///
+/// A duplex pair and not a socket, for the same reason the timing tests use
+/// one -- how much may sit in flight has to be a property of the test rather
+/// than of the host's socket buffers, or "the relay stopped early" cannot be
+/// told from "the kernel buffered the rest".
+fn hostile_upstream(
+    prefix: &'static [u8],
+    chunk: Vec<u8>,
+) -> (
+    tokio::io::DuplexStream,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (client, mut server) = tokio::io::duplex(HOSTILE_DUPLEX);
+    let written = Arc::new(AtomicUsize::new(0));
+    let count = written.clone();
+    let fed = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        if server.write_all(prefix).await.is_err() {
+            return;
+        }
+        count.fetch_add(prefix.len(), Ordering::Relaxed);
+        while count.load(Ordering::Relaxed) < HOSTILE_REPLY {
+            if server.write_all(&chunk).await.is_err() {
+                return;
+            }
+            count.fetch_add(chunk.len(), Ordering::Relaxed);
+        }
+    });
+    (client, written, fed)
+}
+
+/// Small and fixed, so the slack in the assertions below is arithmetic: at
+/// most this much sits unread in the pair, and at most this much again sits
+/// in the relay's own `BufReader`.
+const HOSTILE_DUPLEX: usize = 1024;
+
+/// An upstream that starts a reply line and never ends it must not be able
+/// to grow the relay's memory by the length of what it sends.
+#[tokio::test]
+async fn endless_reply_line_is_refused_not_buffered() {
+    let (client, written, fed) = hostile_upstream(b"220 ", vec![b'x'; HOSTILE_DUPLEX]);
+    let err = probe_over(client, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("line exceeds 4096 bytes"),
+        "{err:?}"
+    );
+    fed.await.unwrap();
+    // The budget itself, plus what the relay's BufReader may have pulled in
+    // on its last fill, plus what is still sitting unread in the pair, plus
+    // the write the feeder was blocked in. Generous, and still two orders of
+    // magnitude below the mebibyte an unbounded read_line would have taken.
+    let written = written.load(Ordering::Relaxed);
+    assert!(
+        written <= MAX_REPLY_LINE + 8 * HOSTILE_DUPLEX,
+        "the relay consumed {written} bytes of an endless line"
+    );
+}
+
+/// The other dimension: every line is short and well-formed, but the reply
+/// never reaches its final line. Only the running total can stop it.
+#[tokio::test]
+async fn endless_multiline_reply_is_refused() {
+    let line = "220-a\r\n";
+    let (client, written, fed) = hostile_upstream(b"", line.repeat(146).into_bytes());
+    let err = probe_over(client, Duration::from_secs(5))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("exceeds 65536 bytes"), "{err:?}");
+    fed.await.unwrap();
+    let written = written.load(Ordering::Relaxed);
+    assert!(
+        written <= MAX_REPLY_TOTAL + 8 * HOSTILE_DUPLEX,
+        "the relay consumed {written} bytes of an endless multi-line reply"
+    );
 }

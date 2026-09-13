@@ -53,6 +53,13 @@ impl ProxyFactory {
         self.limiter.prune(idle);
     }
 
+    /// How many rate-limit buckets are held. A bucket is keyed on the
+    /// username claimed at AUTH, so this is the count of distinct unverified
+    /// identities the process is currently remembering.
+    pub fn rate_limit_buckets(&self) -> usize {
+        self.limiter.bucket_count()
+    }
+
     pub fn upstream_dsn(&self) -> Arc<AtomicBool> {
         self.upstream_dsn.clone()
     }
@@ -130,12 +137,21 @@ pub struct ProxyHandler {
     transaction: Transaction,
 }
 
-/// Splits at CRLF followed by a non-blank (folded lines stay whole), then at
-/// the first colon. A line without a colon, and a line with nothing at all
-/// behind the colon, is logged and dropped (spec 5.2).
+/// Splits at a line break followed by a non-blank (folded lines stay whole),
+/// then at the first colon. A line without a colon, and a line with nothing
+/// at all behind the colon, is logged and dropped (spec 5.2).
+///
+/// **Divergence from the Perl, approved 2026-09-12.** The Perl splits on
+/// `/\r\n(?=$|\S)/` and so only ever on CRLF. `DataReader` accepts a bare LF
+/// as a line terminator (`server::data`, as the Perl's reader does), so a
+/// header block written with bare LF genuinely arrives here -- and split on
+/// CRLF alone it becomes a *single* header whose value carries every
+/// remaining header. API-side header policy would then be evadable by
+/// sending LF instead of CRLF. Splitting on the LF of either terminator
+/// closes that.
 pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
     let mut lines: Vec<String> = Vec::new();
-    for raw in block.split_inclusive("\r\n") {
+    for raw in block.split_inclusive('\n') {
         // The Perl splits on `/\r\n(?=$|\S)/`, whose `\S` counts the
         // vertical tab and the form feed as continuation as well.
         let continuation = raw.starts_with([' ', '\t', '\x0b', '\x0c']);
@@ -146,7 +162,7 @@ pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
     }
     let mut out = Vec::new();
     for line in lines {
-        let line = line.trim_end_matches("\r\n");
+        let line = line.trim_end_matches(['\r', '\n']);
         match line.split_once(':') {
             // `[^:]+` needs a name and `(.+)` needs at least one character
             // behind the colon, so `Subject:` does not parse.
@@ -178,11 +194,18 @@ fn perl_header_value(rest: &str) -> String {
 }
 
 /// Spec 5.4: remove every header the API names, then append those it gave a
-/// value, in API order. Names are compared exactly, as in the Perl.
+/// value, in API order.
+///
+/// **Divergence from the Perl, approved 2026-09-12.** The Perl compares names
+/// exactly (`%toRemove` keyed on the raw name, `SMTPProxy.pm:248-250`), so an
+/// API answering `subject` while the client sent `Subject` removes nothing
+/// and the relayed message carries *both*. RFC 5322 3.6.8 makes field names
+/// case-insensitive, so the comparison is too. ASCII case is the right fold:
+/// a field name is printable US-ASCII by the same section.
 pub fn merge_headers(existing: Vec<RequestHeader>, api: &[ResponseHeader]) -> Vec<RequestHeader> {
     let mut out: Vec<RequestHeader> = existing
         .into_iter()
-        .filter(|h| !api.iter().any(|a| a.name == h.name))
+        .filter(|h| !api.iter().any(|a| a.name.eq_ignore_ascii_case(&h.name)))
         .collect();
     out.extend(api.iter().filter_map(|a| {
         a.value.clone().map(|value| RequestHeader {
@@ -193,8 +216,61 @@ pub fn merge_headers(existing: Vec<RequestHeader>, api: &[ResponseHeader]) -> Ve
     out
 }
 
+/// Whether a line break at `i` in `value` is a proper fold: the break itself,
+/// then a space or a tab (RFC 5322 3.2.2 FWS). `\r\n` and a bare `\n` both
+/// count as the break, because a client-supplied folded header reaches this
+/// point with whichever of the two it arrived with (see [`parse_headers`]).
+fn folds_at(value: &[u8], i: usize) -> bool {
+    let after = if value[i] == b'\r' {
+        if value.get(i + 1) != Some(&b'\n') {
+            // A CR that is not the start of a CRLF is not a fold and not a
+            // line break either; it has no business in a relayed header.
+            return false;
+        }
+        i + 2
+    } else {
+        i + 1
+    };
+    matches!(value.get(after), Some(b' ' | b'\t'))
+}
+
+/// Refuses any header that would not survive `format_message` intact
+/// (spec 5.4 writes `name: value` and a CRLF, with no escaping of either
+/// half). A value carrying `\r\n\r\n` splits the relayed message and forges
+/// a body; one carrying a single `\r\n` forges a header.
+///
+/// A line break inside a value is legal only as a proper fold -- a `\r\n` or
+/// a bare `\n` immediately followed by a space or a tab. That precision is
+/// required rather than a blanket "no CRLF": client-supplied folded headers
+/// arrive here with their break intact and have to keep relaying. A *name*
+/// may hold no `\r`, `\n` or `:` at all, since the colon is what separates
+/// it from the value.
+///
+/// `Err` carries the offending header's **name only**. The value may hold
+/// customer content and this string is logged.
+///
+/// **Divergence from the Perl, approved 2026-09-12.** The Perl interpolates
+/// the value unchecked (`SMTPProxy.pm:252-253`). The envelope addresses are
+/// guarded on both sides ([`crate::relay::assert_relayable`]); the headers
+/// were not.
+pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String> {
+    for h in headers {
+        if h.name.contains(['\r', '\n', ':']) {
+            return Err(h.name.clone());
+        }
+        let value = h.value.as_bytes();
+        for i in 0..value.len() {
+            if (value[i] == b'\r' || value[i] == b'\n') && !folds_at(value, i) {
+                return Err(h.name.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Spec 5.4: `name: value` per header, an empty line, then the body as it
-/// was received.
+/// was received. Every header has passed [`assert_header_relayable`] by the
+/// time it gets here.
 pub fn format_message(headers: &[RequestHeader], body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(body.len() + 256);
     for h in headers {
@@ -203,6 +279,22 @@ pub fn format_message(headers: &[RequestHeader], body: &[u8]) -> Vec<u8> {
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
     out
+}
+
+/// The catch-all refusal: the proxy could not establish that this message is
+/// allowed, so it says so in the one existing text rather than inventing a
+/// new one.
+///
+/// It stays permanent, unlike the relay failures of
+/// [`crate::relay::RelayError::client_code`]. An API outage is arguably as
+/// transient as an upstream restart, but that is a separate question the
+/// user has not ruled on, and it is deliberately not folded into the
+/// 2026-09-13 pass-through ruling.
+fn auth_service_failed() -> Rejection {
+    Rejection {
+        code: 550,
+        text: "authentication service failed".into(),
+    }
 }
 
 impl ProxyHandler {
@@ -223,11 +315,23 @@ impl ProxyHandler {
         &mut self,
         outcome: CheckResponse,
         body: Vec<u8>,
-    ) -> Result<String, String> {
+    ) -> Result<String, Rejection> {
         debug!("Relaying Mail to upstream SMTP Server");
         // Cloned rather than taken: the debug dump on the error path below
         // has to show the headers the API was asked about.
         let headers = merge_headers(self.transaction.headers.clone(), &outcome.headers);
+        // On the merged list, so that a break the API introduced and a break
+        // the client sent are both caught, and caught before the connection
+        // costs anything. `escape_debug` because the name is the one thing
+        // that might itself carry the break being complained about.
+        if let Err(which) = assert_header_relayable(&headers) {
+            warn!(
+                "Refusing to relay header '{}' for {}: unfolded line break",
+                which.escape_debug(),
+                self.client
+            );
+            return Err(auth_service_failed());
+        }
         let message = format_message(&headers, &body);
         // Spec 5.5: the API may replace the envelope sender. `relay` runs the
         // printable-ASCII check on it before it writes any command.
@@ -270,7 +374,12 @@ impl ProxyHandler {
                 // JSON like the line above it, because README promises that
                 // every debug dump on this branch is JSON.
                 debug!("ApiResult {}", outcome.json());
-                Err(e.to_string())
+                // Spec 6, and the ruling of 2026-09-13: the upstream's own
+                // code, not a blanket 550. See `RelayError::client_code`.
+                Err(Rejection {
+                    code: e.client_code(),
+                    text: e.to_string(),
+                })
             }
         }
     }
@@ -333,30 +442,36 @@ impl Handler for ProxyHandler {
         Ok(())
     }
 
-    async fn message(&mut self, body: Vec<u8>) -> Result<String, String> {
+    async fn message(&mut self, body: Vec<u8>) -> Result<String, Rejection> {
         // Unreachable from the session, which always delivers the headers
         // before the body: a missing call means a bug, not a bad client, and
         // silently relaying an unchecked mail would be the worse answer.
         let Some(call) = self.transaction.api_call.take() else {
             warn!("No API call was started for {}", self.client);
-            return Err("authentication service failed".into());
+            return Err(auth_service_failed());
         };
         let outcome = match call.await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
-                return Err("authentication service failed".into());
+                return Err(auth_service_failed());
             }
             Err(e) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
-                return Err("authentication service failed".into());
+                return Err(auth_service_failed());
             }
         };
         if !outcome.allow {
             let reason = outcome.reason.clone().unwrap_or_default();
             info!("Mail rejected by API ({reason}) for {}", self.client);
             debug!("INPUT {}", self.check_request().redacted_json());
-            return Err(reason);
+            // A policy refusal is permanent: the API looked at this message
+            // and said no. Unlike the relay paths below, there is nothing
+            // here for the client to retry.
+            return Err(Rejection {
+                code: 550,
+                text: reason,
+            });
         }
         self.relay_message(outcome, body).await
     }
@@ -382,6 +497,13 @@ mod tests {
         RequestHeader {
             name: n.into(),
             value: v.into(),
+        }
+    }
+
+    fn rh(n: &str, v: Option<&str>) -> ResponseHeader {
+        ResponseHeader {
+            name: n.into(),
+            value: v.map(String::from),
         }
     }
 
@@ -455,6 +577,89 @@ mod tests {
                 h("Sender", "bar@blah.com")
             ]
         );
+    }
+
+    /// Item 2. RFC 5322 3.6.8: field names are case-insensitive, so an API
+    /// that answers `subject` replaces the client's `Subject` instead of
+    /// leaving the message with both.
+    #[test]
+    fn api_header_replaces_client_header_regardless_of_case() {
+        let existing = vec![h("Subject", "client"), h("To", "x@y.com")];
+        let api = vec![rh("subject", Some("api"))];
+        let merged = merge_headers(existing, &api);
+        assert_eq!(merged, vec![h("To", "x@y.com"), h("subject", "api")]);
+    }
+
+    /// The removal half of the same rule: a `None` value still removes, and
+    /// now removes whatever the client's casing was.
+    #[test]
+    fn a_null_api_value_removes_the_client_header_regardless_of_case() {
+        let existing = vec![h("X-Remove", "1"), h("To", "x@y.com")];
+        let api = vec![rh("x-REMOVE", None)];
+        assert_eq!(merge_headers(existing, &api), vec![h("To", "x@y.com")]);
+    }
+
+    /// Item 3. `DataReader` accepts a bare LF, so this block genuinely
+    /// arrives. Split on CRLF alone it would be one header named `From`
+    /// whose value carried `Subject` and `To` -- and the API would never see
+    /// them to have an opinion about them.
+    #[test]
+    fn bare_lf_header_block_splits_into_headers() {
+        let parsed = parse_headers("From: a@b.com\nSubject: hi\nTo: x@y.com\n");
+        assert_eq!(
+            parsed,
+            vec![h("From", "a@b.com"), h("Subject", "hi"), h("To", "x@y.com")]
+        );
+    }
+
+    #[test]
+    fn bare_lf_folding_still_folds() {
+        let parsed = parse_headers("Subject: long\n  folded\nTo: x@y.com\n");
+        assert_eq!(
+            parsed,
+            vec![h("Subject", "long\n  folded"), h("To", "x@y.com")]
+        );
+    }
+
+    #[test]
+    fn mixed_crlf_and_lf_block_splits_on_both() {
+        let parsed = parse_headers("A: 1\r\nB: 2\nC: 3\r\n");
+        assert_eq!(parsed, vec![h("A", "1"), h("B", "2"), h("C", "3")]);
+    }
+
+    /// Item 5. A fold is a line break followed by a space or a tab, and a
+    /// client-supplied folded header arrives here with its break intact, so
+    /// refusing every CRLF would refuse legitimate mail.
+    #[test]
+    fn a_folded_value_is_still_relayable() {
+        assert!(assert_header_relayable(&[h("Subject", "long\r\n  folded")]).is_ok());
+        assert!(assert_header_relayable(&[h("Subject", "long\n\tfolded")]).is_ok());
+        assert!(assert_header_relayable(&[h("Subject", "plain")]).is_ok());
+    }
+
+    #[test]
+    fn an_unfolded_break_in_a_value_is_refused() {
+        assert!(assert_header_relayable(&[h("X", "a\r\n\r\nforged body")]).is_err());
+        assert!(assert_header_relayable(&[h("X", "a\r\nInjected: yes")]).is_err());
+        assert!(assert_header_relayable(&[h("X", "a\nInjected: yes")]).is_err());
+        assert!(assert_header_relayable(&[h("X", "trailing\r\n")]).is_err());
+        // A CR that is not the start of a CRLF is not a fold either.
+        assert!(assert_header_relayable(&[h("X", "a\r b")]).is_err());
+    }
+
+    #[test]
+    fn a_break_or_colon_in_a_name_is_refused() {
+        assert!(assert_header_relayable(&[h("X\r\nY", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("X: Y", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("X\nY", "v")]).is_err());
+    }
+
+    /// The error names the offending header and nothing else: the value may
+    /// hold customer content and the name is what gets logged.
+    #[test]
+    fn the_refusal_names_the_header_and_not_its_value() {
+        let e = assert_header_relayable(&[h("Good", "ok"), h("X-Bad", "a\r\nb")]).unwrap_err();
+        assert_eq!(e, "X-Bad");
     }
 
     #[test]

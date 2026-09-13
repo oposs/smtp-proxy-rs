@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 use crate::server::auth::{PASSWORD_CHALLENGE, USERNAME_CHALLENGE, decode_login, decode_plain};
 use crate::server::data::{DataEvent, DataReader};
-use crate::server::{Handler, ServerConfig};
+use crate::server::{Handler, Rejection, ServerConfig};
 use crate::smtp::command::{Command, CommandError, parse_command, take_line};
 use crate::smtp::dsn::{DsnCommand, validate_dsn};
 use crate::smtp::reply::Reply;
@@ -620,12 +620,17 @@ impl<H: Handler> Session<H> {
         let mut headers_error: Option<String> = None;
         let mut logged_mb = 0usize;
         let mut received = 0usize;
+        // Set when *our own* size cap discarded the message. An upstream may
+        // now answer 552 as well (a handler rejection carries the upstream's
+        // own code), and that is a different thing entirely: it leaves no
+        // half-read transaction behind here.
+        let mut too_large = false;
         // Set when an unterminated line was thrown away mid-flight: the rest
         // of that line is still to come, and must not be read as a line of
         // its own -- a tail that happened to be `.` would end DATA early and
         // leave the remaining body to be parsed as commands.
         let mut discarding_line_tail = false;
-        let outcome: Result<String, (u16, String)> = loop {
+        let outcome: Result<String, Rejection> = loop {
             // An incomplete line counts against the cap like any other bytes.
             // Once the reader is already discarding, the cap has nothing left
             // to say and a plain byte bound keeps the drain bounded.
@@ -678,13 +683,14 @@ impl<H: Handler> Session<H> {
                     }
                 }
                 Some(DataEvent::TooLarge) => {
-                    break Err((
-                        552,
-                        format!(
+                    too_large = true;
+                    break Err(Rejection {
+                        code: 552,
+                        text: format!(
                             "Message exceeds maximum size of {} bytes",
                             self.config.max_message_size
                         ),
-                    ));
+                    });
                 }
                 Some(DataEvent::MessageComplete(body)) => {
                     if let Some(h) = reader.take_pending_headers() {
@@ -701,9 +707,9 @@ impl<H: Handler> Session<H> {
                         );
                     }
                     if let Some(e) = headers_error.take() {
-                        break Err((550, e));
+                        break Err(Rejection { code: 550, text: e });
                     }
-                    break self.handler.message(body).await.map_err(|t| (550, t));
+                    break self.handler.message(body).await;
                 }
             }
         };
@@ -724,9 +730,9 @@ impl<H: Handler> Session<H> {
                     return Ok(Flow::Close);
                 }
             }
-            Err((code, text)) => {
+            Err(Rejection { code, text }) => {
                 debug!("DATA rejected for {} {text}", self.client);
-                if code == 552 {
+                if too_large {
                     self.start_transaction();
                 }
                 if let Err(e) = self.send(Reply::new(code, text.clone())).await {
