@@ -1,0 +1,2 @@
+# Flags for smtp-proxy; see `smtp-proxy --help`.
+SMTP_PROXY_OPTS="--listen=0.0.0.0:587 --tohost=mail.example.com --toport=25 --tls_cert=/etc/smtp-proxy/server.crt --tls_key=/etc/smtp-proxy/server.key --api=https://auth.example.com/check --user=smtp-proxy --loglevel=info"

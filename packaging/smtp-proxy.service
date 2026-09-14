@@ -1,0 +1,28 @@
+[Unit]
+Description=SMTP authentication and header injection proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/default/smtp-proxy
+ExecStart=/usr/bin/smtp-proxy $SMTP_PROXY_OPTS
+Restart=on-failure
+KillSignal=SIGTERM
+# Longer than the proxy's own --drain_timeout default of 30 s, so systemd lets
+# the graceful drain finish instead of cutting it short with SIGKILL. Raise it
+# with the flag if you raise the drain.
+TimeoutStopSec=45
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# For --logpath and --smtplog, which ProtectSystem=strict would otherwise make
+# unwritable. The leading `-` is load-bearing: the package does not create this
+# directory, and without the `-` systemd refuses to start a unit whose
+# ReadWritePaths does not exist -- so the default configuration, which logs to
+# /dev/stderr and needs no directory at all, would never come up.
+ReadWritePaths=-/var/log/smtp-proxy
+
+[Install]
+WantedBy=multi-user.target

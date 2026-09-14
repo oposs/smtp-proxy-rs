@@ -52,6 +52,39 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 
+[package.metadata.deb]
+maintainer = "Tobias Oetiker <tobi@oetiker.ch>"
+# Nothing is expected here: the shipped binary is statically linked against
+# musl, so `$auto` resolves to an empty dependency list. It is left in so the
+# package still declares the truth if that ever stops being the case.
+depends = "$auto"
+section = "mail"
+# Spelled out because cargo-deb otherwise folds the whole of README.md into the
+# Description field -- fenced JSON blocks, the full differences list and all,
+# which made the control file 229 lines long.
+extended-description = """
+A submission proxy that asks a REST API whether a mail may be sent. The API is
+called once the envelope and the message headers are in, so it can judge the
+sender and recipient addresses as well as the credentials, and it may return
+headers to insert. Accepted mail is relayed to a configured upstream SMTP
+server.
+Configure it in /etc/default/smtp-proxy; see /usr/share/doc/smtp-proxy/README.md.
+"""
+# The `target/release/` prefix is deliberate and is not a mistake against the
+# musl build: cargo-deb rewrites it to `target/<triple>/release/` when
+# `--target` is given, which is how `make deb` invokes it.
+assets = [
+    ["target/release/smtp-proxy", "usr/bin/", "755"],
+    ["packaging/smtp-proxy.default", "etc/default/smtp-proxy", "644"],
+    ["README.md", "usr/share/doc/smtp-proxy/", "644"],
+    ["CHANGES", "usr/share/doc/smtp-proxy/", "644"],
+]
+conf-files = ["/etc/default/smtp-proxy"]
+# `enable = false`: the unit is installed but not started. A fresh install has
+# no certificate, no API URL and the example host names still in
+# /etc/default/smtp-proxy, so starting it would only produce a crash loop.
+systemd-units = { unit-name = "smtp-proxy", unit-scripts = "packaging", enable = false }
+
 [profile.dev]
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
