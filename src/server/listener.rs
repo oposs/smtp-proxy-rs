@@ -12,7 +12,7 @@ use crate::server::{Drain, HandlerFactory, ServerConfig, session};
 use crate::smtp::reply::Reply;
 
 pub async fn bind(addrs: &[SocketAddr]) -> std::io::Result<Vec<TcpListener>> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    crate::install_crypto_provider();
     let mut listeners = Vec::with_capacity(addrs.len());
     for addr in addrs {
         listeners.push(TcpListener::bind(addr).await?);

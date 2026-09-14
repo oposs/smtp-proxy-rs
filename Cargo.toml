@@ -14,11 +14,24 @@ path = "src/main.rs"
 [dependencies]
 tokio = { version = "1.53", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal", "fs"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-tokio-rustls = "0.26"
-rustls = "0.23"
+# TLS is ring-only: aws-lc-rs must stay out of the build graph, so the build
+# needs no C/assembly toolchain and a static musl target stays reachable.
+# Every `default-features = false` below is load-bearing. rustls and
+# tokio-rustls both default to aws-lc-rs; worse, reqwest's plain `rustls`
+# feature is *defined* as `__rustls-aws-lc-rs`, so it drags aws-lc-rs in no
+# matter how our own rustls is configured. `rustls-no-provider` is the only
+# way out, and it obliges us to install a provider ourselves -- see
+# `smtp_proxy::install_crypto_provider`. `tests/crypto_provider.rs` goes red
+# if any of this is tidied away.
+#
+# Accepted cost: rustls's `prefer-post-quantum` (hybrid X25519MLKEM768 key
+# exchange) is defined as `prefer-post-quantum = ["aws_lc_rs"]`, so it is
+# unreachable here. Wanting it back means taking aws-lc-rs back with it.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = { version = "1.15", features = ["std"] }
 rustls-native-certs = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "http2", "charset"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "http2", "charset"] }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

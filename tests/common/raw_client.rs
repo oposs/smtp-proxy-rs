@@ -130,7 +130,7 @@ impl RawClient {
         &mut self,
         versions: &[&'static rustls::SupportedProtocolVersion],
     ) {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(versions)
             .unwrap()

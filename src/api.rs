@@ -131,6 +131,9 @@ pub struct ApiClient {
 impl ApiClient {
     /// 60 second timeout, as the Perl inactivity timeout.
     pub fn new(url: String) -> anyhow::Result<Self> {
+        // Not optional and not a `?`: `build()` panics outright when no crypto
+        // provider is installed, and nothing guarantees an earlier call here.
+        crate::install_crypto_provider();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build()?;

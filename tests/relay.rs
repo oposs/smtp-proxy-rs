@@ -497,7 +497,7 @@ const BLOCKING_BODY: usize = 255 * 1024;
 /// The client half of an implicit-TLS connection to `up`, carried by a
 /// duplex pair of `DUPLEX_CAPACITY` bytes.
 async fn tls_over_duplex(up: &RecordingUpstream) -> impl smtp_proxy::relay::Io + 'static {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap()

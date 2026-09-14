@@ -99,7 +99,7 @@ impl UpstreamTls {
         if mode == UpstreamTlsMode::Off {
             return Ok(Self::off());
         }
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()?;
         let config = if insecure {

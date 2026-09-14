@@ -76,6 +76,12 @@ cargo build --release
 
 The binary is written to `target/release/smtp-proxy`.
 
+TLS uses rustls with the *ring* backend, pinned in `Cargo.toml`. That is what
+keeps the build free of a C and assembly toolchain, and the static musl link
+straightforward. The cost is post-quantum key exchange: rustls offers hybrid
+X25519MLKEM768 only through its aws-lc-rs backend, so this build does not have
+it.
+
 To build and run a container image instead:
 
 ```console
