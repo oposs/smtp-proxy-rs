@@ -36,6 +36,11 @@
 - packaging: a release builds a statically linked musl binary, a Debian package
   carrying it together with a systemd unit and `/etc/default/smtp-proxy`, and a
   container image on ghcr.io
+- `make conformance`: the original Perl test suite, run against the compiled
+  binary over a real socket rather than against an in-process Perl proxy. Nine
+  of the Perl suite's eighteen test files, with their own assertions and their
+  own helper modules loaded from the Perl checkout. See `conformance/README.md`
+  for what it does and does not measure
 
 ### Changed
 
