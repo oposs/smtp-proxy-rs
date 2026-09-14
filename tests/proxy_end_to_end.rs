@@ -199,7 +199,7 @@ async fn api_failure_is_reported_as_authentication_service_failed() {
         MESSAGE,
     )
     .await;
-    assert_eq!(reply, "550 authentication service failed\r\n");
+    assert_eq!(reply, "451 authentication service failed\r\n");
 }
 
 #[tokio::test]
@@ -452,6 +452,45 @@ async fn a_header_value_with_an_unfolded_break_is_not_relayed() {
     );
 }
 
+/// The two halves of `authentication service failed` are told apart by the
+/// reply code, and one session sees both: an unreachable API is `451` so the
+/// mail is retried, a malformed header is `550` so it is not. The text is
+/// identical on purpose, so the code is the only thing carrying the
+/// distinction and a regression cannot hide behind the wording.
+#[tokio::test]
+async fn an_api_outage_is_transient_but_a_malformed_header_is_permanent() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .fail_with(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let outage = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    // The API said nothing about this mail, so nothing about it is known to
+    // be wrong; the client is asked to come back.
+    assert_eq!(outage, "451 authentication service failed\r\n");
+
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [
+            { "name": "X-Injected", "value": "harmless\r\n\r\nForged body line" }
+        ]}));
+    let malformed = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    // A retry resends the same break, so there is nothing to come back for.
+    assert_eq!(malformed, "550 authentication service failed\r\n");
+    assert!(r.upstream.messages().is_empty());
+}
+
 /// Item 3, end to end: a header block written with bare LF reaches the API
 /// as individual headers, so API-side header policy cannot be evaded by
 /// sending LF where CRLF was expected.
@@ -680,7 +719,7 @@ async fn the_api_debug_dump_carries_the_connection_id() {
     // Unique to this test, so its dump can be picked out of the shared log.
     let from = "cid-probe@foobar.com";
     let reply = send_mail(&mut c, from, &["receiver@foobaz.com"], MESSAGE).await;
-    assert_eq!(reply, "550 authentication service failed\r\n");
+    assert_eq!(reply, "451 authentication service failed\r\n");
 
     let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
     // Spec 5.3: a failing call dumps the request with the password redacted.
@@ -722,7 +761,7 @@ async fn api_log_redaction() {
     c.login(USERNAME, PASSWORD).await;
     let from = "redaction-probe@foobar.com";
     let reply = send_mail(&mut c, from, &["receiver@foobaz.com"], MESSAGE).await;
-    assert_eq!(reply, "550 authentication service failed\r\n");
+    assert_eq!(reply, "451 authentication service failed\r\n");
 
     let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
     // 1. The leak itself: no plaintext password on any line, at any level.

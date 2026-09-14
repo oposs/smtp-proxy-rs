@@ -168,6 +168,14 @@ this is then relayed to the client.
   accepted only as a proper fold (a break followed by a space or a tab) and a
   header name may hold no break or colon at all. The mail is refused with
   `550 authentication service failed`, an existing reply text.
+- **An auth API that gives no verdict is answered `451`, not `550`.** The Perl
+  answers `550 authentication service failed` whatever went wrong, so a mail
+  the API never saw was refused permanently and destroyed for an outage of
+  ours. The reply text is unchanged; only the code moves, and only where the
+  proxy rather than the message is at fault -- a failed or unanswerable API
+  call. RFC 5321 4.2.3 `451` is "local error in processing", which is what
+  this is. A header carrying an unfolded line break keeps the `550` above:
+  that fault is in the message, and resending it unchanged cannot help.
 - **The upstream's reply is bounded** at 4096 bytes per line and 65536 bytes
   in total. The Perl bounds neither, so a hostile or compromised upstream
   could feed an endless reply and exhaust memory. RFC 5321 4.5.3.1.5 caps a

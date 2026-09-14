@@ -298,9 +298,11 @@ Response: `{"allow": bool, "reason"?: string, "headers"?: [...],
 "from"?: string, "authId"?: string}`.
 
 - Non-2xx HTTP status or transport error: the client gets
-  `550 authentication service failed`; log warn `Failed to call API
-  (<err>) for <client>`; log debug of the request with the password
-  replaced by `*******`.
+  `451 authentication service failed` (user ruling, 2026-09-14; the Perl and
+  earlier drafts of this spec said `550`, which destroyed mail the API never
+  saw for an outage of ours -- the text is unchanged, only the code); log
+  warn `Failed to call API (<err>) for <client>`; log debug of the request
+  with the password replaced by `*******`.
 - `allow: false`: client gets `550 <reason>`; log info `Mail rejected by
   API (<reason>) for <client>`.
 

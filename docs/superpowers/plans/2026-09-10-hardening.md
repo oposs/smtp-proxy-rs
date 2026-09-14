@@ -1275,6 +1275,19 @@ These are deliberate. The gate will report them; they are not defects.
   without changing a conforming exchange: the upstream reply is capped at
   4096 bytes per line and 65536 total, and the privilege drop calls
   `initgroups` before `setgid`.
+- **User ruling, 2026-09-14: `authentication service failed` splits into a
+  transient and a permanent half.** The Perl answers `550` on all four of our
+  call sites (spec 5.3, `Connection.pm`), so the gate WILL see this wherever a
+  Perl test drives an API failure: the reply becomes `451 authentication
+  service failed`. The *text* is unchanged, so the gate sees a changed code
+  for one input class and no new string. Transient where the proxy is at
+  fault -- the API call errored, its task failed to join, or no call was
+  started at all (an internal invariant break, ours and not the sender's).
+  Permanent, and unchanged, where the message is at fault: the unfolded
+  header break of Task 22 item 5. RFC 5321 4.2.3 `451` "local error in
+  processing", matching what `RelayError::client_code` already answers for an
+  unreachable upstream. The API's own `allow: false` policy refusal keeps its
+  `550` and is untouched.
 
 - **Exit codes.** The Perl does missing-mandatory → 2 on stderr and `--help` → 1
   on stdout (`pod2usage()` vs `pod2usage(1)`, measured). Ours does

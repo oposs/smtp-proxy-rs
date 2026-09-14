@@ -281,19 +281,35 @@ pub fn format_message(headers: &[RequestHeader], body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The catch-all refusal: the proxy could not establish that this message is
-/// allowed, so it says so in the one existing text rather than inventing a
-/// new one.
-///
-/// It stays permanent, unlike the relay failures of
-/// [`crate::relay::RelayError::client_code`]. An API outage is arguably as
-/// transient as an upstream restart, but that is a separate question the
-/// user has not ruled on, and it is deliberately not folded into the
-/// 2026-09-13 pass-through ruling.
+/// The one text for "the proxy could not establish that this message is
+/// allowed", shared by both refusals below so that the reply code is the
+/// only thing telling them apart. Splitting the wording would let a client
+/// distinguish them by text and stop reading the code, which is the part
+/// that decides whether the mail is retried.
+const AUTH_SERVICE_FAILED: &str = "authentication service failed";
+
+/// Permanent: the message itself is unacceptable and resending it unchanged
+/// cannot help. Only for a fault in the data at hand -- anything the client
+/// could get past by coming back later belongs in
+/// [`auth_service_unavailable`], because a `5xx` there destroys mail that
+/// was never wrong.
 fn auth_service_failed() -> Rejection {
     Rejection {
         code: 550,
-        text: "authentication service failed".into(),
+        text: AUTH_SERVICE_FAILED.into(),
+    }
+}
+
+/// Transient: the proxy, not the message, is why there is no verdict, so the
+/// client is asked to come back. `451` is RFC 5321's "local error in
+/// processing" and matches what
+/// [`crate::relay::RelayError::client_code`] already answers when the other
+/// side is unreachable. Returning a `5xx` here would discard mail for an
+/// outage of ours.
+fn auth_service_unavailable() -> Rejection {
+    Rejection {
+        code: 451,
+        text: AUTH_SERVICE_FAILED.into(),
     }
 }
 
@@ -446,19 +462,22 @@ impl Handler for ProxyHandler {
         // Unreachable from the session, which always delivers the headers
         // before the body: a missing call means a bug, not a bad client, and
         // silently relaying an unchecked mail would be the worse answer.
+        // Transient because the fault is ours: the sender did nothing to
+        // earn a permanent refusal, and a bug we later fix or restart out of
+        // makes the retry succeed.
         let Some(call) = self.transaction.api_call.take() else {
             warn!("No API call was started for {}", self.client);
-            return Err(auth_service_failed());
+            return Err(auth_service_unavailable());
         };
         let outcome = match call.await {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
-                return Err(auth_service_failed());
+                return Err(auth_service_unavailable());
             }
             Err(e) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
-                return Err(auth_service_failed());
+                return Err(auth_service_unavailable());
             }
         };
         if !outcome.allow {
