@@ -77,7 +77,7 @@ assets = [
     ["target/release/smtp-proxy", "usr/bin/", "755"],
     ["packaging/smtp-proxy.default", "etc/default/smtp-proxy", "644"],
     ["README.md", "usr/share/doc/smtp-proxy/", "644"],
-    ["CHANGES", "usr/share/doc/smtp-proxy/", "644"],
+    ["CHANGES.md", "usr/share/doc/smtp-proxy/", "644"],
 ]
 conf-files = ["/etc/default/smtp-proxy"]
 # `enable = false`: the unit is installed but not started. A fresh install has

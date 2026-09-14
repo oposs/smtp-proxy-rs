@@ -1,0 +1,32 @@
+{
+  "_comment": [
+    "smtp-proxy-rs uses the GENERATED repo-infra standard: ci.yml, changelog.yml,",
+    "release-pr.yml, release-publish.yml, dependabot.yml and",
+    ".github/workflows/lib/ all come out of the assembler. Do not hand-edit them;",
+    "take the newer set instead, or the next `apply` reverts you silently.",
+    "The ONE deliberate exception is the publish-deb-container add-on job in",
+    "release-publish.yml, and the `needs:` line on `finalize` that waits for it.",
+    "Both are commented at the top of that file. Read them before running `apply`.",
+    "The static musl build is NOT a local edit: it is the opt-in ci-rust-musl",
+    "block named below, so it joins the required ci-passed check."
+  ],
+  "ecosystems": ["rust"],
+  "moving_major_tag": false,
+  "ci": ["ci-rust-musl"],
+  "publish": [],
+  "build": [],
+  "version_files": [
+    {
+      "path": "Cargo.toml",
+      "pattern": "^version\\s*=\\s*\"[^\"]*\"",
+      "replacement": "version = \"$VERSION\"",
+      "verify": "^version\\s*=\\s*\"$VERSION\""
+    },
+    {
+      "path": "Cargo.lock",
+      "pattern": "^name = \"smtp-proxy\"\nversion = \"[^\"]*\"",
+      "replacement": "name = \"smtp-proxy\"\nversion = \"$VERSION\"",
+      "verify": "^name = \"smtp-proxy\"\nversion = \"$VERSION\""
+    }
+  ]
+}
