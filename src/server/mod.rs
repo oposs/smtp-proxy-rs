@@ -142,6 +142,13 @@ pub struct ServerConfig {
     /// otherwise hold a `max_connections` slot for ever. See the divergence
     /// note on `session::Session::next_line`.
     pub idle_timeout: std::time::Duration,
+    /// The shorter deadline that governs the wait for the client's *first*
+    /// command, before `idle_timeout` takes over for the rest of the
+    /// session. `--greeting_timeout`, default 30 s. It exists because a
+    /// connection that has sent nothing at all is the cheap way to hold a
+    /// `max_connections` slot, and nothing legitimate is silent there: a
+    /// real client sends EHLO as soon as it has read the 220.
+    pub greeting_timeout: std::time::Duration,
     /// Total concurrent connections across all listeners. 0 means unlimited.
     pub max_connections: usize,
     /// Concurrent connections from a single client IP. 0 means unlimited.

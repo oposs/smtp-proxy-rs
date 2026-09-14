@@ -125,6 +125,30 @@ fn help_lists_the_perl_flags() {
     }
 }
 
+/// The greeting deadline's default is an operator-visible contract -- it is
+/// what a deployment gets without asking -- and nothing else pins it. A flag
+/// that silently lost its `default_value_t` would still parse, still run, and
+/// quietly hand every fresh connection the ten-minute budget again.
+#[test]
+fn greeting_timeout_is_offered_with_its_30_second_default() {
+    let out = bin()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let flag = text
+        .split("--greeting_timeout")
+        .nth(1)
+        .unwrap_or_else(|| panic!("--greeting_timeout is not offered:\n{text}"));
+    assert!(
+        flag.contains("[default: 30]"),
+        "--greeting_timeout lost its default:\n{flag}"
+    );
+}
+
 #[test]
 fn missing_mandatory_flag_exits_1_with_usage() {
     bin()

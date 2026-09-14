@@ -49,23 +49,32 @@ async fn total_connection_limit() {
 /// connection-limit slot for ever.
 ///
 /// **Divergence from the Perl.** The Perl arms its inactivity timer only
-/// after STARTTLS: `SMTPProxy.pm:47` passes `timeout => 0` to the stream at
-/// accept and `SMTPServer/Connection.pm:384` sets `timeout(600)` on the
-/// upgraded one. Measured against the running Perl, a silent client is still
+/// after STARTTLS: `SMTPProxy.pm` passes `timeout => 0` to the stream at
+/// accept and `SMTPServer/Connection.pm` sets `$self->stream->timeout(600)`
+/// on the upgraded one. Measured against the running Perl, a silent client is still
 /// connected after 90 s. The Perl could afford that because a stalled
 /// connection cost it one file descriptor and nothing else; here it costs a
 /// slot in `max_connections` (spec 9.2), which is taken at accept, so an
 /// untimed pre-TLS read would let anyone who can open a socket lock the
 /// service out permanently for free.
+///
+/// The deadline under test here is `--greeting_timeout` (user ruling
+/// 2026-09-14), not `idle_timeout`: `idle_timeout` is left at its full 600 s
+/// below, so nothing but the greeting deadline can end these connections.
 #[tokio::test]
 async fn a_silent_connection_does_not_hold_its_slot_for_ever() {
     let mut config = server_config(false, false);
     config.max_connections = 2;
-    // Production uses 600 s (`src/main.rs`). Two seconds here is a
+    // Production uses 30 s (`--greeting_timeout`). Two seconds here is a
     // compromise between a fast test and a safe one: the refusal below has
     // to be measured while the two silent sockets provably still hold their
-    // slots, so the margin has to survive a loaded host.
-    config.idle_timeout = std::time::Duration::from_secs(2);
+    // slots, so the margin has to survive a loaded host. Injecting a short
+    // value is also what keeps this test off a 30 s wall clock.
+    config.greeting_timeout = std::time::Duration::from_secs(2);
+    // Deliberately far longer than the test can run. If the greeting
+    // deadline were not applied, this is the timeout the first read would
+    // get, and the assertions below would sit until they expired.
+    config.idle_timeout = std::time::Duration::from_secs(600);
     let addr = start_server(config, ScriptedFactory::default()).await;
 
     // Two sockets that finish the TCP handshake, read the greeting, and then
@@ -82,10 +91,11 @@ async fn a_silent_connection_does_not_hold_its_slot_for_ever() {
     );
     assert!(refused.expect_close().await);
 
-    // ... and the idle timeout is what stops it from holding them for ever.
-    // With the pre-TLS read untimed these two waits never come back: the
-    // session stays parked in `next_line` until the process dies, and
-    // `expect_close` fails on its own 5 s deadline.
+    // ... and the greeting deadline is what stops it from holding them for
+    // ever. With the first read untimed -- or governed by the 600 s
+    // `idle_timeout` set above -- these two waits never come back: the
+    // session stays parked in `next_line`, and `expect_close` fails on its
+    // own 5 s deadline.
     assert!(
         silent1.expect_close().await,
         "the server never closed the first silent connection"
@@ -113,6 +123,63 @@ async fn a_silent_connection_does_not_hold_its_slot_for_ever() {
         drop(next);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+/// The other half of the greeting deadline, and the half that says it is a
+/// *greeting* deadline rather than a blanket short timeout: once the client
+/// has sent one complete command, the ordinary inactivity timeout governs the
+/// rest of the session.
+///
+/// This is what the user ruled against being lost. RFC 5321 4.5.3.2 asks a
+/// server to allow five minutes per command, and the 30 s narrowing is
+/// defensible only because it applies to a connection that has said nothing
+/// at all. A test that only proved a silent connection is dropped would pass
+/// against a blanket short timeout, which is the option that was rejected.
+#[tokio::test]
+async fn the_greeting_deadline_does_not_outlive_the_first_command() {
+    let mut config = server_config(false, false);
+    // 300 ms against the second below: the session is idled for more than
+    // three times the greeting deadline, so a deadline that leaked into the
+    // rest of the session has expired several times over by the NOOP.
+    config.greeting_timeout = std::time::Duration::from_millis(300);
+    // Long enough that this is provably not what ended the session, short
+    // enough that a hung test still fails rather than sits.
+    config.idle_timeout = std::time::Duration::from_secs(30);
+    let addr = start_server(config, ScriptedFactory::default()).await;
+
+    let (mut c, greeting) = RawClient::connect(addr).await;
+    assert!(greeting.starts_with("220"));
+    // One complete command line. From here the greeting deadline is spent.
+    assert!(c.command("EHLO x").await.starts_with("250"));
+
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Still there, and still a working session rather than a socket the
+    // server has quietly stopped reading.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+}
+
+/// A half-written first command does not buy the longer budget either: the
+/// deadline is handed over when a *complete* line is taken, so a client that
+/// dribbles part of a command and stops is still on the greeting deadline.
+/// Without that, "EHL" and silence would be a cheaper lockout than silence
+/// alone.
+#[tokio::test]
+async fn a_half_written_first_command_stays_on_the_greeting_deadline() {
+    let mut config = server_config(false, false);
+    config.greeting_timeout = std::time::Duration::from_secs(2);
+    config.idle_timeout = std::time::Duration::from_secs(600);
+    let addr = start_server(config, ScriptedFactory::default()).await;
+
+    let (mut c, greeting) = RawClient::connect(addr).await;
+    assert!(greeting.starts_with("220"));
+    c.write_raw("EHL").await;
+
+    assert!(
+        c.expect_close().await,
+        "a client that sent only part of a command was not held to the greeting deadline"
+    );
 }
 
 #[tokio::test]

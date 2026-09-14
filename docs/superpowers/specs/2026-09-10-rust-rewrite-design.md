@@ -181,11 +181,16 @@ In `WantStartTls`:
 
 Before TLS there is no inactivity timeout, as in the Perl.
 
-> **Superseded by user ruling R39, 2026-09-14.** The pre-TLS read is timed
-> too, at the same 600 s, because the connection limit of section 9.2 takes
-> its slot at accept: an untimed read there lets a silent client hold every
-> slot for ever. No separate knob; the one value covers both phases. Recorded
-> in the hardening plan's divergence list and in the README.
+> **Superseded by user ruling R39 and by a further user ruling, both
+> 2026-09-14.** The pre-TLS read is timed too, because the connection limit of
+> section 9.2 takes its slot at accept: an untimed read there lets a silent
+> client hold every slot for ever. R39 reused the 600 s value for both phases;
+> the later ruling adds a shorter deadline, `--greeting_timeout` (30 s), that
+> governs the wait for the client's first command only, because 600 s makes
+> the lockout self-healing rather than impossible. From the first complete
+> command onwards the 600 s value governs, so the short deadline does not
+> re-arm after STARTTLS. Both are recorded in the hardening plan's divergence
+> list and in the README.
 
 TLS is rustls, TLS 1.2 and 1.3 only. Certificates and keys are PEM files
 loaded with `rustls-pki-types` (`pem` feature). A client that needs TLS 1.0

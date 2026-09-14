@@ -126,6 +126,13 @@ pub struct Cli {
                 0 means wait as long as they take, and a second signal exits at once either way"
     )]
     pub drain_timeout: u64,
+    #[arg(
+        long = "greeting_timeout",
+        default_value_t = 30,
+        help = "seconds a connection may stay silent before it has sent its first command; \
+                0 means the ordinary ten-minute inactivity timeout governs that wait too"
+    )]
+    pub greeting_timeout: u64,
 }
 
 /// The command line after the mandatory flags have been checked and the
@@ -151,6 +158,7 @@ pub struct Config {
     pub max_messages_per_minute: u32,
     pub max_recipients: usize,
     pub drain_timeout: u64,
+    pub greeting_timeout: u64,
 }
 
 /// `ip:port`, where the ip may be IPv4 or IPv6 and the port is the text
@@ -237,6 +245,7 @@ pub fn parse_args() -> Config {
         max_messages_per_minute: cli.max_messages_per_minute,
         max_recipients: cli.max_recipients,
         drain_timeout: cli.drain_timeout,
+        greeting_timeout: cli.greeting_timeout,
     }
 }
 

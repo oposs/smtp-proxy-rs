@@ -114,6 +114,11 @@ struct Session<H> {
     id: String,
     config: Arc<ServerConfig>,
     handler: H,
+    /// Set the moment the first complete command line is taken, which is
+    /// what hands the session from `greeting_timeout` to `idle_timeout`. It
+    /// never goes back to false, so the short deadline does not re-arm --
+    /// the EHLO a client sends again after STARTTLS is not a first command.
+    first_command_seen: bool,
     /// RCPT entries accepted in the running transaction, for
     /// `max_recipients`. Repeats count, as the spec says (9.3).
     recipients: usize,
@@ -135,6 +140,7 @@ pub async fn run<H: Handler>(
         id,
         config,
         handler,
+        first_command_seen: false,
         recipients: 0,
     };
     match s.serve().await {
@@ -156,7 +162,11 @@ impl<H: Handler> Session<H> {
         }
         loop {
             let line = match self.next_command_line().await {
-                Ok(Some(Line::Got(line))) => line,
+                Ok(Some(Line::Got(line))) => {
+                    // From here on the ordinary inactivity timeout governs.
+                    self.first_command_seen = true;
+                    line
+                }
                 Ok(Some(Line::Eof)) => return End::Eof,
                 Ok(Some(Line::TooLong)) => {
                     self.refuse_long_line().await;
@@ -234,26 +244,47 @@ impl<H: Handler> Session<H> {
     /// every phase of the session.
     ///
     /// Deliberate divergence from the Perl, which arms its inactivity timer
-    /// only after STARTTLS (`SMTPProxy.pm:47` passes `timeout => 0` to the
-    /// stream at accept; `SMTPServer/Connection.pm:384` sets `timeout(600)`
-    /// on the upgraded stream). Measured against the running Perl: a client
-    /// that connects and then stays silent is still connected after 90 s,
-    /// with no close and no `Timeout on stream` log line.
+    /// only after STARTTLS (`SMTPProxy.pm` passes `timeout => 0` to the
+    /// stream at accept; `SMTPServer/Connection.pm` sets
+    /// `$self->stream->timeout(600)` on the upgraded stream). Measured against
+    /// the running Perl: a client that connects and then stays silent is still
+    /// connected after 90 s, with no close and no `Timeout on stream` log line.
     ///
     /// The Perl could afford that because a stalled connection cost it only
     /// a file descriptor. Here it costs a slot in `max_connections` /
     /// `max_connections_per_ip` (spec 9.2), taken at accept
-    /// (`listener.rs:162`) and released only when the session future is
-    /// dropped. An untimed read before TLS therefore means an unauthenticated
-    /// client can hold every slot for ever by sending nothing at all, which
-    /// turns the new connection limit into the lockout mechanism. One timeout
-    /// covering both phases is what makes the limit self-healing.
+    /// (`listener.rs`, `limits.try_acquire(client.ip())`) and released only
+    /// when the session future is dropped. An untimed read before TLS
+    /// therefore means an unauthenticated client can hold every slot for ever
+    /// by sending nothing at all, which turns the new connection limit into
+    /// the lockout mechanism.
+    ///
+    /// The wait for the client's *first* command has a shorter deadline of
+    /// its own, `--greeting_timeout` (30 s), because `idle_timeout` alone
+    /// only makes the lockout self-healing rather than impossible: 1000 slots
+    /// over 600 s is one new connection every twelve seconds from each of
+    /// twenty addresses, which costs an attacker nothing. User ruling
+    /// 2026-09-14. It is a deliberate narrowing of RFC 5321 4.5.3.2, which
+    /// asks for five minutes per command, and it is defensible only because
+    /// it applies to a connection that has sent *nothing at all*: a real
+    /// client sends EHLO as soon as it has read the 220. Once one complete
+    /// command line has arrived the RFC's own budget applies for the rest of
+    /// the session, STARTTLS and the EHLO after it included.
     ///
     /// `max_incomplete` bounds the bytes held while no newline has arrived.
     /// Without it a client that sends bytes and never a newline grows the
     /// buffer without limit: `DataReader` cannot help, because `push_line`
     /// only ever sees lines that are already complete.
     async fn next_line(&mut self, max_incomplete: usize) -> std::io::Result<Line> {
+        // A half-written first command does not buy the longer budget: the
+        // flag is set by `serve` when a *complete* line has been taken, so a
+        // client that dribbles "EHL" and stops is still on the greeting
+        // deadline.
+        let deadline = if self.first_command_seen {
+            self.config.idle_timeout
+        } else {
+            self.config.greeting_timeout
+        };
         loop {
             if let Some(line) = take_line(&mut self.buf) {
                 return Ok(Line::Got(line));
@@ -262,18 +293,15 @@ impl<H: Handler> Session<H> {
                 return Ok(Line::TooLong);
             }
             let mut chunk = [0u8; 8192];
-            let n =
-                match tokio::time::timeout(self.config.idle_timeout, self.stream.read(&mut chunk))
-                    .await
-                {
-                    Ok(r) => r?,
-                    Err(_) => {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "inactivity timeout",
-                        ));
-                    }
-                };
+            let n = match tokio::time::timeout(deadline, self.stream.read(&mut chunk)).await {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "inactivity timeout",
+                    ));
+                }
+            };
             if n == 0 {
                 return Ok(Line::Eof);
             }

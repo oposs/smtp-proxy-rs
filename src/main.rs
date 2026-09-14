@@ -60,6 +60,13 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         max_message_size: config.max_message_size,
         smtplog,
         idle_timeout: Duration::from_secs(600),
+        // 0 means "no separate greeting deadline", so the ordinary
+        // inactivity timeout governs that first wait too -- the same
+        // reading of 0 that every other limit here uses.
+        greeting_timeout: match config.greeting_timeout {
+            0 => Duration::from_secs(600),
+            secs => Duration::from_secs(secs),
+        },
         max_connections: config.max_connections,
         max_connections_per_ip: config.max_connections_per_ip,
         max_recipients: config.max_recipients,

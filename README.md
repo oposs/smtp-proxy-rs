@@ -176,6 +176,9 @@ Options:
       --drain_timeout <DRAIN_TIMEOUT>
           seconds to let messages already in flight finish after a shutdown signal; 0 means wait as
           long as they take, and a second signal exits at once either way [default: 30]
+      --greeting_timeout <GREETING_TIMEOUT>
+          seconds a connection may stay silent before it has sent its first command; 0 means the
+          ordinary ten-minute inactivity timeout governs that wait too [default: 30]
 ```
 
 Starts an SMTP server on the listen host and port. When a connection is
@@ -201,11 +204,11 @@ this is then relayed to the client.
   buffer without any limit. RFC 5321 4.5.3.1.4 caps a command line at 512
   octets, so no working client can reach this.
 - Debug-level data dumps are JSON rather than Perl `Data::Dumper` output.
-- Ten new flags: `--version`, `--max_message_size`, `--upstream_tls`,
+- Eleven new flags: `--version`, `--max_message_size`, `--upstream_tls`,
   `--upstream_tls_ca`, `--upstream_tls_insecure`, `--max_connections`,
-  `--max_connections_per_ip`, `--max_messages_per_minute`, `--max_recipients`
-  and `--drain_timeout`. Every flag the Perl had is still spelled the same
-  way.
+  `--max_connections_per_ip`, `--max_messages_per_minute`, `--max_recipients`,
+  `--drain_timeout` and `--greeting_timeout`. Every flag the Perl had is still
+  spelled the same way.
 - Exit codes differ from the Perl proxy on two paths, both measured against
   the Perl `smtpproxy.pl`: a missing mandatory option exits 1 on stderr here
   versus 2 there, and `--help`/`--man`/`--version` exit 0 on stdout here
@@ -262,9 +265,21 @@ this is then relayed to the client.
   is accepted -- so without this an unauthenticated client could hold every
   slot for ever by sending nothing at all, and every legitimate client would
   be answered `421 ... Too many connections, try again later` until the
-  service was restarted. The timeout is the same ten minutes in both phases
-  and there is no new flag for it. No working client is idle that long
-  between the TCP handshake and its first command.
+  service was restarted. No working client is idle that long between the TCP
+  handshake and its first command.
+- **A connection that has not yet sent a command is dropped after 30
+  seconds**, which is `--greeting_timeout`. The ten minutes above make the
+  lockout self-healing rather than impossible: 1000 slots over 600 seconds is
+  one new connection every twelve seconds from each of twenty addresses, which
+  costs an attacker nothing to sustain. The shorter deadline applies *only*
+  before the client's first complete command; from that command onwards the
+  ten-minute inactivity timeout governs the rest of the session, the EHLO
+  after STARTTLS included. This is a deliberate narrowing of RFC 5321 4.5.3.2,
+  which asks a server to allow five minutes for a command, and it is
+  defensible because it applies to a connection that has said nothing at all:
+  a real client sends EHLO as soon as it has read the 220. Set
+  `--greeting_timeout=0` to give that first wait the full ten minutes as
+  well.
 - **An AUTH username longer than 256 decoded bytes is refused** with the
   existing `535 Authentication credentials invalid`. The Perl applies no
   length check, and the username is the one unverified client-supplied string
@@ -305,6 +320,12 @@ this is then relayed to the client.
   no recipients. RFC 5321 4.5.3.1.10 requires at least 100 and the default
   matches Postfix, so no ordinary client reaches it. `--max_recipients=0`
   removes the cap.
+- **A connection that sends nothing is closed after 30 seconds**, before it
+  has issued its first command; afterwards the ordinary ten-minute inactivity
+  timeout applies for the rest of the session. The Perl timed neither, so a
+  silent connection lived for ever -- which mattered less there, because the
+  Perl had no connection limit for it to occupy. `--greeting_timeout=0` puts
+  that first wait on the ten-minute timeout too.
 - **SIGTERM drains instead of dropping.** The Perl exited and every open
   session died mid-transaction, which for a session inside `DATA` means a
   message accepted by the client and never relayed. Listeners are now closed

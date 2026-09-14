@@ -1221,14 +1221,16 @@ because the Perl behaves the same way in every case.
 > and neither had a length check. Today line 45 *is* the bound this item
 > added, so re-pointing the range would make the sentence say the opposite
 > of what it means. The paragraph's other two references
-> (`src/server/session.rs:31`, `:539`) still hold at the current tree and are
-> left alone.
+> (`MAX_COMMAND_BUFFER` and the `Reply::new(535, "Authentication credentials
+> invalid")` call, both in `src/server/session.rs`) still hold at the current
+> tree and are left alone. Per ruling R40 they are named by anchor rather
+> than by line, so that a later edit above them cannot rot them again.
 
 Nothing bounds the length of an AUTH username. `decode_plain` and
 `decode_login` (`src/server/auth.rs:23-45` **at `618f374`**) turn whatever
 base64 decodes into an owned `String` with no length check. The only bound on
 that path is
-`MAX_COMMAND_BUFFER` (`src/server/session.rs:31`) at 64 KiB, whose own doc
+`MAX_COMMAND_BUFFER` (`src/server/session.rs`) at 64 KiB, whose own doc
 comment records that RFC 5321 4.5.3.1.4 caps a command line at 512 octets and
 calls 64 KiB "generous", its stated job being only to stop a client that never
 sends a newline. So a single username can be roughly 50 KiB.
@@ -1248,7 +1250,8 @@ a problem whose fix belongs in `auth.rs`.
   any real username and far below anything that matters for memory.
 - **Reuse the existing credential-failure reply. Invent no new reply text.** An
   over-long username is treated exactly as malformed credentials already are
-  (`session.rs:539`, `535 Authentication credentials invalid`) — same code, same
+  (`session.rs`, `Reply::new(535, "Authentication credentials invalid")`) —
+  same code, same
   text, same path. This deliberately keeps Task 21's conformance surface from
   growing: the branch already has four new reply texts with no Perl counterpart,
   and this adds a fifth divergence but no fifth text.
@@ -1268,10 +1271,10 @@ These are deliberate. The gate will report them; they are not defects.
 
 - **User ruling R39, 2026-09-14: the inactivity timeout covers the whole
   session, not only the part after STARTTLS.** The Perl arms its timer on the
-  upgraded stream alone: `SMTPProxy.pm:47` passes `timeout => 0` to
-  `SMTPServer.pm:29`, which applies it to the stream at accept, and
-  `SMTPServer/Connection.pm:384` sets `timeout(600)` only inside the
-  successful STARTTLS upgrade. Measured against the running Perl on
+  upgraded stream alone: `SMTPProxy.pm` passes `timeout => 0` to
+  `SMTPServer.pm`, whose `$stream->timeout($self->timeout)` applies it to the
+  stream at accept, and `SMTPServer/Connection.pm` sets
+  `$self->stream->timeout(600)` only inside the successful STARTTLS upgrade. Measured against the running Perl on
   2026-09-14: a client that connects, reads the 220, and then sends nothing
   is still connected 92 s later, with no close and no `Timeout on stream`
   log line. We time the pre-TLS read too, at the same 600 s, because the
@@ -1279,9 +1282,26 @@ These are deliberate. The gate will report them; they are not defects.
   takes its slot at accept, so an untimed read before TLS lets an
   unauthenticated client hold every slot for ever by sending nothing at all.
   No new flag: the existing 600 s value covers both phases, and the spec
-  names no separate pre-TLS one (`2026-09-10-rust-rewrite-design.md:182`
-  is the line this supersedes). The gate sees a Perl test that idles a
-  pre-STARTTLS connection past 600 s, which none does.
+  names no separate pre-TLS one (the sentence this supersedes is `Before TLS
+  there is no inactivity timeout, as in the Perl` in
+  `2026-09-10-rust-rewrite-design.md`). The gate would see this only in a Perl test
+  that idles a pre-STARTTLS connection past 600 s, and there is no such test.
+- **User ruling, 2026-09-14: a connection that has not yet sent a command is
+  dropped after 30 s (`--greeting_timeout`, a new flag with that default).**
+  This sits beside R39 rather than replacing it: R39 says why the read is
+  timed at all, this says why the *first* read is timed harder. R39 alone
+  makes the lockout self-healing, not impossible -- 1000 slots over 600 s is
+  1.67 connections per second, or one every twelve seconds from each of
+  twenty addresses given the per-IP cap of 50, which costs an attacker
+  nothing. The deadline applies only before the first complete command line;
+  from that line onwards `idle_timeout` governs, so it does not re-arm for the
+  EHLO a client sends again after STARTTLS. It is a deliberate narrowing of
+  RFC 5321 4.5.3.2, which asks for five minutes per command, defensible only
+  because it applies to a connection that has sent nothing at all: a real
+  client sends EHLO as soon as it has read the 220. `--greeting_timeout=0`
+  hands that first wait back to `idle_timeout`. The gate would see this only
+  in a Perl test that connects and then stays silent for over 30 s, and there
+  is no such test.
 - **Task 22 item 7 (user ruling, 2026-09-13): an AUTH username longer than 256
   decoded bytes is refused.** The Perl applies no length check, so a Perl test
   that authenticates with an absurdly long username would pass there and be

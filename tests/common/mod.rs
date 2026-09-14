@@ -27,6 +27,10 @@ pub fn server_config(require_starttls: bool, require_auth: bool) -> ServerConfig
         max_message_size: 1 << 30,
         smtplog: None,
         idle_timeout: std::time::Duration::from_secs(600),
+        // The production default is 30 s. Tests that care about the
+        // greeting deadline set their own; the rest must not have a
+        // 30 s clock running under them.
+        greeting_timeout: std::time::Duration::from_secs(600),
         max_connections: 0,
         max_connections_per_ip: 0,
         max_recipients: 0,

@@ -26,6 +26,13 @@
 - `--max_recipients` (1000); the RCPT that would exceed it is answered
   `452 4.5.3 Too many recipients` and is not recorded, and the transaction stays
   valid with the recipients it already has
+- `--greeting_timeout` (30). A connection that has sent no command at all is
+  closed after this many seconds; from the first complete command onwards the
+  ordinary ten-minute inactivity timeout governs the session. Without it the
+  connection limit above is a lockout an attacker can hold with one connection
+  every twelve seconds per address. 0 gives that first wait the ten-minute
+  timeout too. A deliberate narrowing of RFC 5321 4.5.3.2, which applies only
+  to a connection that has said nothing
 - `--drain_timeout` (30). SIGTERM now closes the listeners, answers a session
   between transactions
   `421 <service> Service not available, closing transmission channel`, and lets
@@ -61,7 +68,8 @@
   nothing stayed connected indefinitely. That cost the Perl a file descriptor;
   here it costs a `--max_connections` slot, which is taken at accept, so
   without this an unauthenticated client could hold every slot for ever by
-  sending nothing at all. No new flag
+  sending nothing at all. The wait for the client's *first* command has a
+  shorter deadline of its own, `--greeting_timeout` above
 
 ### Fixed
 
