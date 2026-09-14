@@ -72,7 +72,15 @@ sub start ($self) {
     $line =~ /Waiting for connections on 127\.0\.0\.1:(\d+)/
         or die "unexpected startup line: $line";
     $self->port($1);
-    $self->_readBannerLine;    # "Will forward mails to ..."
+    # Checked, not discarded. A banner that stops after one line means the
+    # proxy died between binding and announcing its upstream, and swallowing
+    # that spent the whole startup timeout and then carried on to fail later,
+    # somewhere less informative.
+    my $forward = $self->_readBannerLine
+        // die "the proxy announced its port but not its upstream; stderr: "
+            . $self->_drainStderr;
+    $forward =~ /Will forward mails to /
+        or die "unexpected second startup line: $forward";
     return $self;
 }
 
@@ -154,7 +162,11 @@ sub stop ($self) {
     # upstream port and break whatever runs next, so the wait is bounded and
     # ends in SIGKILL rather than in giving up.
     for (1 .. 100) {
-        return if waitpid($pid, POSIX::WNOHANG()) == $pid;
+        # -1 as well as the pid: a test may have reaped the child itself while
+        # checking that it was still alive, and waiting five seconds for a
+        # child that no longer exists helps nobody.
+        my $reaped = waitpid($pid, POSIX::WNOHANG());
+        return if $reaped == $pid || $reaped == -1;
         select undef, undef, undef, 0.05;
     }
     kill KILL => $pid;

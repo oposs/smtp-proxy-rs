@@ -11,6 +11,7 @@ use Mojo::IOLoop;
 use Mojo::IOLoop::Server;
 use Mojo::Log;
 use Mojo::Promise;
+use POSIX qw(WNOHANG);
 use RawSMTPClient;
 use Test::More;
 
@@ -79,7 +80,13 @@ my $logOutput = $proxy->log;
 # Replaces 'No unhandled rejected promise'. A rejection nobody handled is a
 # Perl runtime concept; what it cost was the process, so that is what is
 # measured here.
-is kill(0 => $proxy->pid), 1, 'The proxy process survived the race';
+#
+# waitpid, not kill(0). The proxy is this process's own child and is reaped
+# only in ProxyUnderTest::stop, so a proxy that died is a zombie -- still a
+# live pid as far as kill is concerned, which made the obvious liveness check
+# pass for a crashed proxy. waitpid answers 0 only while the child is genuinely
+# still running.
+is waitpid($proxy->pid, WNOHANG), 0, 'The proxy process survived the race';
 
 # Replaces 'Nothing called a method on the departed connection'. Same reason:
 # the damage such a call did was to stop the proxy serving.
@@ -95,14 +102,26 @@ like $stillServing, qr/^220 /, 'The proxy still accepts new connections';
 # Proves the test actually exercised the race rather than passing vacuously:
 # the connection really was gone by the time the relay settled.
 #
-# The Perl has one place that can notice, so it always logs "left before". The
-# proxy has two, and which one fires is decided by TCP rather than by policy:
-# the client closed with a FIN, so writing the rejection into the socket still
-# succeeds and only the read that follows sees the EOF. Measured on this branch
-# the "hung up" line therefore wins every time. Both lines record the same
-# fact, at info as spec 4.7 requires, so both satisfy what this assertion is
-# for. See conformance/README.md.
-like $logOutput, qr/left before|hung up/,
-    'Proxy noticed the client had gone before the relay settled';
+# Both halves are needed, and this is the whole subtlety of the file.
+#
+# The Perl has one place that can notice the client has gone, so it always logs
+# "left before". The proxy has two, and which one fires is decided by TCP
+# rather than by policy: the client closed with a FIN, so writing the rejection
+# into the socket still succeeds and only the read that follows sees the EOF.
+# Measured on this branch the "hung up" line wins every time.
+#
+# But "hung up" alone proves nothing. src/server/session.rs:145 logs it for any
+# session ending in a hangup-class error, and line 68 above closes a TLS client
+# unconditionally -- a FIN with no close_notify -- so that line appears whether
+# or not a relay was still pending. Matching it alone is an assertion that
+# cannot fail, which is exactly the defect this assertion exists to catch.
+#
+# So the relay-settled line is required as well. Together they say what the
+# original said: the relay ran to a verdict, and by then there was nobody to
+# tell. See conformance/README.md.
+ok $logOutput =~ /Mail refused by relay server/
+    && $logOutput =~ /left before|hung up/,
+    'Proxy noticed the client had gone before the relay settled'
+    or diag "proxy log was:\n$logOutput";
 unlike $logOutput, qr/panicked/,
     'Nothing panicked while the relay settled';

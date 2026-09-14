@@ -116,21 +116,36 @@ by the observable consequence it was standing in for, so the count is unchanged:
 | Original | Replacement | Why |
 | --- | --- | --- |
 | `No unhandled rejected promise` | The proxy process survived the race | A rejection nobody handled is a Perl runtime concept. What it cost was the process. |
+| — | *(checked with `waitpid(..., WNOHANG) == 0`, not `kill 0`)* | The proxy is the test's own child and is reaped only in `stop`, so a proxy that died is a zombie and `kill 0` still answers 1. That check passed for a crashed proxy. |
 | `Nothing called a method on the departed connection` | The proxy still accepts new connections | Same: the damage such a call did was to stop the proxy serving. |
 | `No method call errors logged` (`qr/Can't call method/`) | No `panicked` in the proxy's log | `Can't call method` is a Perl error string. The proxy's equivalent is a panic. |
 
-The fourth assertion, `qr/left before/`, is **widened to
-`qr/left before|hung up/`** and needs its own note. The Perl has one place that
-can notice the client has gone, so it always logs `left before`. The proxy has
-two, and which one fires is decided by TCP rather than by policy: the client
-closes with a FIN, so the proxy's write of the rejection still succeeds into the
-socket buffer and only the read that follows sees the EOF. Measured on this
-branch, `Client <addr> hung up: ...` (`src/server/session.rs:143`) wins every
-time and `Client <addr> left before the rejection could be sent`
-(`src/server/session.rs:743`) is not reached. Both lines record the same fact at
-`info`, which is what spec 4.7 asks for and what this assertion is there to
-prove — that the race was exercised rather than passing vacuously. The widened
-regex keeps that intent whole.
+The fourth assertion, `qr/left before/`, needs its own note — it is the most
+delicate thing in this directory.
+
+The Perl has one place that can notice the client has gone, so it always logs
+`left before`. The proxy has two, and which one fires is decided by TCP rather
+than by policy: the client closes with a FIN, so the proxy's write of the
+rejection still succeeds into the socket buffer and only the read that follows
+sees the EOF. Measured deterministically over four runs,
+`Client <addr> hung up: ...` (`src/server/session.rs:145`) wins every time and
+`Client <addr> left before the rejection could be sent`
+(`src/server/session.rs:743`) is not reached. That is recorded as user ruling
+R36 in the plan's divergence list, and `src/` is not to change for it.
+
+**But matching `hung up` alone would destroy the assertion rather than re-word
+it.** `session.rs:145` logs that line for *any* session ending in a
+hangup-class error (`is_hangup`: `UnexpectedEof`, `BrokenPipe`,
+`ConnectionReset`, `ConnectionAborted`, `NotConnected`), and the test closes a
+TLS client unconditionally — a FIN with no `close_notify`. So the line appears
+whether or not a relay was still pending, and an assertion whose stated job is
+*"proves the test actually exercised the race"* would pass without the race.
+
+The assertion therefore requires **both** the relay-settled line
+(`Mail refused by relay server`) **and** the client-gone line
+(`left before|hung up`). Together they say what the original said: the relay ran
+to a verdict, and by then there was nobody to tell. Both halves are verified to
+go red under fault injection.
 
 ### `pipelining.t` — one assertion dropped, category 2
 
@@ -194,6 +209,13 @@ bare-LF header splitting; the refusal of a relayed header carrying an unfolded
 break; the reply-size caps; the exit codes; the `MAIL FROM` fallback on `"0"`;
 the pipelined AUTH continuation; `QUIT 0`; and `500 Line too long`. Each is
 covered by the Rust suite and recorded in the plan's ruling list.
+
+**Only one listen address is exercised.** The original `end-to-end.t` binds two
+(`$TEST_PROXY_PORT` and `$TEST_PROXY_PORT + 1`) and uses only the first, so no
+original assertion was lost by starting the binary with a single `--listen`.
+But `ProxyUnderTest` passes one `--listen 127.0.0.1:0` and reads one port back
+out of the banner, so **a proxy serving several listen addresses at once is not
+measured here.**
 
 The service name in greetings is `smtp-proxy`, not the Perl suite's
 `smtp.proxy.service`. No copied assertion matches on it, so nothing needed

@@ -1303,11 +1303,25 @@ These are deliberate. The gate will report them; they are not defects.
   single argument `0` through as no argument. We answer 501. Ours is correct.
 - **`500 Line too long`.** A reply the Perl never sends, reachable at the 64 KiB
   command-line cap. Documented in the README's differences list.
-- **Three log-wording drifts** (`src/server/session.rs`, `src/smtplog.rs`): the
+- **Four log-wording drifts** (`src/server/session.rs`, `src/smtplog.rs`): the
   `received <N> MB data` line counts cumulative receipt where the Perl counted
   pending buffer past 1 MB; the Perl's debug line carrying the *decoded* AUTH
   LOGIN username is deliberately omitted; and redaction rejoins with a single
   space where the Perl preserved the original whitespace run.
+- **User ruling R36, 2026-09-14: a client that hangs up mid-relay is logged as
+  `Client <addr> hung up` rather than `Client <addr> left before ...`.** Found
+  by Task 21's gate, which drives the race the Perl's `connection-lifecycle.t`
+  was written for. The Perl has one place that can notice, so it always logs
+  `left before`. We have two, and TCP picks: the client closes with a FIN, so
+  the write of the rejection succeeds into the socket buffer and `send` returns
+  `Ok`, and only the read after it sees the EOF -- logged from
+  `session.rs:145`. Measured deterministic over four runs. The consequence is
+  that `session.rs:727` and `session.rs:743` are effectively unreachable for an
+  ordinary FIN close; they need an RST, or a teardown hard enough to fail the
+  write. Both lines are `info` and both record the same fact, so spec 4.7 is
+  satisfied either way and `src/` is not to change for this. Making `left
+  before` deterministic would mean polling the client socket for readability
+  before every reply -- real complexity bought for a log line.
 
 ### Test-suite notes for Tasks 20-21 (CI)
 
