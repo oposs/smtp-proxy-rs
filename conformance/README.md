@@ -128,13 +128,13 @@ The Perl has one place that can notice the client has gone, so it always logs
 than by policy: the client closes with a FIN, so the proxy's write of the
 rejection still succeeds into the socket buffer and only the read that follows
 sees the EOF. Measured deterministically over four runs,
-`Client <addr> hung up: ...` (`src/server/session.rs:145`) wins every time and
+`Client <addr> hung up: ...` (`src/server/session.rs:143`) wins every time and
 `Client <addr> left before the rejection could be sent`
 (`src/server/session.rs:743`) is not reached. That is recorded as user ruling
 R36 in the plan's divergence list, and `src/` is not to change for it.
 
 **But matching `hung up` alone would destroy the assertion rather than re-word
-it.** `session.rs:145` logs that line for *any* session ending in a
+it.** `session.rs:143` logs that line for *any* session ending in a
 hangup-class error (`is_hangup`: `UnexpectedEof`, `BrokenPipe`,
 `ConnectionReset`, `ConnectionAborted`, `NotConnected`), and the test closes a
 TLS client unconditionally — a FIN with no `close_notify`. So the line appears

@@ -110,8 +110,8 @@ like $stillServing, qr/^220 /, 'The proxy still accepts new connections';
 # into the socket still succeeds and only the read that follows sees the EOF.
 # Measured on this branch the "hung up" line wins every time.
 #
-# But "hung up" alone proves nothing. src/server/session.rs:145 logs it for any
-# session ending in a hangup-class error, and line 68 above closes a TLS client
+# But "hung up" alone proves nothing. src/server/session.rs:143 logs it for any
+# session ending in a hangup-class error, and line 69 above closes a TLS client
 # unconditionally -- a FIN with no close_notify -- so that line appears whether
 # or not a relay was still pending. Matching it alone is an assertion that
 # cannot fail, which is exactly the defect this assertion exists to catch.
