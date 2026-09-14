@@ -45,6 +45,76 @@ async fn total_connection_limit() {
     }
 }
 
+/// A client that connects and then sends nothing must not hold a
+/// connection-limit slot for ever.
+///
+/// **Divergence from the Perl.** The Perl arms its inactivity timer only
+/// after STARTTLS: `SMTPProxy.pm:47` passes `timeout => 0` to the stream at
+/// accept and `SMTPServer/Connection.pm:384` sets `timeout(600)` on the
+/// upgraded one. Measured against the running Perl, a silent client is still
+/// connected after 90 s. The Perl could afford that because a stalled
+/// connection cost it one file descriptor and nothing else; here it costs a
+/// slot in `max_connections` (spec 9.2), which is taken at accept, so an
+/// untimed pre-TLS read would let anyone who can open a socket lock the
+/// service out permanently for free.
+#[tokio::test]
+async fn a_silent_connection_does_not_hold_its_slot_for_ever() {
+    let mut config = server_config(false, false);
+    config.max_connections = 2;
+    // Production uses 600 s (`src/main.rs`). Two seconds here is a
+    // compromise between a fast test and a safe one: the refusal below has
+    // to be measured while the two silent sockets provably still hold their
+    // slots, so the margin has to survive a loaded host.
+    config.idle_timeout = std::time::Duration::from_secs(2);
+    let addr = start_server(config, ScriptedFactory::default()).await;
+
+    // Two sockets that finish the TCP handshake, read the greeting, and then
+    // send not one byte. That is the whole attack.
+    let (mut silent1, g1) = RawClient::connect(addr).await;
+    let (mut silent2, g2) = RawClient::connect(addr).await;
+    assert!(g1.starts_with("220") && g2.starts_with("220"));
+
+    // Both slots are held, so the limit is doing its job ...
+    let (mut refused, g3) = RawClient::connect(addr).await;
+    assert_eq!(
+        g3,
+        "421 test.service.name Too many connections, try again later\r\n"
+    );
+    assert!(refused.expect_close().await);
+
+    // ... and the idle timeout is what stops it from holding them for ever.
+    // With the pre-TLS read untimed these two waits never come back: the
+    // session stays parked in `next_line` until the process dies, and
+    // `expect_close` fails on its own 5 s deadline.
+    assert!(
+        silent1.expect_close().await,
+        "the server never closed the first silent connection"
+    );
+    assert!(
+        silent2.expect_close().await,
+        "the server never closed the second silent connection"
+    );
+
+    // Closing the socket is not the same as releasing the permit -- that
+    // happens when the session future drops -- so poll for the slot rather
+    // than assume a margin, for the reason `total_connection_limit` gives.
+    drop(silent1);
+    drop(silent2);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (next, greeting) = RawClient::connect(addr).await;
+        if greeting.starts_with("220") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the slots held by silent connections were never freed"
+        );
+        drop(next);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn per_ip_connection_limit() {
     let mut config = server_config(false, false);

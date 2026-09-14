@@ -230,8 +230,24 @@ impl<H: Handler> Session<H> {
         End::Drained
     }
 
-    /// One line including its terminator. After TLS, an idle connection
-    /// times out; before TLS it does not, as in the Perl.
+    /// One line including its terminator. An idle connection times out, in
+    /// every phase of the session.
+    ///
+    /// Deliberate divergence from the Perl, which arms its inactivity timer
+    /// only after STARTTLS (`SMTPProxy.pm:47` passes `timeout => 0` to the
+    /// stream at accept; `SMTPServer/Connection.pm:384` sets `timeout(600)`
+    /// on the upgraded stream). Measured against the running Perl: a client
+    /// that connects and then stays silent is still connected after 90 s,
+    /// with no close and no `Timeout on stream` log line.
+    ///
+    /// The Perl could afford that because a stalled connection cost it only
+    /// a file descriptor. Here it costs a slot in `max_connections` /
+    /// `max_connections_per_ip` (spec 9.2), taken at accept
+    /// (`listener.rs:162`) and released only when the session future is
+    /// dropped. An untimed read before TLS therefore means an unauthenticated
+    /// client can hold every slot for ever by sending nothing at all, which
+    /// turns the new connection limit into the lockout mechanism. One timeout
+    /// covering both phases is what makes the limit self-healing.
     ///
     /// `max_incomplete` bounds the bytes held while no newline has arrived.
     /// Without it a client that sends bytes and never a newline grows the
@@ -246,12 +262,9 @@ impl<H: Handler> Session<H> {
                 return Ok(Line::TooLong);
             }
             let mut chunk = [0u8; 8192];
-            let n = if self.tls_active {
-                match tokio::time::timeout(
-                    self.config.tls_idle_timeout,
-                    self.stream.read(&mut chunk),
-                )
-                .await
+            let n =
+                match tokio::time::timeout(self.config.idle_timeout, self.stream.read(&mut chunk))
+                    .await
                 {
                     Ok(r) => r?,
                     Err(_) => {
@@ -260,10 +273,7 @@ impl<H: Handler> Session<H> {
                             "inactivity timeout",
                         ));
                     }
-                }
-            } else {
-                self.stream.read(&mut chunk).await?
-            };
+                };
             if n == 0 {
                 return Ok(Line::Eof);
             }

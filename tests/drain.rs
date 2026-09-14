@@ -112,3 +112,119 @@ async fn a_half_written_command_does_not_hold_the_drain() {
         .await
         .expect("tracker drained");
 }
+
+/// A panicking accept loop has to reach the exit code. `serve` used to
+/// discard `join_next`'s result, so a `JoinError` looked exactly like a
+/// clean finish, `main` returned `Ok(())`, and `Restart=on-failure` in
+/// packaging/smtp-proxy.service left the dead unit alone.
+///
+/// The panic is injected through `HandlerFactory::create`, which the accept
+/// loop calls on its own task -- a real panic site on a real path, rather
+/// than a fault the test invents. The panic message it prints is expected
+/// output, not a failure.
+#[tokio::test]
+async fn a_panicking_accept_loop_reports_failure() {
+    use smtp_proxy::server::listener::{ServeOutcome, bind, serve};
+
+    #[derive(Clone)]
+    struct PanicOnCreate;
+    impl smtp_proxy::server::HandlerFactory for PanicOnCreate {
+        type Handler = common::fake_handler::ScriptedHandler;
+        fn create(&self, _client: std::net::SocketAddr, _id: &str) -> Self::Handler {
+            panic!("injected accept-loop panic");
+        }
+    }
+
+    let listeners = bind(&["127.0.0.1:0".parse().unwrap()]).await.unwrap();
+    let addr = listeners[0].local_addr().unwrap();
+    let serving = tokio::spawn(serve(
+        listeners,
+        Arc::new(server_config(false, false)),
+        PanicOnCreate,
+    ));
+
+    // One connection is all it takes: `create` runs before the session is
+    // spawned, so the accept loop itself is what dies.
+    let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("serve returned after its only accept loop died")
+        .expect("serve's own task did not panic");
+    assert_eq!(outcome, ServeOutcome::ListenerFailed);
+}
+
+/// The case nothing used to surface: with several `--listen` addresses, one
+/// panicking accept loop left the survivors running and the process looking
+/// healthy while a port was silently closed. `serve` now reports the failure
+/// straight away rather than waiting for the other loops -- which, short of a
+/// drain, never end -- so the whole proxy goes down and comes back whole.
+#[tokio::test]
+async fn one_panicking_loop_takes_the_other_listeners_with_it() {
+    use smtp_proxy::server::listener::{ServeOutcome, bind, serve};
+
+    #[derive(Clone)]
+    struct PanicOnCreate;
+    impl smtp_proxy::server::HandlerFactory for PanicOnCreate {
+        type Handler = common::fake_handler::ScriptedHandler;
+        fn create(&self, _client: std::net::SocketAddr, _id: &str) -> Self::Handler {
+            panic!("injected accept-loop panic");
+        }
+    }
+
+    let listeners = bind(&[
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+    ])
+    .await
+    .unwrap();
+    let doomed = listeners[0].local_addr().unwrap();
+    let survivor = listeners[1].local_addr().unwrap();
+    let serving = tokio::spawn(serve(
+        listeners,
+        Arc::new(server_config(false, false)),
+        PanicOnCreate,
+    ));
+
+    // Only the first address is touched, so the second loop is healthy and
+    // would otherwise keep `serve` waiting for ever.
+    let _client = tokio::net::TcpStream::connect(doomed).await.unwrap();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("serve reported the failure without waiting for the healthy loop")
+        .expect("serve's own task did not panic");
+    assert_eq!(outcome, ServeOutcome::ListenerFailed);
+
+    // The survivor's socket went with its aborted task, so the process is not
+    // left half-serving.
+    wait_until("the surviving listener to close", || {
+        std::net::TcpStream::connect(survivor).is_err()
+    })
+    .await;
+}
+
+/// The control for the test above: without a panic the very same shutdown
+/// path reports `Clean`, so `ListenerFailed` is measuring the panic and not
+/// merely the fact that `serve` returned.
+#[tokio::test]
+async fn a_drained_listener_reports_clean() {
+    use smtp_proxy::server::listener::{ServeOutcome, bind, serve};
+
+    let drain = Drain::new();
+    let mut config = server_config(false, false);
+    config.drain = Some(drain.clone());
+    let listeners = bind(&["127.0.0.1:0".parse().unwrap()]).await.unwrap();
+    let serving = tokio::spawn(serve(
+        listeners,
+        Arc::new(config),
+        ScriptedFactory::default(),
+    ));
+
+    drain.token.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), serving)
+        .await
+        .expect("serve returned once the drain stopped its accept loop")
+        .expect("serve's own task did not panic");
+    assert_eq!(outcome, ServeOutcome::Clean);
+}

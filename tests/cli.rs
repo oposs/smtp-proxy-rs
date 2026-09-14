@@ -41,6 +41,52 @@ fn wait_for(what: &str, needle: &str, text: impl Fn() -> String) -> String {
     }
 }
 
+/// A spawned proxy that is reaped whatever happens to the test.
+///
+/// `std::process::Child` does not kill on drop, so every panic between a
+/// spawn and its `kill()` used to leave a real daemon listening on an
+/// ephemeral port with nobody to reap it. The likeliest such panic is
+/// `wait_for`'s deadline above -- which is precisely what a genuine
+/// regression in this code trips, so the failure mode paired a red test
+/// with a leaked process. Six of those were once found still alive after
+/// two days and nineteen hours, holding a binary from a deleted worktree.
+///
+/// `Deref`/`DerefMut` keep `child.kill()`, `child.wait()`, `child.id()`,
+/// `child.try_wait()` and `child.stdout.take()` reading as before, so the
+/// tests say what they always said and the reaping is the only addition.
+struct Proxy(std::process::Child);
+
+impl Proxy {
+    fn spawn(command: &mut std::process::Command) -> Self {
+        Self(command.spawn().unwrap())
+    }
+}
+
+impl std::ops::Deref for Proxy {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Proxy {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        // Both results are dropped on purpose. On the success path the test
+        // has already killed and reaped the child, so `kill` answers "no
+        // such process" and `wait` "no child processes" -- and this runs
+        // during unwinding as well, where a panic would abort the test
+        // binary instead of reporting the failure that got us here.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn version_flag() {
     bin()
@@ -208,27 +254,27 @@ fn starts_binds_and_announces() {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
     let certs = certs();
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
-        .args([
-            "--listen",
-            "127.0.0.1:0",
-            "--tohost",
-            "127.0.0.1",
-            "--toport",
-            "1",
-            "--api",
-            "http://127.0.0.1:1/check",
-            "--loglevel",
-            "info",
-        ])
-        .arg("--tls_cert")
-        .arg(certs.join("server.crt"))
-        .arg("--tls_key")
-        .arg(certs.join("server.key"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Proxy::spawn(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--tohost",
+                "127.0.0.1",
+                "--toport",
+                "1",
+                "--api",
+                "http://127.0.0.1:1/check",
+                "--loglevel",
+                "info",
+            ])
+            .arg("--tls_cert")
+            .arg(certs.join("server.crt"))
+            .arg("--tls_key")
+            .arg(certs.join("server.key"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();
@@ -270,29 +316,29 @@ fn logpath_writes_the_log_to_a_file() {
     let dir = tempfile::tempdir().unwrap();
     let logfile = dir.path().join("proxy.log");
     let certs = certs();
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
-        .args([
-            "--listen",
-            "127.0.0.1:0",
-            "--tohost",
-            "127.0.0.1",
-            "--toport",
-            "1",
-            "--api",
-            "http://127.0.0.1:1/check",
-            "--loglevel",
-            "debug",
-        ])
-        .arg("--tls_cert")
-        .arg(certs.join("server.crt"))
-        .arg("--tls_key")
-        .arg(certs.join("server.key"))
-        .arg("--logpath")
-        .arg(&logfile)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Proxy::spawn(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--tohost",
+                "127.0.0.1",
+                "--toport",
+                "1",
+                "--api",
+                "http://127.0.0.1:1/check",
+                "--loglevel",
+                "debug",
+            ])
+            .arg("--tls_cert")
+            .arg(certs.join("server.crt"))
+            .arg("--tls_key")
+            .arg(certs.join("server.key"))
+            .arg("--logpath")
+            .arg(&logfile)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let pid = child.id();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
@@ -345,29 +391,29 @@ fn sigterm_drains_and_exits_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let logfile = dir.path().join("proxy.log");
     let certs = certs();
-    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
-        .args([
-            "--listen",
-            "127.0.0.1:0",
-            "--tohost",
-            "127.0.0.1",
-            "--toport",
-            "1",
-            "--api",
-            "http://127.0.0.1:1/check",
-            "--loglevel",
-            "info",
-        ])
-        .arg("--tls_cert")
-        .arg(certs.join("server.crt"))
-        .arg("--tls_key")
-        .arg(certs.join("server.key"))
-        .arg("--logpath")
-        .arg(&logfile)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Proxy::spawn(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+            .args([
+                "--listen",
+                "127.0.0.1:0",
+                "--tohost",
+                "127.0.0.1",
+                "--toport",
+                "1",
+                "--api",
+                "http://127.0.0.1:1/check",
+                "--loglevel",
+                "info",
+            ])
+            .arg("--tls_cert")
+            .arg(certs.join("server.crt"))
+            .arg("--tls_key")
+            .arg(certs.join("server.key"))
+            .arg("--logpath")
+            .arg(&logfile)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut line = String::new();
     stdout.read_line(&mut line).unwrap();

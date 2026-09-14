@@ -251,6 +251,20 @@ this is then relayed to the client.
   in total. The Perl bounds neither, so a hostile or compromised upstream
   could feed an endless reply and exhaust memory. RFC 5321 4.5.3.1.5 caps a
   reply line at 512 octets, so no working upstream reaches either bound.
+- **An idle connection times out after ten minutes in every phase of the
+  session, not only after STARTTLS.** The Perl arms its ten-minute inactivity
+  timer on the upgraded stream alone and leaves the connection before
+  STARTTLS untimed, so a client that connects and then sends nothing stays
+  connected indefinitely (measured: still open after 90 seconds, with no
+  close and no log line). That cost the Perl one file descriptor. Here it
+  costs a slot in `--max_connections` and `--max_connections_per_ip`, which
+  the Perl has no equivalent of and which is taken the moment the connection
+  is accepted -- so without this an unauthenticated client could hold every
+  slot for ever by sending nothing at all, and every legitimate client would
+  be answered `421 ... Too many connections, try again later` until the
+  service was restarted. The timeout is the same ten minutes in both phases
+  and there is no new flag for it. No working client is idle that long
+  between the TCP handshake and its first command.
 - **An AUTH username longer than 256 decoded bytes is refused** with the
   existing `535 Authentication credentials invalid`. The Perl applies no
   length check, and the username is the one unverified client-supplied string

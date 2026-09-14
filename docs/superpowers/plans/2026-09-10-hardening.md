@@ -1212,10 +1212,22 @@ because the Perl behaves the same way in every case.
 
 #### Item 7 — bound the AUTH username at 256 bytes (`src/server/auth.rs`)
 
-**User ruling 2026-09-13. Divergence from the Perl approved.** Nothing bounds
-the length of an AUTH username. `decode_plain` and `decode_login`
-(`src/server/auth.rs:23-45`) turn whatever base64 decodes into an owned
-`String` with no length check. The only bound on that path is
+**User ruling 2026-09-13. Divergence from the Perl approved.**
+
+> *Ruling R38, 2026-09-14.* The paragraph below describes the code **as it
+> stood before this item was implemented**, and its `auth.rs` citation is
+> pinned to the base commit `618f374` for that reason. At `618f374`,
+> `src/server/auth.rs:23-45` is exactly `decode_plain` and `decode_login`,
+> and neither had a length check. Today line 45 *is* the bound this item
+> added, so re-pointing the range would make the sentence say the opposite
+> of what it means. The paragraph's other two references
+> (`src/server/session.rs:31`, `:539`) still hold at the current tree and are
+> left alone.
+
+Nothing bounds the length of an AUTH username. `decode_plain` and
+`decode_login` (`src/server/auth.rs:23-45` **at `618f374`**) turn whatever
+base64 decodes into an owned `String` with no length check. The only bound on
+that path is
 `MAX_COMMAND_BUFFER` (`src/server/session.rs:31`) at 64 KiB, whose own doc
 comment records that RFC 5321 4.5.3.1.4 caps a command line at 512 octets and
 calls 64 KiB "generous", its stated job being only to stop a client that never
@@ -1254,6 +1266,22 @@ a problem whose fix belongs in `auth.rs`.
 
 These are deliberate. The gate will report them; they are not defects.
 
+- **User ruling R39, 2026-09-14: the inactivity timeout covers the whole
+  session, not only the part after STARTTLS.** The Perl arms its timer on the
+  upgraded stream alone: `SMTPProxy.pm:47` passes `timeout => 0` to
+  `SMTPServer.pm:29`, which applies it to the stream at accept, and
+  `SMTPServer/Connection.pm:384` sets `timeout(600)` only inside the
+  successful STARTTLS upgrade. Measured against the running Perl on
+  2026-09-14: a client that connects, reads the 220, and then sends nothing
+  is still connected 92 s later, with no close and no `Timeout on stream`
+  log line. We time the pre-TLS read too, at the same 600 s, because the
+  connection limit of spec 9.2 -- which the Perl has no equivalent of --
+  takes its slot at accept, so an untimed read before TLS lets an
+  unauthenticated client hold every slot for ever by sending nothing at all.
+  No new flag: the existing 600 s value covers both phases, and the spec
+  names no separate pre-TLS one (`2026-09-10-rust-rewrite-design.md:182`
+  is the line this supersedes). The gate sees a Perl test that idles a
+  pre-STARTTLS connection past 600 s, which none does.
 - **Task 22 item 7 (user ruling, 2026-09-13): an AUTH username longer than 256
   decoded bytes is refused.** The Perl applies no length check, so a Perl test
   that authenticates with an absurdly long username would pass there and be

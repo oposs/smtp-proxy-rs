@@ -99,7 +99,16 @@ impl Drop for ConnectionPermit {
         if !self.counted {
             return;
         }
-        let mut counts = self.per_ip.lock().unwrap();
+        // Not `unwrap()`: this runs inside a `Drop`, and a panic there while
+        // another panic is unwinding aborts the process outright. The map's
+        // invariant does not depend on the poisoning critical section having
+        // finished -- every one of them is a single counter edit -- so
+        // recovering the guard is strictly better than refusing to release
+        // the slot.
+        let mut counts = self
+            .per_ip
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(count) = counts.get_mut(&self.ip) {
             *count -= 1;
             if *count == 0 {
@@ -119,11 +128,29 @@ async fn cancelled(drain: &Option<Drain>) {
     }
 }
 
+/// How `serve` ended.
+///
+/// An accept loop only ever leaves its `loop` on a drain, so in production
+/// `serve` returning at all, other than at shutdown, means a task died on
+/// its own -- which is exactly the case that used to be invisible.
+#[derive(Debug, PartialEq, Eq)]
+#[must_use]
+pub enum ServeOutcome {
+    /// Every accept loop ended the way it was asked to.
+    Clean,
+    /// At least one accept loop panicked; its port is closed and nothing
+    /// else in the process notices. The caller has to turn this into a
+    /// non-zero exit: with several `--listen` addresses the survivors keep
+    /// the process looking healthy, and `Restart=on-failure` in the shipped
+    /// systemd unit does nothing about an exit 0.
+    ListenerFailed,
+}
+
 pub async fn serve<F: HandlerFactory>(
     listeners: Vec<TcpListener>,
     config: Arc<ServerConfig>,
     factory: F,
-) {
+) -> ServeOutcome {
     let limits = Arc::new(ConnectionLimits::new(
         config.max_connections,
         config.max_connections_per_ip,
@@ -206,7 +233,28 @@ pub async fn serve<F: HandlerFactory>(
     if let Some(drain) = &config.drain {
         drain.tracker.close();
     }
-    while tasks.join_next().await.is_some() {}
+    // `join_next` reports a panicked task as `Some(Err(JoinError))`, which
+    // the discarded-result form of this loop could not tell from a clean
+    // finish. Say so in the log and carry it out to the exit code.
+    let mut outcome = ServeOutcome::Clean;
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(e) = joined {
+            tracing::error!("Accept loop ended abnormally: {e}");
+            outcome = ServeOutcome::ListenerFailed;
+            // Give up the surviving listeners too, rather than serve on with
+            // one port silently closed. That partial state is the one nothing
+            // surfaces -- the process stays up and looks healthy while mail
+            // to the dead address is refused by the kernel -- and waiting for
+            // the others to finish would hold this report back until a
+            // shutdown that may never come. Returning now makes `main` exit
+            // non-zero at once, so `Restart=on-failure` brings back a whole
+            // proxy. Sessions already running are not in this `JoinSet`; the
+            // process exiting is what ends those.
+            tasks.abort_all();
+            break;
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]

@@ -56,6 +56,12 @@
 - debug-level data dumps are JSON instead of Perl dumper output
 - a missing mandatory option exits 1 instead of 2, and `--help`, `--man` and
   `--version` exit 0 on stdout instead of `--help` exiting 1
+- the ten-minute inactivity timeout now covers the whole session. The Perl
+  armed it only after STARTTLS, so a client that connected and then sent
+  nothing stayed connected indefinitely. That cost the Perl a file descriptor;
+  here it costs a `--max_connections` slot, which is taken at accept, so
+  without this an unauthenticated client could hold every slot for ever by
+  sending nothing at all. No new flag
 
 ### Fixed
 
@@ -83,6 +89,10 @@
   `535 Authentication credentials invalid`
 - initgroups is called before setgid and setuid, so a proxy started as root no
   longer keeps root's supplementary groups for its whole life
+- an accept loop that dies takes the process down with a non-zero exit instead
+  of being swallowed. It used to exit 0, which `Restart=on-failure` leaves
+  alone, or -- with several `--listen` addresses -- leave the process up and
+  healthy-looking with one port silently closed
 
 ## Earlier releases
 

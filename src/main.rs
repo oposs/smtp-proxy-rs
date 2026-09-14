@@ -59,7 +59,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         tls: Some(tls),
         max_message_size: config.max_message_size,
         smtplog,
-        tls_idle_timeout: Duration::from_secs(600),
+        idle_timeout: Duration::from_secs(600),
         max_connections: config.max_connections,
         max_connections_per_ip: config.max_connections_per_ip,
         max_recipients: config.max_recipients,
@@ -119,7 +119,13 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     let mut serve = std::pin::pin!(listener::serve(listeners, server_config, factory));
     tokio::select! {
         // Every listener gave up on its own: there is nothing left to drain.
-        _ = &mut serve => return Ok(()),
+        // An accept loop only leaves its loop on a drain, so short of one
+        // this arm means the loops died, and `ListenerFailed` says at least
+        // one of them died by panicking. That has to be a non-zero exit:
+        // `Restart=on-failure` in packaging/smtp-proxy.service leaves an
+        // exit 0 alone, and the unit then reads as cleanly stopped while no
+        // mail is being delivered.
+        outcome = &mut serve => return listener_outcome(outcome),
         _ = shutdown_signal() => {}
     }
     // Spec 9.1. Cancelling stops the accept loops -- which closes the
@@ -132,11 +138,17 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     );
     drain.token.cancel();
     let timeout = (config.drain_timeout != 0).then(|| Duration::from_secs(config.drain_timeout));
+    // Carried out of the `select!` because the second arm never sets it: an
+    // operator's second signal cuts the drain short before `serve` has been
+    // awaited, so there is nothing to report either way.
+    let mut outcome = listener::ServeOutcome::Clean;
     tokio::select! {
         drained = async {
-            serve.await;
-            drain.wait_drained(timeout).await
+            let ended = serve.await;
+            (ended, drain.wait_drained(timeout).await)
         } => {
+            let (ended, drained) = drained;
+            outcome = ended;
             if !drained {
                 tracing::warn!("Drain timeout; closing {} connection(s)", drain.connections());
             }
@@ -144,7 +156,19 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         // A second signal from an operator who is not prepared to wait.
         _ = shutdown_signal() => {}
     }
-    Ok(())
+    // A listener that panicked earlier is still a failure, even though the
+    // shutdown itself went to plan.
+    listener_outcome(outcome)
+}
+
+/// Turns `serve`'s outcome into this process's exit status.
+fn listener_outcome(outcome: listener::ServeOutcome) -> anyhow::Result<()> {
+    match outcome {
+        listener::ServeOutcome::Clean => Ok(()),
+        listener::ServeOutcome::ListenerFailed => {
+            Err(anyhow::anyhow!("An accept loop ended abnormally"))
+        }
+    }
 }
 
 async fn shutdown_signal() {

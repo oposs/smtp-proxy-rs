@@ -136,8 +136,12 @@ pub struct ServerConfig {
     pub tls: Option<Arc<rustls::ServerConfig>>,
     pub max_message_size: usize,
     pub smtplog: Option<Arc<crate::smtplog::SmtpLog>>,
-    /// Inactivity timeout once TLS is up. Perl: 600 s.
-    pub tls_idle_timeout: std::time::Duration,
+    /// Inactivity timeout on the client connection. The Perl arms this only
+    /// after STARTTLS (600 s) and leaves the pre-TLS phase untimed; here it
+    /// covers the whole session, because before TLS a silent client would
+    /// otherwise hold a `max_connections` slot for ever. See the divergence
+    /// note on `session::Session::next_line`.
+    pub idle_timeout: std::time::Duration,
     /// Total concurrent connections across all listeners. 0 means unlimited.
     pub max_connections: usize,
     /// Concurrent connections from a single client IP. 0 means unlimited.
