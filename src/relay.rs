@@ -1,5 +1,4 @@
 //! A minimal SMTP client for the upstream: one session per message.
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use tracing::{debug, warn};
 
 use crate::api::Recipient;
 use crate::smtp::dsn::{is_mail_dsn_keyword, is_rcpt_dsn_keyword};
-use crate::smtp::extensions::parse_extensions;
+use crate::smtp::extensions::{Extensions, parse_extensions};
 use crate::smtp::params::Param;
 
 /// Any transport a session can run over. The upstream connection changes
@@ -499,7 +498,7 @@ impl Upstream {
         &mut self,
         tls: &UpstreamTls,
         server_name: &str,
-    ) -> Result<HashSet<String>, RelayError> {
+    ) -> Result<Extensions, RelayError> {
         let greeting = self.read_reply().await?;
         if greeting.code / 100 != 2 {
             return Err(RelayError::Rejected {
@@ -512,7 +511,7 @@ impl Upstream {
             Ok(reply) => parse_extensions(&reply.raw),
             Err(RelayError::Rejected { code, .. }) if code / 100 == 5 => {
                 self.command("HELO", format!("HELO {HELLO}"), 2).await?;
-                HashSet::new()
+                Extensions::default()
             }
             Err(e) => return Err(e),
         };
@@ -705,7 +704,7 @@ pub async fn relay_over<S: Io + 'static>(
 /// Everything after the greeting: MAIL, RCPT.., DATA, message, QUIT.
 async fn transact(
     mut up: Upstream,
-    extensions: HashSet<String>,
+    extensions: Extensions,
     envelope: Envelope<'_>,
     message: &[u8],
 ) -> Result<Relayed, RelayError> {
