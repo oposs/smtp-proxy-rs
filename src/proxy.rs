@@ -1,7 +1,7 @@
 //! The application behind the SMTP server: collect, ask the API, relay.
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::task::JoinHandle;
 use tracing::{Instrument, debug, info, warn};
@@ -10,7 +10,7 @@ use crate::api::{
     ApiClient, ApiError, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
 };
 use crate::ratelimit::RateLimiter;
-use crate::relay::{Envelope, RelayConfig, probe, relay};
+use crate::relay::{Envelope, RelayConfig, UpstreamCaps, probe, relay};
 use crate::server::{Handler, HandlerFactory, Rejection};
 use crate::smtp::params::Param;
 
@@ -30,6 +30,10 @@ pub struct ProxyFactory {
     /// until asked" state. Kept apart from `upstream_dsn` so that the first
     /// answer is logged even when it is the same as the initial `false`.
     upstream_dsn_known: Arc<AtomicBool>,
+    /// The upstream's stated SIZE limit, or 0 for "none stated". Zero is
+    /// safe as the sentinel because RFC 1870's `SIZE 0` already means "no
+    /// fixed maximum", so a real limit is never zero.
+    upstream_size: Arc<AtomicUsize>,
     /// Shared by every connection, because the limit is per username and a
     /// username may arrive on any number of them.
     limiter: Arc<RateLimiter>,
@@ -42,6 +46,7 @@ impl ProxyFactory {
             config: Arc::new(config),
             upstream_dsn: Arc::new(AtomicBool::new(false)),
             upstream_dsn_known: Arc::new(AtomicBool::new(false)),
+            upstream_size: Arc::new(AtomicUsize::new(0)),
             limiter,
         }
     }
@@ -69,20 +74,43 @@ impl ProxyFactory {
     }
 
     /// Logs only when the answer changes (spec 6).
-    fn note_upstream_dsn(&self, supported: bool) {
-        let previous = self.upstream_dsn.swap(supported, Ordering::Relaxed);
+    fn note_upstream_caps(&self, caps: UpstreamCaps) {
+        let previous = self.upstream_dsn.swap(caps.dsn, Ordering::Relaxed);
         let known = self.upstream_dsn_known.swap(true, Ordering::Relaxed);
-        if !known || previous != supported {
+        if !known || previous != caps.dsn {
             info!(
                 "{} {}; the extension will {}be offered to clients",
                 self.upstream_name(),
-                if supported {
+                if caps.dsn {
                     "announces DSN"
                 } else {
                     "does not announce DSN"
                 },
-                if supported { "" } else { "not " }
+                if caps.dsn { "" } else { "not " }
             );
+        }
+        let size = caps.size.unwrap_or(0);
+        let previous_size = self.upstream_size.swap(size, Ordering::Relaxed);
+        if !known || previous_size != size {
+            match caps.size {
+                Some(n) => info!(
+                    "{} accepts messages up to {n} bytes; the limit will be offered to clients",
+                    self.upstream_name()
+                ),
+                None => info!(
+                    "{} states no message size limit; none will be offered to clients",
+                    self.upstream_name()
+                ),
+            }
+        }
+    }
+
+    /// The upstream's stated limit, or `None` when it stated none or has not
+    /// been asked yet. Both are the same answer to a client: say nothing.
+    pub fn upstream_size_limit(&self) -> Option<usize> {
+        match self.upstream_size.load(Ordering::Relaxed) {
+            0 => None,
+            n => Some(n),
         }
     }
 
@@ -94,7 +122,7 @@ impl ProxyFactory {
         let upstream = self.upstream_name();
         debug!("Asking {upstream} which extensions it offers");
         match probe(&self.config.relay).await {
-            Ok(dsn) => self.note_upstream_dsn(dsn),
+            Ok(caps) => self.note_upstream_caps(caps),
             Err(e) => warn!(
                 "Could not ask {upstream} which extensions it offers ({e}); DSN will not be announced until a mail is relayed"
             ),
@@ -367,7 +395,7 @@ impl ProxyHandler {
         };
         match relay(&self.factory.config.relay, envelope, &message).await {
             Ok(relayed) => {
-                self.factory.note_upstream_dsn(relayed.upstream_dsn);
+                self.factory.note_upstream_caps(relayed.caps);
                 debug!("Upstream server says: {}", relayed.message);
                 match &outcome.auth_id {
                     Some(id) => info!(

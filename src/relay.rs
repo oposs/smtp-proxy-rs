@@ -244,6 +244,24 @@ pub struct Envelope<'a> {
     pub recipients: &'a [Recipient],
 }
 
+/// What the upstream announced at EHLO, as far as this proxy cares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpstreamCaps {
+    pub dsn: bool,
+    /// The largest message the upstream states it will take. `None` means
+    /// it stated none -- see `Extensions::size`.
+    pub size: Option<usize>,
+}
+
+impl UpstreamCaps {
+    fn of(extensions: &Extensions) -> Self {
+        Self {
+            dsn: extensions.contains("DSN"),
+            size: extensions.size(),
+        }
+    }
+}
+
 /// Outcome of a relayed message.
 #[derive(Clone, Debug)]
 pub struct Relayed {
@@ -251,7 +269,7 @@ pub struct Relayed {
     /// multi-line reply arrives here with its lines joined by `\n`;
     /// `smtp::reply::sanitize` folds those away before a client sees it.
     pub message: String,
-    pub upstream_dsn: bool,
+    pub caps: UpstreamCaps,
 }
 
 /// RFC 5321 4.1.2 builds a path out of printable ASCII; the angle brackets
@@ -650,21 +668,24 @@ async fn connect(config: &RelayConfig) -> Result<Box<dyn Io>, RelayError> {
     }
 }
 
-/// EHLO + QUIT. Returns whether the upstream announces DSN.
-pub async fn probe(config: &RelayConfig) -> Result<bool, RelayError> {
+/// EHLO + QUIT. Returns what the upstream announces.
+pub async fn probe(config: &RelayConfig) -> Result<UpstreamCaps, RelayError> {
     let mut up = Upstream::new(connect(config).await?, config.timeout);
     let extensions = up.open(&config.tls, config.server_name()).await?;
     up.quit().await;
-    Ok(extensions.contains("DSN"))
+    Ok(UpstreamCaps::of(&extensions))
 }
 
 /// [`probe`] over a stream the caller supplies, without TLS. See
 /// [`Upstream`].
-pub async fn probe_over<S: Io + 'static>(stream: S, timeout: Duration) -> Result<bool, RelayError> {
+pub async fn probe_over<S: Io + 'static>(
+    stream: S,
+    timeout: Duration,
+) -> Result<UpstreamCaps, RelayError> {
     let mut up = Upstream::new(Box::new(stream), timeout);
     let extensions = up.open(&UpstreamTls::off(), "").await?;
     up.quit().await;
-    Ok(extensions.contains("DSN"))
+    Ok(UpstreamCaps::of(&extensions))
 }
 
 /// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
@@ -708,18 +729,18 @@ async fn transact(
     envelope: Envelope<'_>,
     message: &[u8],
 ) -> Result<Relayed, RelayError> {
-    let upstream_dsn = extensions.contains("DSN");
+    let caps = UpstreamCaps::of(&extensions);
     let mail = format!(
         "MAIL FROM:<{}>{}",
         envelope.from,
-        dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, upstream_dsn)
+        dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, caps.dsn)
     );
     up.command("MAIL", mail, 2).await?;
     for r in envelope.recipients {
         let rcpt = format!(
             "RCPT TO:<{}>{}",
             r.address,
-            dsn_suffix(&r.parameters, is_rcpt_dsn_keyword, upstream_dsn)
+            dsn_suffix(&r.parameters, is_rcpt_dsn_keyword, caps.dsn)
         );
         up.command("RCPT", rcpt, 2).await?;
     }
@@ -741,7 +762,7 @@ async fn transact(
     up.quit().await;
     Ok(Relayed {
         message: accepted.text,
-        upstream_dsn,
+        caps,
     })
 }
 

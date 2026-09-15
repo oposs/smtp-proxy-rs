@@ -76,11 +76,13 @@ fn p(k: &str, v: Option<&str>) -> Param {
 #[tokio::test]
 async fn probe_reports_dsn() {
     let up = RecordingUpstream::start(&["DSN"]).await;
-    assert!(probe(&config(&up)).await.unwrap());
+    assert!(probe(&config(&up)).await.unwrap().dsn);
     // One probe so far, so the all-connections view holds a single QUIT.
     assert_eq!(up.commands_matching("QUIT").len(), 1);
     up.set_extensions(&["SIZE 1000"]);
-    assert!(!probe(&config(&up)).await.unwrap());
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(!caps.dsn);
+    assert_eq!(caps.size, Some(1000));
     assert!(
         probe(&RelayConfig {
             host: "127.0.0.1".into(),
@@ -92,6 +94,22 @@ async fn probe_reports_dsn() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn probe_reports_the_upstream_size_limit() {
+    let up = RecordingUpstream::start(&["DSN", "SIZE 10240000"]).await;
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(caps.dsn);
+    assert_eq!(caps.size, Some(10_240_000));
+}
+
+#[tokio::test]
+async fn probe_reports_no_limit_when_size_is_absent() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(caps.dsn);
+    assert_eq!(caps.size, None);
 }
 
 #[tokio::test]
@@ -127,7 +145,7 @@ async fn full_session_and_dsn_forwarding() {
     .await
     .unwrap();
     assert_eq!(out.message, "OK message accepted");
-    assert!(out.upstream_dsn);
+    assert!(out.caps.dsn);
     let cmds = up.commands();
     // The greeting name is the Perl's fixed one, never this host's name.
     assert_eq!(cmds[0], "EHLO localhost.localdomain");
@@ -214,7 +232,7 @@ async fn ehlo_refused_falls_back_to_helo() {
     .await
     .unwrap();
     assert_eq!(out.message, "OK message accepted");
-    assert!(!out.upstream_dsn);
+    assert!(!out.caps.dsn);
     let cmds = up.commands();
     assert_eq!(cmds[0], "EHLO localhost.localdomain");
     assert_eq!(cmds[1], "HELO localhost.localdomain");
@@ -237,7 +255,7 @@ async fn dsn_parameters_are_dropped_without_upstream_dsn() {
     let out = relay(&config(&up), env, b"Subject: x\r\n\r\n")
         .await
         .unwrap();
-    assert!(!out.upstream_dsn);
+    assert!(!out.caps.dsn);
     assert_eq!(up.commands()[1], "MAIL FROM:<>");
     assert_eq!(up.commands()[2], "RCPT TO:<x@baz.com>");
 }
@@ -475,6 +493,7 @@ async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
         probe(&tls_config(&up, UpstreamTlsMode::Implicit, false))
             .await
             .unwrap()
+            .dsn
     );
     // An upstream that announces DSN only inside TLS: reading the extension
     // list from the first EHLO would miss it.
@@ -484,6 +503,7 @@ async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
         probe(&tls_config(&up, UpstreamTlsMode::Opportunistic, false))
             .await
             .unwrap()
+            .dsn
     );
 }
 
