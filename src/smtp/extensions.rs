@@ -35,7 +35,12 @@ pub fn parse_extensions(ehlo_reply: &str) -> Extensions {
         {
             continue;
         }
-        let rest = &line[4..];
+        // Trim before slicing: split_ascii_whitespace() skips leading
+        // whitespace before returning `word`, so `word.len()` is only a
+        // valid cut point into `rest` when `word` starts at byte 0 of it.
+        // Trimming first makes that true, and also keeps the cut on a char
+        // boundary when the keyword itself is non-ASCII.
+        let rest = line[4..].trim_start();
         let mut words = rest.split_ascii_whitespace();
         if let Some(word) = words.next() {
             let params = rest[word.len()..].trim_start().to_string();
@@ -57,12 +62,53 @@ mod tests {
         assert!(set.contains("DSN"));
         assert!(set.contains("STARTTLS"));
         assert!(!set.contains("PIPELINING"));
+        // A parameter token must never become a keyword in its own right.
+        assert!(!set.contains("10240000"));
     }
 
     #[test]
     fn garbage_is_ignored() {
         assert!(!parse_extensions("garbage\r\n").contains("DSN"));
+        assert!(!parse_extensions("garbage\r\n").contains("GARBAGE"));
         assert!(!parse_extensions("").contains("DSN"));
+    }
+
+    /// A stray space (or tab) between the `250-`/`250 ` separator and the
+    /// keyword must not shift the params slice into the middle of the
+    /// keyword. Covers the whole whitespace-position family the separator
+    /// can carry: none, one leading space, a tab, and multiple internal
+    /// spaces between keyword and value.
+    #[test]
+    fn stray_whitespace_around_the_keyword_does_not_corrupt_params() {
+        assert_eq!(
+            parse_extensions("250-SIZE 10240000\r\n").size(),
+            Some(10_240_000)
+        );
+        assert_eq!(
+            parse_extensions("250- SIZE 10240000\r\n").size(),
+            Some(10_240_000)
+        );
+        assert_eq!(
+            parse_extensions("250-\tSIZE 10240000\r\n").size(),
+            Some(10_240_000)
+        );
+        assert_eq!(
+            parse_extensions("250-SIZE   10240000\r\n").size(),
+            Some(10_240_000)
+        );
+    }
+
+    /// A leading space before a non-ASCII keyword must not panic: the old
+    /// code sliced `rest` at `word.len()`, a byte offset computed against a
+    /// trimmed copy but applied to the untrimmed string, which lands mid
+    /// character whenever the keyword itself is multi-byte UTF-8. This must
+    /// return, not unwind -- reachable from an upstream server's EHLO reply,
+    /// a panic here would take down a whole client session or the
+    /// background upstream probe.
+    #[test]
+    fn stray_whitespace_before_a_non_ascii_keyword_does_not_panic() {
+        let e = parse_extensions("250- SIZÉ 10\r\n");
+        assert!(e.contains("SIZÉ"));
     }
 
     #[test]
