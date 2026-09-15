@@ -251,6 +251,16 @@ pub struct UpstreamCaps {
     /// The largest message the upstream states it will take. `None` means
     /// it stated none -- see `Extensions::size`.
     pub size: Option<usize>,
+    /// Whether the upstream announced the `SIZE` keyword at all, regardless
+    /// of what limit (if any) it stated.
+    ///
+    /// Not the same question as `size.is_some()`: `Extensions::size` folds
+    /// RFC 1870's `SIZE 0` ("no fixed maximum") and an unparseable value
+    /// into `None`, so an upstream that announced `SIZE 0` has `size: None`
+    /// but `size_announced: true`. Sending a client's `SIZE=` parameter
+    /// risks a `555` only when the keyword was never offered, so that is
+    /// the question this field answers.
+    pub size_announced: bool,
 }
 
 impl UpstreamCaps {
@@ -258,6 +268,7 @@ impl UpstreamCaps {
         Self {
             dsn: extensions.contains("DSN"),
             size: extensions.size(),
+            size_announced: extensions.contains("SIZE"),
         }
     }
 }
@@ -755,7 +766,7 @@ async fn transact(
         "MAIL FROM:<{}>{}{}",
         envelope.from,
         dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, caps.dsn),
-        size_suffix(envelope.mail_params, caps.size.is_some()),
+        size_suffix(envelope.mail_params, caps.size_announced),
     );
     up.command("MAIL", mail, 2).await?;
     for r in envelope.recipients {
@@ -823,6 +834,59 @@ mod tests {
         );
         assert_eq!(dsn_suffix(&params, is_rcpt_dsn_keyword, true), " NOTIFY");
         assert_eq!(dsn_suffix(&params, is_mail_dsn_keyword, false), "");
+    }
+
+    #[test]
+    fn size_suffix_forwards_the_clients_size_when_the_upstream_announces_size() {
+        let params = [p("SIZE", Some("4096"))];
+        assert_eq!(size_suffix(&params, true), " SIZE=4096");
+    }
+
+    #[test]
+    fn size_suffix_drops_the_clients_size_when_the_upstream_is_silent() {
+        let params = [p("SIZE", Some("4096"))];
+        assert_eq!(size_suffix(&params, false), "");
+    }
+
+    /// RFC 1870's `SIZE 0` means "no fixed maximum", which `Extensions::size`
+    /// deliberately folds into `None` alongside "SIZE absent" -- but the
+    /// keyword was still announced, so forwarding a client's `SIZE=` is
+    /// still safe (an upstream that never offered SIZE at all is the one
+    /// that would answer 555). `UpstreamCaps::size_announced` is the field
+    /// that keeps this case apart from an upstream that said nothing.
+    #[test]
+    fn size_suffix_is_forwarded_when_the_upstream_states_size_zero() {
+        let extensions = parse_extensions("250-localhost\r\n250 SIZE 0\r\n");
+        let caps = UpstreamCaps::of(&extensions);
+        assert_eq!(caps.size, None);
+        let params = [p("SIZE", Some("4096"))];
+        assert_eq!(size_suffix(&params, caps.size_announced), " SIZE=4096");
+    }
+
+    #[test]
+    fn size_suffix_ignores_a_bare_size_keyword_with_no_value() {
+        let params = [p("SIZE", None)];
+        assert_eq!(size_suffix(&params, true), "");
+    }
+
+    /// The value is forwarded as-is rather than parsed: the upstream is the
+    /// one that will validate it, and a proxy that silently reinterprets or
+    /// drops a malformed parameter risks masking what the client actually
+    /// sent.
+    #[test]
+    fn size_suffix_forwards_a_non_numeric_value_verbatim() {
+        let params = [p("SIZE", Some("abc"))];
+        assert_eq!(size_suffix(&params, true), " SIZE=abc");
+    }
+
+    /// A client sending the same MAIL FROM parameter twice is malformed.
+    /// `size_suffix` takes the first occurrence, unlike `dsn_suffix` (which
+    /// forwards every matching parameter it finds) -- SIZE takes one value,
+    /// not a list, so there is no second slot to put a duplicate in.
+    #[test]
+    fn size_suffix_uses_the_first_of_a_duplicated_size_parameter() {
+        let params = [p("SIZE", Some("1")), p("SIZE", Some("2"))];
+        assert_eq!(size_suffix(&params, true), " SIZE=1");
     }
 
     #[test]
