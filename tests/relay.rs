@@ -261,6 +261,60 @@ async fn dsn_parameters_are_dropped_without_upstream_dsn() {
 }
 
 #[tokio::test]
+async fn the_clients_size_is_forwarded_when_the_upstream_announces_size() {
+    let up = RecordingUpstream::start(&["SIZE 10240000"]).await;
+    let params = vec![Param {
+        keyword: "SIZE".into(),
+        value: Some("4096".into()),
+    }];
+    let recipients = vec![Recipient {
+        address: "a@b.com".into(),
+        parameters: vec![],
+    }];
+    relay(
+        &config(&up),
+        Envelope {
+            from: "x@y.com",
+            mail_params: &params,
+            recipients: &recipients,
+        },
+        b"Subject: x\r\n\r\nbody\r\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        up.commands_matching("MAIL"),
+        vec!["MAIL FROM:<x@y.com> SIZE=4096"]
+    );
+}
+
+/// An upstream that never announced SIZE would answer 555 to the parameter.
+#[tokio::test]
+async fn the_clients_size_is_dropped_when_the_upstream_is_silent_about_size() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    let params = vec![Param {
+        keyword: "SIZE".into(),
+        value: Some("4096".into()),
+    }];
+    let recipients = vec![Recipient {
+        address: "a@b.com".into(),
+        parameters: vec![],
+    }];
+    relay(
+        &config(&up),
+        Envelope {
+            from: "x@y.com",
+            mail_params: &params,
+            recipients: &recipients,
+        },
+        b"Subject: x\r\n\r\nbody\r\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(up.commands_matching("MAIL"), vec!["MAIL FROM:<x@y.com>"]);
+}
+
+#[tokio::test]
 async fn upstream_rejection_carries_its_text() {
     let up = RecordingUpstream::start(&["DSN"]).await;
     up.reject_mail(Some("Sorry, I don't send from there"));

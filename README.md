@@ -338,6 +338,13 @@ this is then relayed to the client.
   relays the upstream's stated limit to the client, so a client learns the
   real limit before it sends. When the upstream states none, or has not been
   reached yet, no SIZE line is sent.
+- **A client's `SIZE=` on `MAIL FROM` is forwarded to the upstream.** The
+  Perl's `MAIL FROM` carries only a DSN-keyword suffix and drops `SIZE=`
+  entirely. This proxy passes it on when the upstream announced SIZE at
+  EHLO, so the upstream can refuse an oversized message before the transfer
+  instead of after. When the upstream never announced SIZE, the parameter is
+  still dropped, with a warning logged, to avoid a `555` on a parameter the
+  upstream never offered.
 - **A malformed EHLO line whose keyword is preceded by extra whitespace (for
   example `250- SIZE 10240000`) is accepted.** The Perl's
   `/^\d{3}[- ](\S+)/` fails to match such a line and drops it entirely.

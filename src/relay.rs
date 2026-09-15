@@ -315,6 +315,27 @@ pub fn dsn_suffix(params: &[Param], keep: fn(&str) -> bool, upstream_dsn: bool) 
         .collect()
 }
 
+/// The client's own `SIZE=` on MAIL FROM, passed through so the upstream can
+/// refuse an oversized message before a single body byte is transferred.
+///
+/// Guarded on the announcement for the same reason `dsn_suffix` is: an
+/// upstream that never offered SIZE answers `555` to the parameter, turning
+/// a deliverable message into a rejected one.
+pub fn size_suffix(params: &[Param], upstream_announces_size: bool) -> String {
+    let Some(size) = params
+        .iter()
+        .find(|p| p.keyword.eq_ignore_ascii_case("SIZE"))
+        .and_then(|p| p.value.as_deref())
+    else {
+        return String::new();
+    };
+    if !upstream_announces_size {
+        warn!("Upstream does not announce SIZE; dropping SIZE={size}");
+        return String::new();
+    }
+    format!(" SIZE={size}")
+}
+
 /// Rewrites every `\r?\n` to `\r\n` and doubles a dot that follows one
 /// (RFC 5321 4.5.2), in a single pass. This is the Perl's
 ///
@@ -731,9 +752,10 @@ async fn transact(
 ) -> Result<Relayed, RelayError> {
     let caps = UpstreamCaps::of(&extensions);
     let mail = format!(
-        "MAIL FROM:<{}>{}",
+        "MAIL FROM:<{}>{}{}",
         envelope.from,
-        dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, caps.dsn)
+        dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, caps.dsn),
+        size_suffix(envelope.mail_params, caps.size.is_some()),
     );
     up.command("MAIL", mail, 2).await?;
     for r in envelope.recipients {
