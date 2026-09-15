@@ -334,3 +334,12 @@ this is then relayed to the client.
   session inside `DATA` or waiting on the API or the upstream is allowed to
   finish and reply. After `--drain_timeout` seconds (default 30) whatever is
   still open is closed without a reply. A second signal exits immediately.
+- **`SIZE` is advertised.** The Perl announced no SIZE extension. This proxy
+  relays the upstream's stated limit to the client, so a client learns the
+  real limit before it sends. When the upstream states none, or has not been
+  reached yet, no SIZE line is sent.
+- **A malformed EHLO line whose keyword is preceded by extra whitespace (for
+  example `250- SIZE 10240000`) is accepted.** The Perl's
+  `/^\d{3}[- ](\S+)/` fails to match such a line and drops it entirely.
+  Consequence: against such an upstream this proxy may learn -- and therefore
+  advertise -- an extension the Perl would have ignored.

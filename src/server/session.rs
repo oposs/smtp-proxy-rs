@@ -408,6 +408,9 @@ impl<H: Handler> Session<H> {
             if self.handler.dsn_available() {
                 lines.push("DSN".into());
             }
+            if let Some(n) = self.handler.size_limit() {
+                lines.push(format!("SIZE {n}"));
+            }
         }
         if self.state >= State::WantMail {
             self.start_transaction();

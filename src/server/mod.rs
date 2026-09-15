@@ -121,6 +121,10 @@ pub trait Handler: Send + 'static {
     /// RSET, or EHLO/HELO while a transaction is running.
     fn reset(&mut self);
     fn dsn_available(&self) -> bool;
+    /// The largest message to announce in EHLO, or `None` to announce no
+    /// SIZE line at all. The proxy has no limit of its own; this is the
+    /// upstream's, relayed.
+    fn size_limit(&self) -> Option<usize>;
 }
 
 pub trait HandlerFactory: Clone + Send + Sync + 'static {

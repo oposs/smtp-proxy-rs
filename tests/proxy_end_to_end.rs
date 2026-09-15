@@ -630,6 +630,16 @@ async fn dsn_parameters_travel_to_the_api_and_the_upstream() {
     assert_eq!(cmds[3], "RCPT TO:<x@y.com> NOTIFY=NEVER");
 }
 
+/// The whole path: the upstream's own SIZE line, learned at the probe,
+/// reaches the client's EHLO.
+#[tokio::test]
+async fn the_upstream_size_limit_reaches_the_client() {
+    let r = rig(&["DSN", "SIZE 10240000"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let reply = c.command("EHLO x").await;
+    assert!(reply.contains("SIZE 10240000"), "got {reply:?}");
+}
+
 #[tokio::test]
 async fn dsn_follows_the_upstream() {
     let r = rig(&["SIZE 1000"]).await;

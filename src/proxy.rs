@@ -534,6 +534,10 @@ impl Handler for ProxyHandler {
     fn dsn_available(&self) -> bool {
         self.factory.upstream_dsn.load(Ordering::Relaxed)
     }
+
+    fn size_limit(&self) -> Option<usize> {
+        self.factory.upstream_size_limit()
+    }
 }
 
 #[cfg(test)]

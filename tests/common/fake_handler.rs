@@ -27,6 +27,7 @@ pub struct Script {
     pub rcpt_error: Option<Rejection>,
     pub message_result: Result<String, Rejection>,
     pub dsn: bool,
+    pub size_limit: Option<usize>,
     /// Delay before answering `message`, to simulate a slow relay.
     pub message_delay: std::time::Duration,
     /// Holds `message` until the test releases it with `notify_one`, so a
@@ -44,6 +45,7 @@ impl Default for Script {
             rcpt_error: None,
             message_result: Ok("queued".into()),
             dsn: true,
+            size_limit: None,
             message_delay: std::time::Duration::ZERO,
             message_hold: None,
         }
@@ -142,5 +144,9 @@ impl Handler for ScriptedHandler {
 
     fn dsn_available(&self) -> bool {
         self.script().dsn
+    }
+
+    fn size_limit(&self) -> Option<usize> {
+        self.script().size_limit
     }
 }

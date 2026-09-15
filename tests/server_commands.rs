@@ -49,6 +49,37 @@ async fn dsn_is_announced_only_when_available() {
 }
 
 #[tokio::test]
+async fn ehlo_announces_the_size_limit_the_handler_reports() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = Some(10_240_000));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("EHLO x").await;
+    assert!(reply.contains("SIZE 10240000"), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn ehlo_omits_size_when_the_handler_reports_none() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = None);
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("EHLO x").await;
+    assert!(!reply.contains("SIZE"), "got {reply:?}");
+}
+
+/// HELO takes no extension list at all, so the limit must not leak into it.
+#[tokio::test]
+async fn helo_never_announces_size() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = Some(64));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("HELO x").await;
+    assert!(!reply.contains("SIZE"), "got {reply:?}");
+}
+
+#[tokio::test]
 async fn commands_valid_in_any_state() {
     let (mut c, _) = open_session().await;
     assert_eq!(c.command("NOOP").await, "250 OK\r\n");
