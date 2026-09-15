@@ -320,16 +320,42 @@ Two faults must be added, one per new failure mode:
   is not vacuous. Without it that hazard ships silently.
 - **drop the connection mid-DATA** -- the `Dropped` mirror.
 
-**The memory invariant needs a test that fails rather than OOM-killing the
-slice:**
+**The memory invariant needs its own test, and the assertion is peak RSS --
+not an OOM kill.** With the body streaming, the resident set is the header
+block (`--max_header_size`, ~1 MiB), one 64 KiB staging buffer, an 8 KiB
+socket read chunk, rustls' bounded buffers, the tokio runtime and the
+binary. Single-digit to low-double-digit MiB, and **none of it scales with
+message size**. A ceiling loose enough to be safe is therefore loose enough
+to pass a regression that buffers a few hundred MB, which would make the
+test nearly vacuous -- the lax-fixture trap this project already has a rule
+about.
+
+So: stream **1 GiB** -- exactly what used to be the default
+`--max_message_size` -- from a generator that allocates nothing, then read
+`VmHWM` from `/proc/self/status` and assert it. The assertion is then a
+statement worth reading: what used to be the largest permitted message now
+passes through in a hundredth of its size. A failure prints
+"peak 412 MiB, expected under N" instead of a kill.
+
+`MemoryMax` stays, but as a backstop rather than the assertion, so a runaway
+regression dies locally instead of eating into the 25 GiB slice every
+session on this machine shares:
 
 ```
-systemd-run --user --scope -p MemoryMax=512M -- cargo test --test streaming -- big_body
+cargo test --no-run --test streaming        # build OUTSIDE the scope
+systemd-run --user --scope -p MemoryMax=256M -- <the built binary> big_body
 ```
 
-Stream a body far larger than that ceiling from a generator that allocates
-nothing. If anyone reintroduces buffering the test dies instead of passing
-quietly.
+Building outside the scope matters. The project's usual pattern puts
+`cargo test` under the scope, which is right for adversarial-input tests;
+here it is wrong, because cargo's own footprint lands in the same ceiling
+and blurs the measurement.
+
+**Derive `N`, do not inherit it from this document.** Every number above is
+an estimate. The implementation measures the actual steady-state peak first
+and sets the assertion at a small multiple of it, with the measured baseline
+written into the test as a comment -- so a later reader can tell a drift
+from a regression.
 
 For this one test `RecordingUpstream` needs a count-and-discard mode,
 because it records raw bytes (`raw_messages`) and would otherwise buffer on
