@@ -10,8 +10,8 @@ use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
-    Envelope, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamTls,
-    UpstreamTlsMode, probe, probe_over, relay, relay_over,
+    Envelope, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamSession,
+    UpstreamTls, UpstreamTlsMode, probe, probe_over, relay, relay_over,
 };
 use smtp_proxy::smtp::params::Param;
 
@@ -388,8 +388,17 @@ async fn a_slow_but_steady_upstream_is_not_timed_out() {
 /// The other half of the same coin: an upstream that stops reading
 /// altogether for longer than the timeout must still be given up on, so the
 /// chunking has not simply removed the protection.
+///
+/// Spec 6.2: a hung upstream -- not dropped, not replying -- cannot be
+/// mirrored, because mirroring "hangs forever" would leak a connection per
+/// hung upstream. So the inactivity timer turns it into
+/// `UpstreamVerdict::Dropped`, which reaches the caller as `Io` rather than
+/// as `Timeout`. Both answer the client `451`, and the assertion below is no
+/// weaker for it: paired with `elapsed < stall` it still pins the failure to
+/// the write timer, because nothing but the write can fail while the
+/// upstream is asleep.
 #[tokio::test]
-async fn an_upstream_that_stops_reading_still_times_out() {
+async fn an_upstream_that_stops_reading_is_given_up_on() {
     let up = RecordingUpstream::in_memory(&["DSN"]);
     // Far longer than the timeout, and — the point of the duplex — longer
     // than this test may take if the timer that fires is the right one.
@@ -414,7 +423,7 @@ async fn an_upstream_that_stops_reading_still_times_out() {
     .await
     .unwrap_err();
     let elapsed = started.elapsed();
-    assert!(matches!(err, RelayError::Timeout), "{err:?}");
+    assert!(matches!(err, RelayError::Io(_)), "{err:?}");
     assert!(up.messages().is_empty());
     // Returning before the stall is over is what pins the timeout to the
     // write: nothing else can make progress until the upstream reads again.
@@ -424,6 +433,127 @@ async fn an_upstream_that_stops_reading_still_times_out() {
     assert!(
         elapsed < stall,
         "the timeout did not come from the write: {elapsed:?}"
+    );
+}
+
+/// An upstream that refuses mid-body and stops reading. The relay has to
+/// surface the upstream's own code rather than its own impatience: the
+/// unread body fills the transport, so a relay that only writes blocks here
+/// until its inactivity timer fires and reports a `Timeout` for a message
+/// the upstream has already answered.
+///
+/// A `tokio::io::duplex` pair rather than a socket, for the same reason the
+/// pacing tests use one: what blocks a write is then [`DUPLEX_CAPACITY`] and
+/// not whatever `tcp_wmem` the host chose. The elapsed-time assertion is
+/// what makes this test non-vacuous — it fails if the reply was noticed only
+/// after the write timer gave up.
+#[tokio::test]
+async fn a_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    // Four 1 KiB lines in, which is less than one write chunk and less than
+    // half the body, so the refusal lands while the relay is still writing.
+    // Four 1 KiB lines in, which is less than one write chunk and less than
+    // half the body, so the refusal lands while the relay is still writing.
+    up.reject_during_data(4096, (552, "5.3.4 too big"));
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(
+        up.connect_duplex(DUPLEX_CAPACITY),
+        timeout,
+        env,
+        &body(512 << 10),
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    match err {
+        RelayError::Rejected { code, ref text, .. } => {
+            assert_eq!(code, 552);
+            assert_eq!(text, "5.3.4 too big");
+        }
+        other => panic!("expected the upstream's 552, got {other:?}"),
+    }
+    assert!(
+        elapsed < timeout,
+        "the reply was noticed only after the write timer: {elapsed:?}"
+    );
+}
+
+/// The same shape, but the upstream simply goes away. That has no reply to
+/// report, so it must not become a fabricated one.
+#[tokio::test]
+async fn a_drop_during_the_body_is_not_reported_as_a_rejection() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    up.drop_during_data(4096);
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(
+        up.connect_duplex(DUPLEX_CAPACITY),
+        timeout,
+        env,
+        &body(512 << 10),
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, RelayError::Io(_)),
+        "a dead connection has no verdict to report, got {err:?}"
+    );
+    assert!(
+        elapsed < timeout,
+        "the close was noticed only after the write timer: {elapsed:?}"
+    );
+}
+
+/// Two properties nothing else in the suite reaches, in one session.
+///
+/// The upstream answers EHLO and the MAIL that follows it in a *single*
+/// write, so the MAIL reply is already sitting in the handshake's `BufReader`
+/// when `UpstreamSession::from_handshake` takes the stream apart. Those bytes
+/// are carried across the split in front of the read half; without that carry
+/// `into_inner` drops them and the session waits out its timeout for a reply
+/// it has already been sent.
+///
+/// And the body is handed over in two `write` calls rather than one, which is
+/// all any other test does — so the chunk loop and the record of the last
+/// byte written are otherwise unproven across calls.
+#[tokio::test]
+async fn pipelined_bytes_survive_the_split_and_a_body_may_arrive_in_pieces() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    up.coalesce_mail_reply();
+    let recipients = one_recipient();
+    let mut session =
+        UpstreamSession::over(up.connect_duplex(DUPLEX_CAPACITY), Duration::from_secs(5))
+            .await
+            .unwrap();
+    session
+        .open_transaction(Envelope {
+            from: "a@b.com",
+            mail_params: &[],
+            recipients: &recipients,
+        })
+        .await
+        .unwrap();
+    session.write(b"Subject: x\r\n\r\nfirst\r\n").await.unwrap();
+    session.write(b"second\r\n").await.unwrap();
+    let accepted = session.finish().await.unwrap();
+    assert_eq!(accepted, "OK message accepted");
+    assert_eq!(
+        up.messages(),
+        vec!["Subject: x\r\n\r\nfirst\r\nsecond\r\n".to_string()]
     );
 }
 

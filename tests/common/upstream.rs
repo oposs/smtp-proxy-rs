@@ -74,6 +74,21 @@ struct Inner {
     /// a body several times bigger than the buffers can hold, which puts
     /// every pause safely inside the transfer.
     data_pace: Option<(usize, Duration, usize)>,
+    /// After this many body bytes have been consumed, send this reply and
+    /// stop reading entirely: an upstream that refuses mid-transfer and
+    /// leaves the sender to notice. The unread bytes are what fill the
+    /// relay's send buffer, so a relay that does not watch for a reply while
+    /// writing blocks here until its inactivity timer fires.
+    reject_during_data: Option<(usize, u16, String)>,
+    /// After this many body bytes have been consumed, close the connection.
+    drop_during_data: Option<usize>,
+    /// Answer EHLO and the MAIL that follows it in a *single* write, and then
+    /// say nothing to MAIL itself. The relay's read of the EHLO reply then
+    /// pulls the MAIL reply off the socket too, so it is sitting in the
+    /// handshake's `BufReader` when the session splits -- the one way to put
+    /// bytes where `UpstreamSession::from_handshake` has to carry them across
+    /// the split, since nothing else this fake does pipelines behind EHLO.
+    coalesce_mail_reply: bool,
     /// `Some` for an upstream that can do TLS. Then `STARTTLS` is announced
     /// and answered, or, with `implicit`, the connection is a TLS one from
     /// its first byte and STARTTLS is neither announced nor accepted.
@@ -100,6 +115,9 @@ impl Inner {
             reject_data_end: None,
             data_stall: None,
             data_pace: None,
+            reject_during_data: None,
+            drop_during_data: None,
+            coalesce_mail_reply: false,
             tls: None,
             implicit: false,
             tls_extensions: None,
@@ -256,6 +274,24 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().data_pace = Some((bytes, pause, times));
     }
 
+    /// Refuse the message once `after_bytes` of body have been consumed, and
+    /// then stop reading without hanging up. See `Inner::reject_during_data`.
+    pub fn reject_during_data(&self, after_bytes: usize, reply: (u16, &str)) {
+        self.inner.lock().unwrap().reject_during_data =
+            Some((after_bytes, reply.0, reply.1.to_string()));
+    }
+
+    /// Hang up once `after_bytes` of body have been consumed, saying nothing.
+    pub fn drop_during_data(&self, after_bytes: usize) {
+        self.inner.lock().unwrap().drop_during_data = Some(after_bytes);
+    }
+
+    /// Send the MAIL reply already with the EHLO reply, in one write. See
+    /// `Inner::coalesce_mail_reply`.
+    pub fn coalesce_mail_reply(&self) {
+        self.inner.lock().unwrap().coalesce_mail_reply = true;
+    }
+
     /// Drops every recorded connection and message. The startup probe's own
     /// EHLO and QUIT would otherwise shift every later command index.
     pub fn clear(&self) {
@@ -304,6 +340,9 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
     let mut message: Vec<u8> = Vec::new();
     let mut since_pause = 0usize;
     let mut pauses_done = 0usize;
+    // Body bytes consumed in the current message, which is what the
+    // mid-transfer faults are measured against.
+    let mut body_bytes = 0usize;
     let mut stall_after_reply: Option<Duration> = None;
     loop {
         // `read_until` rather than `lines()`: the body has to be recorded
@@ -321,6 +360,7 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 in_data = false;
                 since_pause = 0;
                 pauses_done = 0;
+                body_bytes = 0;
                 let (code, text) = {
                     let mut s = state.lock().unwrap();
                     s.messages.push(std::mem::take(&mut message));
@@ -338,7 +378,36 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 }
             } else {
                 since_pause += raw.len();
+                body_bytes += raw.len();
                 message.extend_from_slice(&raw);
+                let (reject, drop_at) = {
+                    let s = state.lock().unwrap();
+                    (s.reject_during_data.clone(), s.drop_during_data)
+                };
+                if let Some(after) = drop_at
+                    && body_bytes >= after
+                {
+                    return;
+                }
+                if let Some((after, code, text)) = reject
+                    && body_bytes >= after
+                {
+                    if io
+                        .write_all(format!("{code} {text}\r\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Park instead of returning. Returning would drop the
+                    // transport, and a connection closed with megabytes still
+                    // unread is a *different* fault: the sender would meet the
+                    // close rather than the reply. What this fault means is an
+                    // upstream that has answered and stopped reading, so the
+                    // task has to stay alive holding its end open. The runtime
+                    // drops it when the test ends.
+                    std::future::pending::<()>().await;
+                }
                 let pace = state.lock().unwrap().data_pace;
                 if let Some((bytes, pause, times)) = pace
                     && pauses_done < times
@@ -359,6 +428,7 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
             state.lock().unwrap().tls_commands.push(line.clone());
         }
         let upper = line.to_ascii_uppercase();
+        let coalesce = state.lock().unwrap().coalesce_mail_reply;
         let reply = if upper.starts_with("EHLO") {
             let (rejection, ext) = {
                 let s = state.lock().unwrap();
@@ -385,9 +455,18 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 if ext.is_empty() {
                     r.push_str("250 HELP\r\n");
                 }
+                // The MAIL reply rides along in this same write, so that the
+                // relay's read of the EHLO reply takes it off the socket too.
+                if coalesce {
+                    r.push_str("250 OK\r\n");
+                }
                 r
             }
         } else if upper.starts_with("MAIL") {
+            if coalesce {
+                // Already answered, with the EHLO reply.
+                continue;
+            }
             let rejection = state.lock().unwrap().reject_mail.clone();
             match rejection {
                 Some(text) => format!("553 {text}\r\n"),

@@ -461,6 +461,36 @@ pub struct UpstreamSession {
     last_written: Option<u8>,
 }
 
+/// What the upstream did, when it did something other than accept.
+///
+/// During DATA the proxy mirrors the upstream, so this is the whole
+/// vocabulary a caller needs: either the upstream said something, which is
+/// relayed verbatim, or the connection died, which has nothing to relay. An
+/// upstream that has merely gone quiet joins the second group once the
+/// inactivity timer fires -- mirroring "hangs forever" would leak a
+/// connection per hung upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamVerdict {
+    Dropped,
+    Replied { code: u16, text: String },
+}
+
+impl UpstreamVerdict {
+    pub fn into_relay_error(self) -> RelayError {
+        match self {
+            UpstreamVerdict::Dropped => RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "upstream closed the connection during DATA",
+            )),
+            UpstreamVerdict::Replied { code, text } => RelayError::Rejected {
+                command: "DATA",
+                code,
+                text,
+            },
+        }
+    }
+}
+
 struct UpstreamReply {
     code: u16,
     /// Text of every line, without the codes, joined with "\n".
@@ -868,16 +898,65 @@ impl UpstreamSession {
     /// caller. An empty piece writes nothing and leaves the record of the
     /// last byte alone, so that `write(b"")` cannot make `finish` believe the
     /// body ended in a newline it never saw.
-    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), RelayError> {
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
         if chunk.is_empty() {
             return Ok(());
         }
         self.last_written = chunk.last().copied();
-        write_chunks(&mut self.writer, self.timeout, chunk).await
+        for piece in chunk.chunks(WRITE_CHUNK) {
+            // An upstream may refuse mid-transfer, and one that refuses
+            // usually stops reading. Writing blind would then fill the send
+            // buffer and time out, reporting our own impatience instead of
+            // its answer -- so both halves are awaited together and whichever
+            // happens first wins. This is the whole reason the session holds
+            // the stream split in two (`relay.rs`, `struct UpstreamSession`).
+            //
+            // What is raced is `fill_buf`, not `read_reply`. `read_reply`
+            // accumulates a reply line by line and is not cancel safe, so
+            // losing the race would lose a partial line. `fill_buf` is cancel
+            // safe and consumes nothing: it fills the `BufReader`'s own buffer
+            // and hands back a slice, and dropping it leaves those bytes right
+            // where they are. So the `read_reply` below runs to completion,
+            // uncancelled, with its per-line timers intact -- which is also
+            // why a single `read_reply` future is not held across the loop
+            // instead: its timer would then span the whole body transfer and
+            // fire on a healthy but slow upstream.
+            let reader = &mut self.reader;
+            let writer = &mut self.writer;
+            let early = tokio::select! {
+                written = tokio::time::timeout(self.timeout, writer.write_all(piece)) => {
+                    match written {
+                        Err(_) | Ok(Err(_)) => return Err(UpstreamVerdict::Dropped),
+                        Ok(Ok(())) => false,
+                    }
+                }
+                // The borrow of `reader` ends here: what leaves this branch is
+                // a bool, never the slice `fill_buf` returned.
+                ready = reader.fill_buf() => match ready {
+                    Err(_) => return Err(UpstreamVerdict::Dropped),
+                    // `Ok(&[])` is end of file, which `read_reply` turns into
+                    // the same `Dropped` an error would.
+                    Ok(_) => true,
+                },
+            };
+            if early {
+                return Err(match read_reply(&mut self.reader, self.timeout).await {
+                    Ok(r) => UpstreamVerdict::Replied {
+                        code: r.code,
+                        text: r.text,
+                    },
+                    Err(_) => UpstreamVerdict::Dropped,
+                });
+            }
+            if flush(&mut self.writer, self.timeout).await.is_err() {
+                return Err(UpstreamVerdict::Dropped);
+            }
+        }
+        Ok(())
     }
 
     /// The terminator, the upstream's verdict on the message, then QUIT.
-    pub async fn finish(mut self) -> Result<String, RelayError> {
+    pub async fn finish(mut self) -> Result<String, UpstreamVerdict> {
         // RFC 5321 4.1.1.4: the terminator is a line of its own, so a body
         // that did not end in CRLF gets one first. `transact` used to make
         // this decision against the whole payload, which it still had in
@@ -890,11 +969,18 @@ impl UpstreamSession {
         } else {
             b"\r\n.\r\n"
         };
-        write_chunks(&mut self.writer, self.timeout, tail).await?;
-        let accepted = read_reply(&mut self.reader, self.timeout).await?;
+        if write_chunks(&mut self.writer, self.timeout, tail)
+            .await
+            .is_err()
+        {
+            return Err(UpstreamVerdict::Dropped);
+        }
+        let accepted = match read_reply(&mut self.reader, self.timeout).await {
+            Ok(reply) => reply,
+            Err(_) => return Err(UpstreamVerdict::Dropped),
+        };
         if accepted.code / 100 != 2 {
-            return Err(RelayError::Rejected {
-                command: "DATA_END",
+            return Err(UpstreamVerdict::Replied {
                 code: accepted.code,
                 text: accepted.text,
             });
@@ -979,8 +1065,13 @@ async fn send_whole_message(
 ) -> Result<Relayed, RelayError> {
     let caps = up.caps();
     up.open_transaction(envelope).await?;
-    up.write(&normalize_and_stuff(message)).await?;
-    let message = up.finish().await?;
+    up.write(&normalize_and_stuff(message))
+        .await
+        .map_err(UpstreamVerdict::into_relay_error)?;
+    let message = up
+        .finish()
+        .await
+        .map_err(UpstreamVerdict::into_relay_error)?;
     Ok(Relayed { message, caps })
 }
 
