@@ -476,14 +476,26 @@ pub enum UpstreamVerdict {
 }
 
 impl UpstreamVerdict {
-    pub fn into_relay_error(self) -> RelayError {
+    /// `command` is the step that was in flight, and it is the caller's to
+    /// name: the body and the terminator are two different failures to an
+    /// operator reading a log, and only the caller knows which one it drove.
+    pub fn into_relay_error(self, command: &'static str) -> RelayError {
         match self {
+            // Deliberately vague about *how* the upstream was lost, because
+            // `Dropped` is reached by more than one road and naming only one
+            // of them would be a false log line. A connection that really
+            // closed, one that went silent until the inactivity timer fired,
+            // and one that answered something unparseable or endless all
+            // arrive here, and this is the line an operator reads to decide
+            // whether to suspect the network or the peer.
             UpstreamVerdict::Dropped => RelayError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
-                "upstream closed the connection during DATA",
+                format!(
+                    "lost the upstream during {command}: it stopped reading, closed the connection, or answered unintelligibly"
+                ),
             )),
             UpstreamVerdict::Replied { code, text } => RelayError::Rejected {
-                command: "DATA",
+                command,
                 code,
                 text,
             },
@@ -903,6 +915,9 @@ impl UpstreamSession {
             return Ok(());
         }
         self.last_written = chunk.last().copied();
+        // Hoisted above the two field borrows below, so that the `async` block
+        // in the `select!` does not have to capture `self` as well.
+        let timeout = self.timeout;
         for piece in chunk.chunks(WRITE_CHUNK) {
             // An upstream may refuse mid-transfer, and one that refuses
             // usually stops reading. Writing blind would then fill the send
@@ -921,15 +936,28 @@ impl UpstreamSession {
             // why a single `read_reply` future is not held across the loop
             // instead: its timer would then span the whole body transfer and
             // fire on a healthy but slow upstream.
+            //
+            // The write and its flush are raced *together*, as one step. On a
+            // TLS connection the write is not where the transfer blocks at
+            // all: `poll_write` reports the plaintext written as soon as it is
+            // in rustls' send buffer, however little ciphertext the socket
+            // took (see [`flush`]). Leaving the flush outside the race would
+            // leave every TLS upstream exactly as blind as watching neither
+            // half. The flush is per chunk and carries its own timer for the
+            // reasons [`write_chunks`] gives; this loop is that loop with the
+            // reader raced against it.
             let reader = &mut self.reader;
             let writer = &mut self.writer;
             let early = tokio::select! {
-                written = tokio::time::timeout(self.timeout, writer.write_all(piece)) => {
-                    match written {
-                        Err(_) | Ok(Err(_)) => return Err(UpstreamVerdict::Dropped),
-                        Ok(Ok(())) => false,
-                    }
-                }
+                pushed = async {
+                    tokio::time::timeout(timeout, writer.write_all(piece))
+                        .await
+                        .map_err(|_| RelayError::Timeout)??;
+                    flush(&mut *writer, timeout).await
+                } => match pushed {
+                    Err(_) => return Err(UpstreamVerdict::Dropped),
+                    Ok(()) => false,
+                },
                 // The borrow of `reader` ends here: what leaves this branch is
                 // a bool, never the slice `fill_buf` returned.
                 ready = reader.fill_buf() => match ready {
@@ -940,16 +968,13 @@ impl UpstreamSession {
                 },
             };
             if early {
-                return Err(match read_reply(&mut self.reader, self.timeout).await {
+                return Err(match read_reply(&mut self.reader, timeout).await {
                     Ok(r) => UpstreamVerdict::Replied {
                         code: r.code,
                         text: r.text,
                     },
                     Err(_) => UpstreamVerdict::Dropped,
                 });
-            }
-            if flush(&mut self.writer, self.timeout).await.is_err() {
-                return Err(UpstreamVerdict::Dropped);
             }
         }
         Ok(())
@@ -1067,11 +1092,11 @@ async fn send_whole_message(
     up.open_transaction(envelope).await?;
     up.write(&normalize_and_stuff(message))
         .await
-        .map_err(UpstreamVerdict::into_relay_error)?;
+        .map_err(|v| v.into_relay_error("DATA"))?;
     let message = up
         .finish()
         .await
-        .map_err(UpstreamVerdict::into_relay_error)?;
+        .map_err(|v| v.into_relay_error("DATA_END"))?;
     Ok(Relayed { message, caps })
 }
 

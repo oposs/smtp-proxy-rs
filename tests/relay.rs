@@ -452,8 +452,6 @@ async fn a_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
     let up = RecordingUpstream::in_memory(&["DSN"]);
     // Four 1 KiB lines in, which is less than one write chunk and less than
     // half the body, so the refusal lands while the relay is still writing.
-    // Four 1 KiB lines in, which is less than one write chunk and less than
-    // half the body, so the refusal lands while the relay is still writing.
     up.reject_during_data(4096, (552, "5.3.4 too big"));
     let recipients = one_recipient();
     let env = Envelope {
@@ -483,6 +481,51 @@ async fn a_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
         elapsed < timeout,
         "the reply was noticed only after the write timer: {elapsed:?}"
     );
+}
+
+/// The same refusal, over TLS -- and a plaintext fixture cannot stand in for
+/// this one.
+///
+/// `tokio_rustls`' `poll_write` takes the plaintext into rustls' send buffer
+/// and reports it written even when the socket took no ciphertext at all (see
+/// `relay.rs`, `fn flush`). So against a TLS upstream `write_all` returns
+/// straight away and the transfer does not actually block there: it blocks in
+/// the *flush*. A relay that races only the write against the reader is
+/// therefore still blind here -- it sits in an unwatched flush until its
+/// inactivity timer fires and reports a dead connection, while the upstream's
+/// `552` waits unread. Both halves of pushing a chunk out have to be inside
+/// the race.
+#[tokio::test]
+async fn a_tls_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
+    let up = RecordingUpstream::in_memory_implicit_tls(&["DSN"]);
+    up.reject_during_data(4096, (552, "5.3.4 too big"));
+    let stream = tls_over_duplex(&up).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(stream, timeout, env, &body(512 << 10))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    match err {
+        RelayError::Rejected { code, ref text, .. } => {
+            assert_eq!(code, 552);
+            assert_eq!(text, "5.3.4 too big");
+        }
+        other => panic!("expected the upstream's 552, got {other:?}"),
+    }
+    assert!(
+        elapsed < timeout,
+        "the reply was noticed only after the write timer: {elapsed:?}"
+    );
+    // The session really was a TLS one; a plaintext duplex would not have
+    // exercised any of this.
+    assert!(up.tls_commands().iter().any(|c| c.starts_with("MAIL")));
 }
 
 /// The same shape, but the upstream simply goes away. That has no reply to
