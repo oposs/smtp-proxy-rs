@@ -1,9 +1,13 @@
 //! A minimal SMTP client for the upstream: one session per message.
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+    Chain, ReadHalf, WriteHalf,
+};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
@@ -419,13 +423,42 @@ const HELLO: &str = "localhost.localdomain";
 /// is one the test chose rather than one the host's TCP buffers decided.
 /// `server::session` carries the same seam for the client side.
 ///
-/// Reads and writes are strictly alternating here, so the stream is buffered
-/// on the read side only and written through -- and that is what makes the
-/// STARTTLS upgrade possible at all, since a `split` cannot be undone
-/// without both halves back in hand.
+/// This is the connection *before* a transaction: the greeting, EHLO with its
+/// HELO fallback, the STARTTLS upgrade, and the QUIT a probe ends on. It is
+/// deliberately *not* split, because the upgrade replaces the stream wholesale
+/// (`mem::replace` then `into_inner`) and a `split` cannot be undone without
+/// both halves back in hand. Reads and writes strictly alternate at this
+/// stage, so buffering the read side only and writing through costs nothing.
+///
+/// Once the handshake is done, [`UpstreamSession::from_handshake`] takes the
+/// stream apart and everything after that runs on the split form.
 struct Upstream {
     stream: BufReader<Box<dyn Io>>,
     timeout: Duration,
+}
+
+/// The read half of a driven session, with whatever the handshake's
+/// `BufReader` had already pulled off the socket put back in front of it.
+type SessionReader = BufReader<Chain<Cursor<Vec<u8>>, ReadHalf<Box<dyn Io>>>>;
+
+/// A connection past its handshake, driven one step at a time by the caller:
+/// MAIL/RCPT/DATA, then the body in as many pieces as it likes, then the
+/// terminator and the upstream's verdict.
+///
+/// Unlike `Upstream` the stream is split in two, so that a blocked body
+/// write and a read of the upstream's reply can be awaited *at the same time*
+/// -- an upstream that refuses a message mid-transfer stops draining the
+/// write, and noticing that means watching both halves at once. Splitting is
+/// only safe once the STARTTLS upgrade is behind us.
+pub struct UpstreamSession {
+    reader: SessionReader,
+    writer: WriteHalf<Box<dyn Io>>,
+    timeout: Duration,
+    caps: UpstreamCaps,
+    /// The last byte handed to [`UpstreamSession::write`], so that `finish`
+    /// knows whether the body already ends in a newline. `transact` used to
+    /// see the whole payload at once and could just look at it.
+    last_written: Option<u8>,
 }
 
 struct UpstreamReply {
@@ -437,6 +470,156 @@ struct UpstreamReply {
     raw: String,
 }
 
+/// Reads one reply, however many lines it spans, under the inactivity
+/// timeout and under both byte caps.
+///
+/// Free rather than a method because both session forms need it and their
+/// readers are different types: `BufReader<Box<dyn Io>>` before the split,
+/// [`SessionReader`] after it.
+async fn read_reply<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<UpstreamReply, RelayError> {
+    let mut raw = String::new();
+    let mut texts = Vec::new();
+    loop {
+        let mut line = String::new();
+        // `take` borrows the reader, so the budget is re-applied per line
+        // rather than one `Take` being held across the loop -- which is
+        // also what makes it a per-line cap and not a per-reply one.
+        let n = tokio::time::timeout(
+            timeout,
+            (&mut *reader)
+                .take(MAX_REPLY_LINE as u64)
+                .read_line(&mut line),
+        )
+        .await
+        .map_err(|_| RelayError::Timeout)??;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "upstream closed the connection",
+            )
+            .into());
+        }
+        // A line that spent its whole budget without reaching a newline
+        // has no end in sight. One that stopped short of the budget
+        // ended at EOF instead, and is parsed as it always was.
+        if !line.ends_with('\n') && line.len() >= MAX_REPLY_LINE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("upstream reply line exceeds {MAX_REPLY_LINE} bytes"),
+            )
+            .into());
+        }
+        raw.push_str(&line);
+        if raw.len() > MAX_REPLY_TOTAL {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("upstream reply exceeds {MAX_REPLY_TOTAL} bytes"),
+            )
+            .into());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let b = trimmed.as_bytes();
+        if b.len() < 3 || !b[..3].iter().all(u8::is_ascii_digit) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unparseable upstream reply: {trimmed}"),
+            )
+            .into());
+        }
+        let code: u16 = trimmed[..3].parse().unwrap();
+        texts.push(trimmed.get(4..).unwrap_or("").to_string());
+        if b.len() == 3 || b[3] == b' ' {
+            return Ok(UpstreamReply {
+                code,
+                text: texts.join("\n"),
+                raw,
+            });
+        }
+    }
+}
+
+/// Hands everything written so far to the transport, under the
+/// inactivity timeout like every other step.
+///
+/// Not a formality on a TLS connection. `tokio_rustls`' `poll_write`
+/// takes the plaintext into rustls' send buffer and then pushes as much
+/// ciphertext at the socket as the socket will take; when the socket
+/// blocks it still reports the plaintext as written
+/// (`common/mod.rs:296-306`). So `write_all` can return `Ok` with the
+/// tail of the message still sitting in rustls. Nothing on the read path
+/// pushes it out -- `poll_fill_buf` only ever calls `read_io` -- so
+/// without this flush a large message to a slow upstream would end with
+/// the relay waiting for a `250` for bytes the upstream has not been
+/// sent, until the inactivity timer turned a deliverable message into a
+/// `550`. `server::session` flushes the client-facing leg for the same
+/// reason.
+async fn flush<W: AsyncWrite + Unpin>(writer: &mut W, timeout: Duration) -> Result<(), RelayError> {
+    tokio::time::timeout(timeout, writer.flush())
+        .await
+        .map_err(|_| RelayError::Timeout)??;
+    Ok(())
+}
+
+/// Writes a payload, restarting the inactivity timer for every chunk.
+/// See [`WRITE_CHUNK`].
+///
+/// Every chunk is flushed before the next one is written, rather than
+/// once at the end. On a TLS connection the leftovers of each chunk
+/// would otherwise pile up in rustls' send buffer, which has no bound:
+/// at the 1 GiB message cap a slow upstream could leave most of the
+/// message in memory and then have to drain it all inside the single
+/// timer of one final flush. Per chunk, what is in flight stays one
+/// chunk and each flush gets its own timer, which is the inactivity
+/// semantics [`WRITE_CHUNK`] describes.
+async fn write_chunks<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    timeout: Duration,
+    payload: &[u8],
+) -> Result<(), RelayError> {
+    for chunk in payload.chunks(WRITE_CHUNK) {
+        tokio::time::timeout(timeout, writer.write_all(chunk))
+            .await
+            .map_err(|_| RelayError::Timeout)??;
+        flush(writer, timeout).await?;
+    }
+    Ok(())
+}
+
+/// Writes one command line and pushes it out. A command is always shorter
+/// than [`WRITE_CHUNK`], so this is a single timed write and its flush.
+async fn send_command<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    timeout: Duration,
+    line: &str,
+) -> Result<(), RelayError> {
+    debug!("upstream <- {line}");
+    write_chunks(writer, timeout, format!("{line}\r\n").as_bytes()).await
+}
+
+/// Logs a reply and requires it to be in the class the command expected.
+fn require_class(
+    name: &'static str,
+    reply: UpstreamReply,
+    expect_class: u16,
+) -> Result<UpstreamReply, RelayError> {
+    debug!(
+        "upstream -> {} {}",
+        reply.code,
+        reply.text.replace('\n', " / ")
+    );
+    if reply.code / 100 != expect_class {
+        return Err(RelayError::Rejected {
+            command: name,
+            code: reply.code,
+            text: reply.text,
+        });
+    }
+    Ok(reply)
+}
+
 impl Upstream {
     fn new(stream: Box<dyn Io>, timeout: Duration) -> Self {
         Self {
@@ -445,97 +628,20 @@ impl Upstream {
         }
     }
 
-    async fn read_reply(&mut self) -> Result<UpstreamReply, RelayError> {
-        let mut raw = String::new();
-        let mut texts = Vec::new();
-        loop {
-            let mut line = String::new();
-            // `take` borrows the reader, so the budget is re-applied per line
-            // rather than one `Take` being held across the loop -- which is
-            // also what makes it a per-line cap and not a per-reply one.
-            let n = tokio::time::timeout(
-                self.timeout,
-                (&mut self.stream)
-                    .take(MAX_REPLY_LINE as u64)
-                    .read_line(&mut line),
-            )
-            .await
-            .map_err(|_| RelayError::Timeout)??;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "upstream closed the connection",
-                )
-                .into());
-            }
-            // A line that spent its whole budget without reaching a newline
-            // has no end in sight. One that stopped short of the budget
-            // ended at EOF instead, and is parsed as it always was.
-            if !line.ends_with('\n') && line.len() >= MAX_REPLY_LINE {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("upstream reply line exceeds {MAX_REPLY_LINE} bytes"),
-                )
-                .into());
-            }
-            raw.push_str(&line);
-            if raw.len() > MAX_REPLY_TOTAL {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("upstream reply exceeds {MAX_REPLY_TOTAL} bytes"),
-                )
-                .into());
-            }
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            let b = trimmed.as_bytes();
-            if b.len() < 3 || !b[..3].iter().all(u8::is_ascii_digit) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("unparseable upstream reply: {trimmed}"),
-                )
-                .into());
-            }
-            let code: u16 = trimmed[..3].parse().unwrap();
-            texts.push(trimmed.get(4..).unwrap_or("").to_string());
-            if b.len() == 3 || b[3] == b' ' {
-                return Ok(UpstreamReply {
-                    code,
-                    text: texts.join("\n"),
-                    raw,
-                });
-            }
-        }
-    }
-
     /// Writes a command and requires a reply in the given class.
+    ///
+    /// A method rather than a free function because `self.stream` is both the
+    /// reader and the writer here: the two borrows have to be sequential, and
+    /// inside a method they are.
     async fn command(
         &mut self,
         name: &'static str,
         line: String,
         expect_class: u16,
     ) -> Result<UpstreamReply, RelayError> {
-        debug!("upstream <- {line}");
-        tokio::time::timeout(
-            self.timeout,
-            self.stream.write_all(format!("{line}\r\n").as_bytes()),
-        )
-        .await
-        .map_err(|_| RelayError::Timeout)??;
-        self.flush().await?;
-        let reply = self.read_reply().await?;
-        debug!(
-            "upstream -> {} {}",
-            reply.code,
-            reply.text.replace('\n', " / ")
-        );
-        if reply.code / 100 != expect_class {
-            return Err(RelayError::Rejected {
-                command: name,
-                code: reply.code,
-                text: reply.text,
-            });
-        }
-        Ok(reply)
+        send_command(&mut self.stream, self.timeout, &line).await?;
+        let reply = read_reply(&mut self.stream, self.timeout).await?;
+        require_class(name, reply, expect_class)
     }
 
     /// Greeting and EHLO (HELO fallback on 5xx), then STARTTLS if the mode
@@ -549,7 +655,7 @@ impl Upstream {
         tls: &UpstreamTls,
         server_name: &str,
     ) -> Result<Extensions, RelayError> {
-        let greeting = self.read_reply().await?;
+        let greeting = read_reply(&mut self.stream, self.timeout).await?;
         if greeting.code / 100 != 2 {
             return Err(RelayError::Rejected {
                 command: "CONNECT",
@@ -603,49 +709,6 @@ impl Upstream {
         Ok(())
     }
 
-    /// Hands everything written so far to the transport, under the
-    /// inactivity timeout like every other step.
-    ///
-    /// Not a formality on a TLS connection. `tokio_rustls`' `poll_write`
-    /// takes the plaintext into rustls' send buffer and then pushes as much
-    /// ciphertext at the socket as the socket will take; when the socket
-    /// blocks it still reports the plaintext as written
-    /// (`common/mod.rs:296-306`). So `write_all` can return `Ok` with the
-    /// tail of the message still sitting in rustls. Nothing on the read path
-    /// pushes it out -- `poll_fill_buf` only ever calls `read_io` -- so
-    /// without this flush a large message to a slow upstream would end with
-    /// the relay waiting for a `250` for bytes the upstream has not been
-    /// sent, until the inactivity timer turned a deliverable message into a
-    /// `550`. `server::session` flushes the client-facing leg for the same
-    /// reason.
-    async fn flush(&mut self) -> Result<(), RelayError> {
-        tokio::time::timeout(self.timeout, self.stream.flush())
-            .await
-            .map_err(|_| RelayError::Timeout)??;
-        Ok(())
-    }
-
-    /// Writes the message body, restarting the inactivity timer for every
-    /// chunk. See [`WRITE_CHUNK`].
-    ///
-    /// Every chunk is flushed before the next one is written, rather than
-    /// once at the end. On a TLS connection the leftovers of each chunk
-    /// would otherwise pile up in rustls' send buffer, which has no bound:
-    /// at the 1 GiB message cap a slow upstream could leave most of the
-    /// message in memory and then have to drain it all inside the single
-    /// timer of one final flush. Per chunk, what is in flight stays one
-    /// chunk and each flush gets its own timer, which is the inactivity
-    /// semantics [`WRITE_CHUNK`] describes.
-    async fn write_body(&mut self, payload: &[u8]) -> Result<(), RelayError> {
-        for chunk in payload.chunks(WRITE_CHUNK) {
-            tokio::time::timeout(self.timeout, self.stream.write_all(chunk))
-                .await
-                .map_err(|_| RelayError::Timeout)??;
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
     async fn quit(&mut self) {
         let _ = self.command("QUIT", "QUIT".into(), 2).await;
     }
@@ -680,7 +743,11 @@ async fn handshake(
 
 /// The TCP connection, with the implicit-TLS handshake already done when the
 /// mode asks for it.
-async fn connect(config: &RelayConfig) -> Result<Box<dyn Io>, RelayError> {
+///
+/// Named `dial` rather than `connect` so that a reader of
+/// [`UpstreamSession::connect`] cannot mistake the call inside it for a
+/// recursive `Self::connect`.
+async fn dial(config: &RelayConfig) -> Result<Box<dyn Io>, RelayError> {
     let tcp = tokio::time::timeout(
         config.timeout,
         TcpStream::connect((config.host.as_str(), config.port)),
@@ -700,24 +767,172 @@ async fn connect(config: &RelayConfig) -> Result<Box<dyn Io>, RelayError> {
     }
 }
 
+/// Everything before a transaction: the connection, the greeting and EHLO.
+/// The one place all four entry points get an opened upstream from.
+async fn greet(
+    stream: Box<dyn Io>,
+    timeout: Duration,
+    tls: &UpstreamTls,
+    server_name: &str,
+) -> Result<(Upstream, UpstreamCaps), RelayError> {
+    let mut up = Upstream::new(stream, timeout);
+    let extensions = up.open(tls, server_name).await?;
+    Ok((up, UpstreamCaps::of(&extensions)))
+}
+
+impl UpstreamSession {
+    /// TCP (plus implicit TLS), then the greeting and EHLO -- everything
+    /// before a transaction. [`caps`](Self::caps) is answerable from here on.
+    pub async fn connect(config: &RelayConfig) -> Result<Self, RelayError> {
+        let (up, caps) = greet(
+            dial(config).await?,
+            config.timeout,
+            &config.tls,
+            config.server_name(),
+        )
+        .await?;
+        Ok(Self::from_handshake(up, caps))
+    }
+
+    /// [`connect`](Self::connect) over a stream the caller supplies, without
+    /// TLS. See [`Io`].
+    pub async fn over<S: Io + 'static>(stream: S, timeout: Duration) -> Result<Self, RelayError> {
+        let (up, caps) = greet(Box::new(stream), timeout, &UpstreamTls::off(), "").await?;
+        Ok(Self::from_handshake(up, caps))
+    }
+
+    /// Splits a handshaken [`Upstream`] into the two halves a driven session
+    /// needs.
+    ///
+    /// Whatever the handshake's `BufReader` had already pulled off the socket
+    /// is carried over in front of the read half. `into_inner` would otherwise
+    /// drop those bytes silently and the protocol would desynchronise. They
+    /// are ordinary pipelined data at this point, not the plaintext-injection
+    /// hazard `upgrade` refuses at STARTTLS: the channel there is about to
+    /// change, and here it is not.
+    fn from_handshake(up: Upstream, caps: UpstreamCaps) -> Self {
+        let timeout = up.timeout;
+        let leftover = up.stream.buffer().to_vec();
+        let (read_half, write_half) = tokio::io::split(up.stream.into_inner());
+        Self {
+            reader: BufReader::new(Cursor::new(leftover).chain(read_half)),
+            writer: write_half,
+            timeout,
+            caps,
+            last_written: None,
+        }
+    }
+
+    /// What the upstream announced at the EHLO that counts.
+    pub fn caps(&self) -> UpstreamCaps {
+        self.caps
+    }
+
+    /// Writes a command and requires a reply in the given class. A method for
+    /// symmetry with [`Upstream::command`], though here the two halves are
+    /// separate fields.
+    async fn command(
+        &mut self,
+        name: &'static str,
+        line: String,
+        expect_class: u16,
+    ) -> Result<UpstreamReply, RelayError> {
+        send_command(&mut self.writer, self.timeout, &line).await?;
+        let reply = read_reply(&mut self.reader, self.timeout).await?;
+        require_class(name, reply, expect_class)
+    }
+
+    /// MAIL, every RCPT, then DATA. Returns once the upstream has answered
+    /// `354` and the body may be written.
+    pub async fn open_transaction(&mut self, envelope: Envelope<'_>) -> Result<(), RelayError> {
+        let mail = format!(
+            "MAIL FROM:<{}>{}{}",
+            envelope.from,
+            dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, self.caps.dsn),
+            size_suffix(envelope.mail_params, self.caps.size_announced),
+        );
+        self.command("MAIL", mail, 2).await?;
+        for r in envelope.recipients {
+            let rcpt = format!(
+                "RCPT TO:<{}>{}",
+                r.address,
+                dsn_suffix(&r.parameters, is_rcpt_dsn_keyword, self.caps.dsn)
+            );
+            self.command("RCPT", rcpt, 2).await?;
+        }
+        self.command("DATA", "DATA".into(), 3).await?;
+        Ok(())
+    }
+
+    /// One piece of the body, already normalised and dot-stuffed by the
+    /// caller. An empty piece writes nothing and leaves the record of the
+    /// last byte alone, so that `write(b"")` cannot make `finish` believe the
+    /// body ended in a newline it never saw.
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<(), RelayError> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        self.last_written = chunk.last().copied();
+        write_chunks(&mut self.writer, self.timeout, chunk).await
+    }
+
+    /// The terminator, the upstream's verdict on the message, then QUIT.
+    pub async fn finish(mut self) -> Result<String, RelayError> {
+        // RFC 5321 4.1.1.4: the terminator is a line of its own, so a body
+        // that did not end in CRLF gets one first. `transact` used to make
+        // this decision against the whole payload, which it still had in
+        // hand; a driven session only remembers the last byte it wrote.
+        // The two agree: every LF `normalize_and_stuff` emits is the second
+        // byte of a CRLF, so "ends in LF" and "ends in CRLF" are the same
+        // question about its output.
+        let tail: &[u8] = if self.last_written == Some(b'\n') {
+            b".\r\n"
+        } else {
+            b"\r\n.\r\n"
+        };
+        write_chunks(&mut self.writer, self.timeout, tail).await?;
+        let accepted = read_reply(&mut self.reader, self.timeout).await?;
+        if accepted.code / 100 != 2 {
+            return Err(RelayError::Rejected {
+                command: "DATA_END",
+                code: accepted.code,
+                text: accepted.text,
+            });
+        }
+        self.quit().await;
+        Ok(accepted.text)
+    }
+
+    async fn quit(&mut self) {
+        let _ = self.command("QUIT", "QUIT".into(), 2).await;
+    }
+}
+
 /// EHLO + QUIT. Returns what the upstream announces.
+///
+/// Stays on the unsplit `Upstream`: a probe never writes a body, so it has
+/// no use for the two halves a [`UpstreamSession`] hands out.
 pub async fn probe(config: &RelayConfig) -> Result<UpstreamCaps, RelayError> {
-    let mut up = Upstream::new(connect(config).await?, config.timeout);
-    let extensions = up.open(&config.tls, config.server_name()).await?;
+    let (mut up, caps) = greet(
+        dial(config).await?,
+        config.timeout,
+        &config.tls,
+        config.server_name(),
+    )
+    .await?;
     up.quit().await;
-    Ok(UpstreamCaps::of(&extensions))
+    Ok(caps)
 }
 
 /// [`probe`] over a stream the caller supplies, without TLS. See
-/// [`Upstream`].
+/// [`Io`].
 pub async fn probe_over<S: Io + 'static>(
     stream: S,
     timeout: Duration,
 ) -> Result<UpstreamCaps, RelayError> {
-    let mut up = Upstream::new(Box::new(stream), timeout);
-    let extensions = up.open(&UpstreamTls::off(), "").await?;
+    let (mut up, caps) = greet(Box::new(stream), timeout, &UpstreamTls::off(), "").await?;
     up.quit().await;
-    Ok(UpstreamCaps::of(&extensions))
+    Ok(caps)
 }
 
 /// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
@@ -732,13 +947,11 @@ pub async fn relay(
     for r in envelope.recipients {
         assert_relayable(&r.address)?;
     }
-    let mut up = Upstream::new(connect(config).await?, config.timeout);
-    let extensions = up.open(&config.tls, config.server_name()).await?;
-    transact(up, extensions, envelope, message).await
+    send_whole_message(UpstreamSession::connect(config).await?, envelope, message).await
 }
 
 /// [`relay`] over a stream the caller supplies, without TLS. See
-/// [`Upstream`].
+/// [`Io`].
 pub async fn relay_over<S: Io + 'static>(
     stream: S,
     timeout: Duration,
@@ -749,54 +962,26 @@ pub async fn relay_over<S: Io + 'static>(
     for r in envelope.recipients {
         assert_relayable(&r.address)?;
     }
-    let mut up = Upstream::new(Box::new(stream), timeout);
-    let extensions = up.open(&UpstreamTls::off(), "").await?;
-    transact(up, extensions, envelope, message).await
+    send_whole_message(
+        UpstreamSession::over(stream, timeout).await?,
+        envelope,
+        message,
+    )
+    .await
 }
 
-/// Everything after the greeting: MAIL, RCPT.., DATA, message, QUIT.
-async fn transact(
-    mut up: Upstream,
-    extensions: Extensions,
+/// Drives an opened session through a message held whole in memory: what
+/// [`relay`] and [`relay_over`] both do once they have an upstream.
+async fn send_whole_message(
+    mut up: UpstreamSession,
     envelope: Envelope<'_>,
     message: &[u8],
 ) -> Result<Relayed, RelayError> {
-    let caps = UpstreamCaps::of(&extensions);
-    let mail = format!(
-        "MAIL FROM:<{}>{}{}",
-        envelope.from,
-        dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, caps.dsn),
-        size_suffix(envelope.mail_params, caps.size_announced),
-    );
-    up.command("MAIL", mail, 2).await?;
-    for r in envelope.recipients {
-        let rcpt = format!(
-            "RCPT TO:<{}>{}",
-            r.address,
-            dsn_suffix(&r.parameters, is_rcpt_dsn_keyword, caps.dsn)
-        );
-        up.command("RCPT", rcpt, 2).await?;
-    }
-    up.command("DATA", "DATA".into(), 3).await?;
-    let mut payload = normalize_and_stuff(message);
-    if !payload.ends_with(b"\r\n") {
-        payload.extend_from_slice(b"\r\n");
-    }
-    payload.extend_from_slice(b".\r\n");
-    up.write_body(&payload).await?;
-    let accepted = up.read_reply().await?;
-    if accepted.code / 100 != 2 {
-        return Err(RelayError::Rejected {
-            command: "DATA_END",
-            code: accepted.code,
-            text: accepted.text,
-        });
-    }
-    up.quit().await;
-    Ok(Relayed {
-        message: accepted.text,
-        caps,
-    })
+    let caps = up.caps();
+    up.open_transaction(envelope).await?;
+    up.write(&normalize_and_stuff(message)).await?;
+    let message = up.finish().await?;
+    Ok(Relayed { message, caps })
 }
 
 #[cfg(test)]
