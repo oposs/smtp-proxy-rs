@@ -1197,6 +1197,12 @@ Message: `Bound the header block, and stop pretending to bound the body`.
 
 ### Task 8: `BodySink`, with behaviour preserved
 
+> **Do not merge the branch between tasks 7 and 9.** Task 7 removed the body
+> cap (`--max_message_size`), and both it and this task still hold the whole
+> body in memory -- task 7 in `read_message`'s bridge, this one in a `ProxySink`
+> that still buffers. A merge here would be strictly worse than `4b78405` on
+> the very axis this branch exists to fix. Task 9 restores the bound.
+
 This changes the **interface** only. `ProxySink` still buffers and still calls `relay()`, so every existing test must pass unchanged. Task 9 changes the behaviour behind it.
 
 **Files:**
@@ -1419,6 +1425,10 @@ Message: `Hand the session a body sink instead of a finished message`. State tha
 ---
 
 ### Task 9: Stream for real
+
+> **This is the task that restores the bound on message size.** From task 7
+> until this one lands the body is uncapped *and* held whole, so the branch is
+> not mergeable in part -- see the note on task 8.
 
 **Files:**
 - Modify: `src/proxy.rs` (`ProxySink`, `fn open_body`; delete `format_message`)

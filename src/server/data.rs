@@ -57,11 +57,26 @@ impl HeaderCollector {
         }
     }
 
-    /// `line` includes its terminator. A caller that keeps pushing after
-    /// `TooLarge` is told so again; nothing accumulates either way.
+    /// `line` includes its terminator.
+    ///
+    /// Three events end the block and hand the caller its next job:
+    /// `Complete` at the blank line, `Terminator` when the lone dot arrives
+    /// first, and `TooLarge` when the cap is crossed. A caller that keeps
+    /// pushing afterwards is told what state the collector is in rather than
+    /// starting it over: every line after `TooLarge` is `TooLarge` again, the
+    /// terminator included, because a discarding collector has nothing else
+    /// to say and the caller is draining to answer `552` itself (spec 6);
+    /// and after `Complete` what arrives is body, which this type does not
+    /// collect. Nothing accumulates on any of those paths.
     pub fn push_line(&mut self, line: &[u8]) -> Option<HeaderEvent> {
+        if self.too_large {
+            return Some(HeaderEvent::TooLarge);
+        }
         if is_terminator(line) {
             return Some(HeaderEvent::Terminator);
+        }
+        if self.delivered {
+            return None;
         }
         if is_empty_line(line) {
             self.delivered = true;
@@ -125,8 +140,11 @@ pub enum BodyPiece {
 /// staging buffer of `WRITE_CHUNK` and, at most, a single held-back CR.
 ///
 /// Body lines pass through **verbatim**: the proxy neither unstuffs nor
-/// restuffs. Only the line ending is normalised to CRLF, which is the one
-/// thing `normalize_and_stuff` did that the wire still needs.
+/// restuffs. Only the line *ending* is normalised to CRLF, which is the one
+/// thing `normalize_and_stuff` did that the wire still needs. SMTP frames on
+/// LF, so a CR with no LF after it is data and passes through untouched --
+/// turning it into CRLF would split one body line into two and could hand
+/// the upstream a `.\r\n` the client never sent (spec 5.1).
 pub struct BodyFramer {
     out: Vec<u8>,
     /// True when the next byte begins a line. The terminator is meaningful
@@ -134,9 +152,10 @@ pub struct BodyFramer {
     /// three-byte terminator.
     at_line_start: bool,
     /// A CR at the end of a piece: we cannot yet tell CRLF from a bare CR,
-    /// so the byte waits for the next one rather than being guessed at. It
-    /// belongs to the framer and not to the piece, so `flush` leaves it
-    /// alone.
+    /// so the byte waits for the next one rather than being guessed at. An
+    /// LF arriving next makes it a line ending; anything else makes it data
+    /// and it is written as the lone CR it is. It belongs to the framer and
+    /// not to the piece, so `flush` leaves it alone.
     held_cr: bool,
 }
 
@@ -192,9 +211,12 @@ impl BodyFramer {
         let mut i = 0;
         if self.held_cr {
             self.held_cr = false;
-            self.out.extend_from_slice(b"\r\n");
             if bytes.first() == Some(&b'\n') {
+                self.out.extend_from_slice(b"\r\n");
                 i = 1;
+            } else {
+                // Nothing followed it, so it was never a line ending.
+                self.out.push(b'\r');
             }
         }
         while i < bytes.len() {
@@ -207,7 +229,7 @@ impl BodyFramer {
                     self.out.extend_from_slice(b"\r\n");
                     i += 2;
                 }
-                b'\r' | b'\n' => {
+                b'\n' => {
                     self.out.extend_from_slice(b"\r\n");
                     i += 1;
                 }
@@ -258,6 +280,40 @@ mod tests {
             h.push_line(b"A: aaaaaaaaaaaaaaaaaaaa\r\n"),
             Some(HeaderEvent::TooLarge)
         ));
+    }
+
+    /// The discarding state is stable: once the cap has been crossed every
+    /// further line says so, the blank line and the terminator included, and
+    /// nothing is collected on top of what was thrown away. The caller drains
+    /// to the terminator itself and answers there.
+    #[test]
+    fn every_line_after_the_cap_reports_too_large() {
+        let mut h = HeaderCollector::new(8);
+        assert!(matches!(
+            h.push_line(b"A: aaaaaaaaaaaaaaaaaaaa\r\n"),
+            Some(HeaderEvent::TooLarge)
+        ));
+        assert!(matches!(
+            h.push_line(b"B: 2\r\n"),
+            Some(HeaderEvent::TooLarge)
+        ));
+        assert!(matches!(h.push_line(b"\r\n"), Some(HeaderEvent::TooLarge)));
+        assert!(matches!(h.push_line(b".\r\n"), Some(HeaderEvent::TooLarge)));
+        assert!(h.take_pending().is_none());
+    }
+
+    /// The block is handed over once. What follows the blank line is body,
+    /// and the collector neither collects it nor offers a second block.
+    #[test]
+    fn nothing_is_collected_after_the_block_has_been_handed_over() {
+        let mut h = HeaderCollector::new(usize::MAX);
+        h.push_line(b"A: 1\r\n");
+        assert!(matches!(
+            h.push_line(b"\r\n"),
+            Some(HeaderEvent::Complete(_))
+        ));
+        assert!(h.push_line(b"body\r\n").is_none());
+        assert!(h.take_pending().is_none());
     }
 
     /// The header block is parsed by the proxy, so it is the one place that
@@ -329,6 +385,18 @@ mod tests {
         assert_eq!(f.flush(), b"hello\r\n");
     }
 
+    /// A bare CR inside a body line is data, not a line ending: SMTP frames
+    /// on LF, so `x\r.\r\n` is a single line and nothing in it is the
+    /// terminator. Normalising that CR to CRLF would split the line in two
+    /// and hand the upstream a `.\r\n` of its own -- it would end the
+    /// message there and read the rest of the body as SMTP commands.
+    #[test]
+    fn a_bare_cr_in_a_body_line_does_not_manufacture_a_line_start() {
+        let mut f = BodyFramer::new();
+        assert!(!matches!(f.push(b"x\r.\r\n"), BodyPiece::Terminator));
+        assert_eq!(f.flush(), b"x\r.\r\n");
+    }
+
     #[test]
     fn the_terminator_is_recognised_in_both_spellings() {
         assert!(matches!(
@@ -389,7 +457,7 @@ mod tests {
         f.push_partial(b"abc\r");
         assert_eq!(f.flush(), b"abc");
         f.push_partial(b"def");
-        assert_eq!(f.flush(), b"\r\ndef");
+        assert_eq!(f.flush(), b"\rdef");
     }
 
     /// A held CR can never be stranded by the terminator: holding one takes
@@ -400,6 +468,9 @@ mod tests {
         let mut f = BodyFramer::new();
         f.push_partial(b"abc\r");
         assert!(matches!(f.push(b".\r\n"), BodyPiece::Pending));
-        assert_eq!(f.flush(), b"abc\r\n.\r\n");
+        // The held CR is emitted as the data it is, so the dot after it does
+        // not begin a line of its own: see
+        // `a_bare_cr_in_a_body_line_does_not_manufacture_a_line_start`.
+        assert_eq!(f.flush(), b"abc\r.\r\n");
     }
 }
