@@ -304,10 +304,14 @@ mod tests {
 
     /// The block is handed over once. What follows the blank line is body,
     /// and the collector neither collects it nor offers a second block.
+    ///
+    /// The cap is what makes that visible: 6 bytes of header leave 2, so a
+    /// 6 byte line counted on top of them would cross the cap and report
+    /// `TooLarge`. Reporting nothing is the proof that nothing was counted.
     #[test]
     fn nothing_is_collected_after_the_block_has_been_handed_over() {
-        let mut h = HeaderCollector::new(usize::MAX);
-        h.push_line(b"A: 1\r\n");
+        let mut h = HeaderCollector::new(8);
+        assert!(h.push_line(b"A: 1\r\n").is_none());
         assert!(matches!(
             h.push_line(b"\r\n"),
             Some(HeaderEvent::Complete(_))
