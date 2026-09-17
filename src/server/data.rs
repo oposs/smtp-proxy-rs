@@ -1,100 +1,228 @@
-//! Reads the lines of a DATA payload: undoes dot stuffing, splits headers
-//! from body at the first empty line, ends at the lone dot, and enforces
-//! the size cap without holding more than the cap in memory.
+//! The two halves of a DATA payload. `HeaderCollector` holds the header
+//! block whole -- it is parsed, so it has to be -- and bounds it with
+//! `--max_header_size`. `BodyFramer` stages the body on its way to the
+//! upstream and retains nothing beyond one write chunk.
 
-pub enum DataEvent {
-    HeadersComplete(String),
-    MessageComplete(Vec<u8>),
+/// The body is written upstream in pieces of this size, each under its own
+/// timer. Spec 6 gives the relay an *inactivity* timeout, so what has to
+/// hold is "some progress within the timeout", not "the whole body within
+/// the timeout": a single deadline over the payload would abort a healthy
+/// but merely slow upstream. At 64 KiB a chunk the 60 s default asks the
+/// upstream for about 1 KB/s, which no working relay fails.
+pub const WRITE_CHUNK: usize = 64 * 1024;
+
+/// What a complete header line did to the block.
+#[derive(Debug)]
+pub enum HeaderEvent {
+    /// The blank line arrived: here is the block.
+    Complete(String),
+    /// The lone dot arrived first, so the message is headers only. The
+    /// block is still pending; `take_pending` hands it over.
+    Terminator,
+    /// The block crossed `--max_header_size`. What was collected is gone;
+    /// the caller drains to the terminator and answers there.
     TooLarge,
 }
 
-pub struct DataReader {
-    max_size: usize,
-    headers_done: bool,
+/// Collects the header block, undoing the client's dot stuffing, until the
+/// blank line that ends it -- or the terminator, when there is no body.
+pub struct HeaderCollector {
+    max_header_size: usize,
     headers: Vec<u8>,
-    body: Vec<u8>,
     size: usize,
     too_large: bool,
+    /// The block has been handed over, by `Complete` or by `take_pending`.
+    delivered: bool,
 }
 
+/// The blank line that ends the header block.
 fn is_empty_line(line: &[u8]) -> bool {
     line == b"\r\n" || line == b"\n"
 }
 
-fn is_terminator(line: &[u8]) -> bool {
+/// The lone dot that ends the message. Only meaningful at a line start,
+/// which is the caller's business to know.
+pub fn is_terminator(line: &[u8]) -> bool {
     line == b".\r\n" || line == b".\n"
 }
 
-impl DataReader {
-    pub fn new(max_size: usize) -> Self {
+impl HeaderCollector {
+    pub fn new(max_header_size: usize) -> Self {
         Self {
-            max_size,
-            headers_done: false,
+            max_header_size,
             headers: Vec::new(),
-            body: Vec::new(),
             size: 0,
             too_large: false,
+            delivered: false,
         }
     }
 
-    /// `line` includes its terminator.
-    pub fn push_line(&mut self, line: &[u8]) -> Option<DataEvent> {
+    /// `line` includes its terminator. A caller that keeps pushing after
+    /// `TooLarge` is told so again; nothing accumulates either way.
+    pub fn push_line(&mut self, line: &[u8]) -> Option<HeaderEvent> {
         if is_terminator(line) {
-            if self.too_large {
-                return Some(DataEvent::TooLarge);
-            }
-            return Some(DataEvent::MessageComplete(std::mem::take(&mut self.body)));
+            return Some(HeaderEvent::Terminator);
         }
-        if !self.headers_done && is_empty_line(line) {
-            self.headers_done = true;
+        if is_empty_line(line) {
+            self.delivered = true;
             let headers = String::from_utf8_lossy(&std::mem::take(&mut self.headers)).into_owned();
-            return Some(DataEvent::HeadersComplete(headers));
+            return Some(HeaderEvent::Complete(headers));
         }
         let unstuffed = line.strip_prefix(b".").unwrap_or(line);
         self.size += unstuffed.len();
-        if self.size > self.max_size {
-            self.too_large = true;
-            self.headers.clear();
-            self.body.clear();
-            return None;
+        if self.size > self.max_header_size {
+            self.mark_too_large();
+            return Some(HeaderEvent::TooLarge);
         }
-        if self.headers_done {
-            self.body.extend_from_slice(unstuffed);
-        } else {
-            self.headers.extend_from_slice(unstuffed);
-        }
+        self.headers.extend_from_slice(unstuffed);
         None
     }
 
     /// Bytes still allowed before the cap is crossed, or `None` once it has
-    /// been crossed and the reader is discarding. A caller reading from a
+    /// been crossed and the collector is discarding. A caller reading from a
     /// socket uses this to bound an incomplete line: those bytes count
     /// against the cap too, but `push_line` never gets to see them.
     pub fn remaining_capacity(&self) -> Option<usize> {
         if self.too_large {
             None
         } else {
-            Some(self.max_size.saturating_sub(self.size))
+            Some(self.max_header_size.saturating_sub(self.size))
         }
     }
 
     /// Enters discard mode without a complete line, for a caller that has
     /// watched the cap being crossed by bytes it is still buffering.
-    /// Everything accumulated so far is dropped and the next terminator
-    /// reports `TooLarge`, exactly as if a complete line had crossed it.
+    /// Everything accumulated so far is dropped.
     pub fn mark_too_large(&mut self) {
         self.too_large = true;
         self.headers.clear();
-        self.body.clear();
     }
 
-    /// The header block, if the terminator arrived before any empty line.
-    pub fn take_pending_headers(&mut self) -> Option<String> {
-        if self.headers_done {
+    /// The header block, when the terminator arrived before any blank line.
+    /// `None` once the block has been handed over, and once the cap has been
+    /// crossed: there is nothing left to hand over in either case.
+    pub fn take_pending(&mut self) -> Option<String> {
+        if self.delivered || self.too_large {
             return None;
         }
-        self.headers_done = true;
+        self.delivered = true;
         Some(String::from_utf8_lossy(&std::mem::take(&mut self.headers)).into_owned())
+    }
+}
+
+/// One piece of body, on its way to the upstream.
+#[derive(Debug)]
+pub enum BodyPiece {
+    /// Staged, not yet worth a write.
+    Pending,
+    /// The staging buffer filled: write this.
+    Chunk(Vec<u8>),
+    /// The lone dot. The body is over.
+    Terminator,
+}
+
+/// Frames the body after the header block. Retains nothing beyond one
+/// staging buffer of `WRITE_CHUNK` and, at most, a single held-back CR.
+///
+/// Body lines pass through **verbatim**: the proxy neither unstuffs nor
+/// restuffs. Only the line ending is normalised to CRLF, which is the one
+/// thing `normalize_and_stuff` did that the wire still needs.
+pub struct BodyFramer {
+    out: Vec<u8>,
+    /// True when the next byte begins a line. The terminator is meaningful
+    /// only there -- and a multi-gigabyte line is self-evidently not a
+    /// three-byte terminator.
+    at_line_start: bool,
+    /// A CR at the end of a piece: we cannot yet tell CRLF from a bare CR,
+    /// so the byte waits for the next one rather than being guessed at. It
+    /// belongs to the framer and not to the piece, so `flush` leaves it
+    /// alone.
+    held_cr: bool,
+}
+
+impl BodyFramer {
+    pub fn new() -> Self {
+        Self {
+            out: Vec::with_capacity(WRITE_CHUNK),
+            at_line_start: true,
+            held_cr: false,
+        }
+    }
+
+    /// A complete line, its terminator included.
+    ///
+    /// The terminator is reported before anything is appended, so the dot
+    /// never reaches the upstream. No CR can be stranded by that: holding
+    /// one takes a partial line, which leaves the framer mid-line, and
+    /// mid-line this reports no terminator.
+    pub fn push(&mut self, line: &[u8]) -> BodyPiece {
+        if self.at_line_start && is_terminator(line) {
+            return BodyPiece::Terminator;
+        }
+        self.append(line);
+        self.at_line_start = true;
+        self.piece()
+    }
+
+    /// Bytes with no line ending in sight. The caller has hit its buffer
+    /// bound, so these are staged as they are and the framer stays mid-line.
+    pub fn push_partial(&mut self, bytes: &[u8]) -> BodyPiece {
+        self.append(bytes);
+        self.at_line_start = false;
+        self.piece()
+    }
+
+    /// Whatever is staged, however little. The held CR is not part of it:
+    /// it belongs to the bytes still to come.
+    pub fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.out)
+    }
+
+    /// A write's worth of body, or nothing yet. Batching is the point: a
+    /// piece per line would be one socket write per line.
+    fn piece(&mut self) -> BodyPiece {
+        if self.out.len() >= WRITE_CHUNK {
+            BodyPiece::Chunk(std::mem::take(&mut self.out))
+        } else {
+            BodyPiece::Pending
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        if self.held_cr {
+            self.held_cr = false;
+            self.out.extend_from_slice(b"\r\n");
+            if bytes.first() == Some(&b'\n') {
+                i = 1;
+            }
+        }
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\r' if i + 1 == bytes.len() => {
+                    self.held_cr = true;
+                    i += 1;
+                }
+                b'\r' if bytes[i + 1] == b'\n' => {
+                    self.out.extend_from_slice(b"\r\n");
+                    i += 2;
+                }
+                b'\r' | b'\n' => {
+                    self.out.extend_from_slice(b"\r\n");
+                    i += 1;
+                }
+                b => {
+                    self.out.push(b);
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+impl Default for BodyFramer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -102,107 +230,176 @@ impl DataReader {
 mod tests {
     use super::*;
 
-    fn feed(reader: &mut DataReader, text: &str) -> Vec<DataEvent> {
-        let mut events = Vec::new();
-        let mut rest = text;
-        while let Some(i) = rest.find('\n') {
-            let (line, tail) = rest.split_at(i + 1);
-            if let Some(e) = reader.push_line(line.as_bytes()) {
-                events.push(e);
-            }
-            rest = tail;
+    #[test]
+    fn headers_end_at_the_blank_line() {
+        let mut h = HeaderCollector::new(usize::MAX);
+        assert!(h.push_line(b"A: 1\r\n").is_none());
+        match h.push_line(b"\r\n") {
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, "A: 1\r\n"),
+            other => panic!("{other:?}"),
         }
-        events
     }
 
     #[test]
-    fn headers_then_body() {
-        let mut r = DataReader::new(usize::MAX);
-        let events = feed(
-            &mut r,
-            "From: a@b.com\r\nSubject: hi\r\n\r\nline one\r\n.\r\n",
-        );
-        assert_eq!(events.len(), 2);
-        assert!(
-            matches!(&events[0], DataEvent::HeadersComplete(h) if h == "From: a@b.com\r\nSubject: hi\r\n")
-        );
-        assert!(matches!(&events[1], DataEvent::MessageComplete(b) if b == b"line one\r\n"));
-        assert!(r.take_pending_headers().is_none());
+    fn a_terminator_before_any_blank_line_is_a_header_only_message() {
+        let mut h = HeaderCollector::new(usize::MAX);
+        assert!(h.push_line(b"A: 1\r\n").is_none());
+        assert!(matches!(
+            h.push_line(b".\r\n"),
+            Some(HeaderEvent::Terminator)
+        ));
+        assert_eq!(h.take_pending().unwrap(), "A: 1\r\n");
     }
 
     #[test]
-    fn dot_stuffing_is_undone_in_headers_and_body() {
-        let mut r = DataReader::new(usize::MAX);
-        let events = feed(&mut r, "..X-Odd: yes\r\n\r\n..\r\n...\r\n.\r\n");
-        assert!(matches!(&events[0], DataEvent::HeadersComplete(h) if h == ".X-Odd: yes\r\n"));
-        assert!(matches!(&events[1], DataEvent::MessageComplete(b) if b == b".\r\n..\r\n"));
+    fn headers_over_the_cap_report_too_large() {
+        let mut h = HeaderCollector::new(8);
+        assert!(matches!(
+            h.push_line(b"A: aaaaaaaaaaaaaaaaaaaa\r\n"),
+            Some(HeaderEvent::TooLarge)
+        ));
+    }
+
+    /// The header block is parsed by the proxy, so it is the one place that
+    /// still has to undo the client's dot stuffing.
+    #[test]
+    fn dot_stuffing_is_undone_in_the_header_block() {
+        let mut h = HeaderCollector::new(usize::MAX);
+        assert!(h.push_line(b"..X-Odd: yes\r\n").is_none());
+        match h.push_line(b"\r\n") {
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, ".X-Odd: yes\r\n"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
-    fn dot_before_any_empty_line_means_headers_only() {
-        let mut r = DataReader::new(usize::MAX);
-        let events = feed(&mut r, "Subject: x\r\n.\r\n");
-        assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], DataEvent::MessageComplete(b) if b.is_empty()));
-        assert_eq!(r.take_pending_headers().as_deref(), Some("Subject: x\r\n"));
-    }
-
-    #[test]
-    fn bare_lf_terminators_are_accepted() {
-        let mut r = DataReader::new(usize::MAX);
-        let events = feed(&mut r, "A: 1\n\nbody\n.\n");
-        assert!(matches!(&events[0], DataEvent::HeadersComplete(h) if h == "A: 1\n"));
-        assert!(matches!(&events[1], DataEvent::MessageComplete(b) if b == b"body\n"));
-    }
-
-    #[test]
-    fn size_cap_discards_and_reports() {
-        let mut r = DataReader::new(20);
-        let events = feed(
-            &mut r,
-            "A: 1\r\n\r\n0123456789\r\n0123456789\r\n0123456789\r\n.\r\n",
-        );
-        assert!(matches!(&events[0], DataEvent::HeadersComplete(_)));
-        assert!(matches!(&events[1], DataEvent::TooLarge));
-        assert_eq!(events.len(), 2);
+    fn bare_lf_line_terminators_are_accepted() {
+        let mut h = HeaderCollector::new(usize::MAX);
+        assert!(h.push_line(b"A: 1\n").is_none());
+        match h.push_line(b"\n") {
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, "A: 1\n"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn remaining_capacity_shrinks_with_the_counted_bytes() {
-        let mut r = DataReader::new(20);
-        assert_eq!(r.remaining_capacity(), Some(20));
-        feed(&mut r, "A: 1\r\n");
-        assert_eq!(r.remaining_capacity(), Some(14));
-        // The blank line that ends the headers is not counted. Dot stuffing
-        // is undone first, so "..x\r\n" costs the 4 bytes of ".x\r\n".
-        feed(&mut r, "\r\n..x\r\n");
-        assert_eq!(r.remaining_capacity(), Some(10));
+        let mut h = HeaderCollector::new(20);
+        assert_eq!(h.remaining_capacity(), Some(20));
+        h.push_line(b"A: 1\r\n");
+        assert_eq!(h.remaining_capacity(), Some(14));
+        // Dot stuffing is undone first, so "..x\r\n" costs the 4 bytes of
+        // ".x\r\n".
+        h.push_line(b"..x\r\n");
+        assert_eq!(h.remaining_capacity(), Some(10));
     }
 
     #[test]
-    fn mark_too_large_discards_and_reports_at_the_terminator() {
-        let mut r = DataReader::new(1000);
-        feed(&mut r, "A: 1\r\n\r\nbody\r\n");
-        r.mark_too_large();
-        // No capacity is left to report once the reader is discarding.
-        assert_eq!(r.remaining_capacity(), None);
-        // Lines still arrive and are still thrown away.
-        assert!(r.push_line(b"more body\r\n").is_none());
-        let events = feed(&mut r, ".\r\n");
-        assert!(matches!(&events[0], DataEvent::TooLarge));
-        assert_eq!(events.len(), 1);
+    fn mark_too_large_discards_the_block_and_leaves_no_capacity() {
+        let mut h = HeaderCollector::new(1000);
+        h.push_line(b"A: 1\r\n");
+        h.mark_too_large();
+        // No capacity is left to report once the collector is discarding.
+        assert_eq!(h.remaining_capacity(), None);
+        // And what was collected is gone rather than waiting to be handed on.
+        assert!(h.take_pending().is_none());
     }
 
     #[test]
-    fn size_cap_counts_headers_too() {
-        // The cap (5) is crossed while the header block itself is still being
-        // accumulated, before the blank line is even seen. HeadersComplete is
-        // still emitted when the blank line arrives, but carrying an empty
-        // string: the over-cap header bytes were discarded as they came in,
-        // per spec 4.7 (the cap counts headers plus body).
-        let mut r = DataReader::new(5);
-        let events = feed(&mut r, "Subject: long enough\r\n\r\n.\r\n");
-        assert!(matches!(&events[0], DataEvent::HeadersComplete(_)));
-        assert!(matches!(&events[1], DataEvent::TooLarge));
+    fn a_body_line_passes_through_unchanged() {
+        let mut f = BodyFramer::new();
+        assert!(!matches!(f.push(b"hello\r\n"), BodyPiece::Terminator));
+        assert_eq!(f.flush(), b"hello\r\n");
+    }
+
+    /// Dot stuffing is the client's and the upstream's business. Unstuffing
+    /// and restuffing was the identity for correct input, and for a client
+    /// that under-stuffed both paths land on the same bytes at the far end.
+    #[test]
+    fn a_stuffed_line_is_not_touched() {
+        let mut f = BodyFramer::new();
+        f.push(b"..hidden\r\n");
+        assert_eq!(f.flush(), b"..hidden\r\n");
+    }
+
+    #[test]
+    fn a_bare_newline_becomes_crlf() {
+        let mut f = BodyFramer::new();
+        f.push(b"hello\n");
+        assert_eq!(f.flush(), b"hello\r\n");
+    }
+
+    #[test]
+    fn the_terminator_is_recognised_in_both_spellings() {
+        assert!(matches!(
+            BodyFramer::new().push(b".\r\n"),
+            BodyPiece::Terminator
+        ));
+        assert!(matches!(
+            BodyFramer::new().push(b".\n"),
+            BodyPiece::Terminator
+        ));
+    }
+
+    /// Nothing goes out before the staging buffer is full, so a short piece
+    /// leaves the framer with something to flush -- and mid-line, which is
+    /// what decides whether the next dot ends the message.
+    #[test]
+    fn a_partial_line_stays_mid_line_and_does_not_end_the_message() {
+        let mut f = BodyFramer::new();
+        assert!(matches!(
+            f.push_partial(b"no break here"),
+            BodyPiece::Pending
+        ));
+        // Still mid-line, so a following "." is body, not a terminator.
+        assert!(matches!(f.push(b".\r\n"), BodyPiece::Pending));
+        assert_eq!(f.flush(), b"no break here.\r\n");
+    }
+
+    /// The buffer is emitted when it fills, line break or not: a client may
+    /// send gigabytes without one, and nothing may accumulate while it does.
+    #[test]
+    fn a_full_buffer_is_emitted_without_a_line_break() {
+        let mut f = BodyFramer::new();
+        match f.push_partial(&vec![b'x'; WRITE_CHUNK]) {
+            BodyPiece::Chunk(c) => assert_eq!(c.len(), WRITE_CHUNK),
+            other => panic!("{other:?}"),
+        }
+        assert!(f.flush().is_empty());
+    }
+
+    /// A chunk that ends on a lone CR cannot be normalised yet: the byte is
+    /// held back rather than guessed at.
+    #[test]
+    fn a_trailing_cr_is_carried_to_the_next_piece() {
+        let mut f = BodyFramer::new();
+        f.push_partial(b"abc\r");
+        assert_eq!(f.flush(), b"abc");
+        f.push_partial(b"\ndef");
+        assert_eq!(f.flush(), b"\r\ndef");
+    }
+
+    /// The case that pins the held CR to the framer rather than to the
+    /// piece: with an LF after it both a kept and a dropped CR would end up
+    /// writing CRLF, so only a continuation that does *not* start with LF
+    /// tells the two apart.
+    #[test]
+    fn a_held_cr_survives_a_flush_with_no_lf_after_it() {
+        let mut f = BodyFramer::new();
+        f.push_partial(b"abc\r");
+        assert_eq!(f.flush(), b"abc");
+        f.push_partial(b"def");
+        assert_eq!(f.flush(), b"\r\ndef");
+    }
+
+    /// A held CR can never be stranded by the terminator: holding one takes
+    /// a partial line, which leaves the framer mid-line, and the terminator
+    /// is only ever reported at a line start.
+    #[test]
+    fn a_held_cr_cannot_be_stranded_by_the_terminator() {
+        let mut f = BodyFramer::new();
+        f.push_partial(b"abc\r");
+        assert!(matches!(f.push(b".\r\n"), BodyPiece::Pending));
+        assert_eq!(f.flush(), b"abc\r\n.\r\n");
     }
 }

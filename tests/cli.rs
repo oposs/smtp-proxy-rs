@@ -118,7 +118,7 @@ fn help_lists_the_perl_flags() {
         "--loglevel",
         "--smtplog",
         "--credentials",
-        "--max_message_size",
+        "--max_header_size",
         "--man",
     ] {
         assert!(text.contains(flag), "missing {flag} in\n{text}");
@@ -270,7 +270,7 @@ fn man_exits_0_with_the_long_description() {
         stdout.contains("Starts an SMTP server on the listen host and port."),
         "{stdout}"
     );
-    assert!(stdout.contains("--max_message_size"), "{stdout}");
+    assert!(stdout.contains("--max_header_size"), "{stdout}");
 }
 
 #[test]

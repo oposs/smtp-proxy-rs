@@ -71,11 +71,11 @@ pub struct Cli {
     #[arg(long, help = "include username and password info in the smtplog")]
     pub credentials: bool,
     #[arg(
-        long = "max_message_size",
-        default_value_t = 1 << 30,
-        help = "largest message accepted, in bytes"
+        long = "max_header_size",
+        default_value_t = 1 << 20,
+        help = "largest header block accepted, in bytes"
     )]
-    pub max_message_size: usize,
+    pub max_header_size: usize,
     #[arg(
         long = "upstream_tls",
         value_enum,
@@ -149,7 +149,7 @@ pub struct Config {
     pub loglevel: String,
     pub smtplog: Option<PathBuf>,
     pub credentials: bool,
-    pub max_message_size: usize,
+    pub max_header_size: usize,
     pub upstream_tls: UpstreamTlsMode,
     pub upstream_tls_ca: Option<PathBuf>,
     pub upstream_tls_insecure: bool,
@@ -236,7 +236,7 @@ pub fn parse_args() -> Config {
         loglevel: cli.loglevel.clone(),
         smtplog: cli.smtplog.clone(),
         credentials: cli.credentials,
-        max_message_size: cli.max_message_size,
+        max_header_size: cli.max_header_size,
         upstream_tls: cli.upstream_tls,
         upstream_tls_ca: cli.upstream_tls_ca.clone(),
         upstream_tls_insecure: cli.upstream_tls_insecure,

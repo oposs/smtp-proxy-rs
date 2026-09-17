@@ -86,10 +86,17 @@ accumulate-then-hand-over loop and becomes a pump.
 
 **`DataReader` (`server/data.rs`)** splits into what it always was: a header
 collector bounded by `--max_header_size`, and a body framer that emits line
-slices it does not retain. The `body` field, `remaining_capacity`,
-`mark_too_large` and `TERMINATOR_SLACK` all go. That slack existed only to
-reconcile a byte cap against a line reader, and there is no byte cap on the
-body any more.
+slices it does not retain. The `body` field goes with `DataReader`.
+
+*Corrected during task 7.* `remaining_capacity`, `mark_too_large` and
+`TERMINATOR_SLACK` do **not** go: they survive on the header collector,
+rescoped to the header block. The argument for deleting them -- there is no
+byte cap on the body any more -- is body-scoped and does not reach the header
+block, which 3.3 says is still held whole and still needs a bound. Delete that
+budget with no replacement and `next_line` has nothing to say while headers
+are collected, so the same memory hole reopens on the session's own buffer.
+The slack reconciles that surviving byte cap against a line reader, which is
+still what the terminator and the blank line need.
 
 **`Handler` (`server/mod.rs`)**: `headers()` and `message()` collapse into
 
@@ -296,8 +303,8 @@ Three details:
 - `format_message` (`proxy.rs`)
 - `normalize_and_stuff` (`relay.rs`)
 - `relay_message` (`proxy.rs`), split across `open_body` and the sink
-- `DataReader`'s `body`, `remaining_capacity`, `mark_too_large`, and
-  `TERMINATOR_SLACK` with its explanatory comment
+- `DataReader`'s `body` field (`remaining_capacity`, `mark_too_large` and
+  `TERMINATOR_SLACK` survive, rescoped to the header block -- see section 4)
 - the `tokio::spawn` and `.in_current_span()` in `headers()`
 - `--max_message_size`
 

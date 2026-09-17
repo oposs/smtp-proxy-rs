@@ -13,6 +13,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, warn};
 
 use crate::api::Recipient;
+use crate::server::data::WRITE_CHUNK;
 use crate::smtp::dsn::{is_mail_dsn_keyword, is_rcpt_dsn_keyword};
 use crate::smtp::extensions::{Extensions, parse_extensions};
 use crate::smtp::params::Param;
@@ -396,15 +397,6 @@ pub fn normalize_and_stuff(message: &[u8]) -> Vec<u8> {
     }
     out
 }
-
-/// The message body is written in pieces of this size, each under its own
-/// timer. Spec 6 gives the relay an *inactivity* timeout, so what has to
-/// hold is "some progress within the timeout", not "the whole body within
-/// the timeout": a single deadline over the payload would abort a healthy
-/// but merely slow upstream, and at the default 1 GiB message cap it would
-/// demand a sustained 17 MB/s. At 64 KiB a chunk the 60 s default asks the
-/// upstream for about 1 KB/s, which no working relay fails.
-const WRITE_CHUNK: usize = 64 * 1024;
 
 /// The name in every EHLO and HELO this proxy sends upstream.
 ///

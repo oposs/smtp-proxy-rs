@@ -154,8 +154,8 @@ Options:
           optional detailed log file of SMTP commands and responses
       --credentials
           include username and password info in the smtplog
-      --max_message_size <MAX_MESSAGE_SIZE>
-          largest message accepted, in bytes [default: 1073741824]
+      --max_header_size <MAX_HEADER_SIZE>
+          largest header block accepted, in bytes [default: 1048576]
       --upstream_tls <UPSTREAM_TLS>
           TLS on the connection to the upstream: off, opportunistic (STARTTLS when offered),
           required (STARTTLS always), implicit (TLS from the first byte) [default: opportunistic]
@@ -197,14 +197,16 @@ this is then relayed to the client.
 
 - TLS 1.0 and 1.1 are no longer offered (rustls only implements TLS 1.2 and
   1.3).
-- A message larger than 1 GiB is refused with 552; the limit is configurable
-  with `--max_message_size`.
+- A header block larger than 1 MiB is refused with 552; the limit is
+  configurable with `--max_header_size`. The message as a whole carries no
+  proxy limit: the only stated limit is the upstream's `SIZE`, which is
+  advertised to the client and forwarded on `MAIL FROM`.
 - A command line that reaches 64 KiB without ending is answered
   `500 Line too long` and the connection is closed. The Perl grew its command
   buffer without any limit. RFC 5321 4.5.3.1.4 caps a command line at 512
   octets, so no working client can reach this.
 - Debug-level data dumps are JSON rather than Perl `Data::Dumper` output.
-- Eleven new flags: `--version`, `--max_message_size`, `--upstream_tls`,
+- Eleven new flags: `--version`, `--max_header_size`, `--upstream_tls`,
   `--upstream_tls_ca`, `--upstream_tls_insecure`, `--max_connections`,
   `--max_connections_per_ip`, `--max_messages_per_minute`, `--max_recipients`,
   `--drain_timeout` and `--greeting_timeout`. Every flag the Perl had is still

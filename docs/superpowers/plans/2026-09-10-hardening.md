@@ -1389,6 +1389,16 @@ These are deliberate. The gate will report them; they are not defects.
   `/^\d{3}[- ](\S+)/` fails to match such a line and drops it entirely.
   Consequence: against such an upstream this proxy may learn -- and therefore
   advertise -- an extension the Perl would have ignored.
+- **Task 7: `--max_message_size` is gone, replaced by `--max_header_size`
+  (default 1 MiB).** The proxy stopped having an opinion about message size:
+  the only stated limit is the upstream's `SIZE`, advertised to the client and
+  forwarded on `MAIL FROM` (the two bullets above). The header block is the
+  one thing the proxy still holds whole -- it parses it -- so it is the one
+  thing still capped, and a block over the cap is refused with `552 Header
+  block exceeds maximum size of <n> bytes`, spoken at the terminator so that
+  the rest of the message is drained rather than read as commands. Both flags
+  are this proxy's own; the Perl had neither, and no size cap of any kind, so
+  the "same CLI flags as the Perl" constraint is untouched.
 
 ### Test-suite notes for Tasks 20-21 (CI)
 

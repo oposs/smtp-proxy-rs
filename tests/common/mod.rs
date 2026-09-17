@@ -24,7 +24,7 @@ pub fn server_config(require_starttls: bool, require_auth: bool) -> ServerConfig
         require_starttls,
         require_auth,
         tls: Some(test_tls()),
-        max_message_size: 1 << 30,
+        max_header_size: 1 << 20,
         smtplog: None,
         idle_timeout: std::time::Duration::from_secs(600),
         // The production default is 30 s. Tests that care about the

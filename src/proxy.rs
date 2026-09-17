@@ -170,8 +170,8 @@ pub struct ProxyHandler {
 /// at all behind the colon, is logged and dropped (spec 5.2).
 ///
 /// **Divergence from the Perl, approved 2026-09-12.** The Perl splits on
-/// `/\r\n(?=$|\S)/` and so only ever on CRLF. `DataReader` accepts a bare LF
-/// as a line terminator (`server::data`, as the Perl's reader does), so a
+/// `/\r\n(?=$|\S)/` and so only ever on CRLF. `HeaderCollector` accepts a bare
+/// LF as a line terminator (`server::data`, as the Perl's reader does), so a
 /// header block written with bare LF genuinely arrives here -- and split on
 /// CRLF alone it becomes a *single* header whose value carries every
 /// remaining header. API-side header policy would then be evadable by
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(merge_headers(existing, &api), vec![h("To", "x@y.com")]);
     }
 
-    /// Item 3. `DataReader` accepts a bare LF, so this block genuinely
+    /// Item 3. `HeaderCollector` accepts a bare LF, so this block genuinely
     /// arrives. Split on CRLF alone it would be one header named `From`
     /// whose value carried `Subject` and `To` -- and the API would never see
     /// them to have an opinion about them.

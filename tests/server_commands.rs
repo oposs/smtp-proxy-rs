@@ -297,21 +297,26 @@ async fn auth_continuation_with_a_line_break_is_confused() {
 }
 
 #[tokio::test]
-async fn message_over_the_cap_is_refused_with_552() {
+async fn header_block_over_the_cap_is_refused_with_552() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    c.write_raw(&format!("Subject: x\r\n\r\n{}\r\n.\r\n", "y".repeat(100)))
-        .await;
+    // The body is not capped any more, so the oversized part has to be a
+    // header for the cap to see it at all.
+    c.write_raw(&format!(
+        "Subject: {}\r\n\r\nbody\r\n.\r\n",
+        "y".repeat(100)
+    ))
+    .await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
@@ -331,27 +336,26 @@ async fn a_command_line_that_never_ends_is_cut_off() {
 }
 
 #[tokio::test]
-async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
+async fn a_header_line_that_never_ends_is_capped_at_the_header_size() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    c.write_raw("Subject: x\r\n\r\n").await;
-    // 256 KiB of body in a single line with no newline anywhere. The cap is
-    // 64 bytes, so the server has to throw these away as they arrive instead
-    // of buffering them while it waits for the end of the line.
+    // 256 KiB of header in a single line with no newline anywhere. The cap
+    // is 64 bytes, so the server has to throw these away as they arrive
+    // instead of buffering them while it waits for the end of the line.
     for _ in 0..4 {
         c.write_raw(&"y".repeat(64 * 1024)).await;
     }
     c.write_raw("\r\n.\r\n").await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     // The connection survives and the next transaction works.
@@ -360,21 +364,22 @@ async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
 }
 
 #[tokio::test]
-async fn a_message_that_fills_the_cap_exactly_still_ends_normally() {
+async fn a_header_block_that_fills_the_cap_exactly_still_ends_normally() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    // 12 bytes of header plus a 52 byte body line is exactly the 64 byte cap,
-    // and the blank line between them costs nothing. That leaves no capacity
-    // at all for the terminator, which also costs nothing.
-    c.write_raw("Subject: x\r\n\r\n").await;
-    c.write_raw(&format!("{}\r\n", "z".repeat(50))).await;
+    // "Subject: " plus 53 characters plus CRLF is exactly the 64 byte cap,
+    // so the header block leaves no capacity at all for the terminator --
+    // which costs nothing.
+    let subject = format!("Subject: {}\r\n", "z".repeat(53));
+    assert_eq!(subject.len(), 64);
+    c.write_raw(&subject).await;
     // The terminator arrives split across two reads. The lone dot must not be
     // read as an over-cap line: doing so would discard the message, swallow
     // the rest of the terminator as a discarded tail, and leave the session
@@ -385,41 +390,64 @@ async fn a_message_that_fills_the_cap_exactly_still_ends_normally() {
     c.write_raw("\r\n").await;
     assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
     let rec = factory.recorded();
-    assert_eq!(rec.headers[0], "Subject: x\r\n");
-    assert_eq!(rec.bodies[0].len(), 52);
+    assert_eq!(rec.headers[0], subject);
+    assert!(rec.bodies[0].is_empty());
+}
+
+/// The body carries no cap any more, so a line longer than the reader will
+/// hold while it waits for a newline is not an error: it is taken in pieces
+/// and delivered whole. The stuffing dot rides on the first piece alone, and
+/// is undone exactly once.
+#[tokio::test]
+async fn a_body_line_longer_than_the_read_buffer_is_delivered_whole() {
+    let factory = ScriptedFactory::default();
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One body line of 128 KiB: twice the 64 KiB the reader holds before it
+    // gives up on finding the end of the line.
+    let long = "z".repeat(128 * 1024);
+    c.write_raw(&format!("..{long}\r\n.\r\n")).await;
+    assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
+    let rec = factory.recorded();
+    assert_eq!(rec.bodies[0], format!(".{long}\r\n").into_bytes());
 }
 
 #[tokio::test]
-async fn a_discarded_data_line_tail_is_not_mistaken_for_the_terminator() {
+async fn a_discarded_header_line_tail_is_not_mistaken_for_the_terminator() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    // The header block leaves 52 of the 64 bytes unspent, and the reader
-    // holds two bytes of slack for a half-read terminator, so 55 bytes
-    // without a newline are what tips the message over the cap. Each sleep
-    // lets the server consume what was sent and go back to waiting with an
-    // empty buffer, which fixes where the discard falls.
-    c.write_raw("Subject: x\r\n\r\n").await;
+    // The first header line leaves 52 of the 64 bytes unspent, and the
+    // collector holds two bytes of slack for a half-read terminator, so 55
+    // bytes without a newline are what tips the block over the cap. Each
+    // sleep lets the server consume what was sent and go back to waiting with
+    // an empty buffer, which fixes where the discard falls.
+    c.write_raw("Subject: x\r\n").await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.write_raw(&"y".repeat(55)).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // The rest of that same body line now happens to be a lone dot. It ends
+    // The rest of that same header line now happens to be a lone dot. It ends
     // the line, but the line began 55 bytes ago, so this is not a dot on a
     // line of its own and must not end the message. Reading it as the
-    // terminator would reply 552 here and leave the rest of the body to be
+    // terminator would reply 552 here and leave the rest of the message to be
     // parsed as commands.
     c.write_raw(".\r\n").await;
     c.write_raw("still inside the message\r\n").await;
     c.write_raw(".\r\n").await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     // Nothing from the message body was taken for a command.

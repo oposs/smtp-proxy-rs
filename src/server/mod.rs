@@ -138,7 +138,7 @@ pub struct ServerConfig {
     pub require_auth: bool,
     /// None means STARTTLS is not offered (tests only; production always has it).
     pub tls: Option<Arc<rustls::ServerConfig>>,
-    pub max_message_size: usize,
+    pub max_header_size: usize,
     pub smtplog: Option<Arc<crate::smtplog::SmtpLog>>,
     /// Inactivity timeout on the client connection. The Perl arms this only
     /// after STARTTLS (600 s) and leaves the pre-TLS phase untimed; here it

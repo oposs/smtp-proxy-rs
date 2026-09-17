@@ -13,7 +13,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
 use crate::server::auth::{PASSWORD_CHALLENGE, USERNAME_CHALLENGE, decode_login, decode_plain};
-use crate::server::data::{DataEvent, DataReader};
+use crate::server::data::{HeaderCollector, HeaderEvent, is_terminator};
 use crate::server::{Handler, Rejection, ServerConfig};
 use crate::smtp::command::{Command, CommandError, parse_command, take_line};
 use crate::smtp::dsn::{DsnCommand, validate_dsn};
@@ -30,11 +30,11 @@ impl<T: AsyncRead + AsyncWrite + Send> AsyncReadWrite for T {}
 /// to keep a client that never sends a newline from filling memory.
 const MAX_COMMAND_BUFFER: usize = 64 * 1024;
 
-/// Bytes of headroom the DATA reader keeps on top of what the size cap still
-/// allows, so that a half-read terminator is never mistaken for an over-cap
-/// line. The terminator and the blank line that ends the header block are
-/// both free of charge, and the longest either can be while still incomplete
-/// is `.\r`.
+/// Bytes of headroom the header collector keeps on top of what the header
+/// cap still allows, so that a half-read terminator is never mistaken for an
+/// over-cap line. The terminator and the blank line that ends the header
+/// block are both free of charge, and the longest either can be while still
+/// incomplete is `.\r`.
 const TERMINATOR_SLACK: usize = 2;
 
 /// What one read attempt produced.
@@ -273,7 +273,7 @@ impl<H: Handler> Session<H> {
     ///
     /// `max_incomplete` bounds the bytes held while no newline has arrived.
     /// Without it a client that sends bytes and never a newline grows the
-    /// buffer without limit: `DataReader` cannot help, because `push_line`
+    /// buffer without limit: `HeaderCollector` cannot help, because `push_line`
     /// only ever sees lines that are already complete.
     async fn next_line(&mut self, max_incomplete: usize) -> std::io::Result<Line> {
         // A half-written first command does not buy the longer budget: the
@@ -657,38 +657,55 @@ impl<H: Handler> Session<H> {
     async fn read_message(&mut self) -> std::io::Result<Flow> {
         self.send(Reply::new(354, "End data with <CR><LF>.<CR><LF>"))
             .await?;
-        let mut reader = DataReader::new(self.config.max_message_size);
+        let mut collector = HeaderCollector::new(self.config.max_header_size);
         let mut headers_error: Option<String> = None;
         let mut logged_mb = 0usize;
         let mut received = 0usize;
-        // Set when *our own* size cap discarded the message. An upstream may
+        // Set when *our own* header cap discarded the message. An upstream may
         // now answer 552 as well (a handler rejection carries the upstream's
         // own code), and that is a different thing entirely: it leaves no
         // half-read transaction behind here.
         let mut too_large = false;
-        // Set when an unterminated line was thrown away mid-flight: the rest
-        // of that line is still to come, and must not be read as a line of
-        // its own -- a tail that happened to be `.` would end DATA early and
-        // leave the remaining body to be parsed as commands.
-        let mut discarding_line_tail = false;
+        // The header block is behind us and body lines are arriving.
+        //
+        // **Task 9 removes this bridge.** The body is still accumulated whole,
+        // and still unstuffed as it arrives, because the write path still
+        // re-stuffs it (`relay.rs`, `fn normalize_and_stuff`) and
+        // `Handler::message` still takes a finished body. Feeding that path
+        // the verbatim lines `BodyFramer` (`server::data`) produces would add
+        // a dot to every stuffed line. Task 8 replaces both halves at once,
+        // with the framer and a streaming sink.
+        let mut headers_done = false;
+        let mut body: Vec<u8> = Vec::new();
+        // False while the tail of a line that was already taken -- because it
+        // outgrew the read budget -- is still to come. That tail ends a line
+        // without beginning one, so it must not be read as a line of its own:
+        // a tail that happened to be `.` would end DATA early and leave the
+        // rest of the body to be parsed as commands.
+        let mut at_line_start = true;
         let outcome: Result<String, Rejection> = loop {
-            // An incomplete line counts against the cap like any other bytes.
-            // Once the reader is already discarding, the cap has nothing left
-            // to say and a plain byte bound keeps the drain bounded.
+            // An incomplete header line counts against the cap like any other
+            // bytes. Once the collector is discarding, or the header block is
+            // behind us, the cap has nothing left to say and a plain byte
+            // bound keeps the reader bounded.
             //
             // TERMINATOR_SLACK covers the two lines that cost nothing: the
-            // terminator and the blank line that ends the headers. A message
-            // that fills the cap exactly leaves no capacity, and the ".\r\n"
-            // or "\r\n" that follows can still be split across reads. Held
-            // half-read it is at most ".\r", two bytes, so without the slack
-            // it would look like an over-cap line, the message would be
+            // terminator and the blank line that ends the headers. A header
+            // block that fills the cap exactly leaves no capacity, and the
+            // ".\r\n" or "\r\n" that follows can still be split across reads.
+            // Held half-read it is at most ".\r", two bytes, so without the
+            // slack it would look like an over-cap line, the message would be
             // discarded, and the rest of the terminator would be eaten as a
             // discarded tail -- leaving the session waiting for a terminator
-            // that had already arrived. Two bytes cannot hide a real line:
-            // any body line costs at least its own terminator.
-            let budget = reader
-                .remaining_capacity()
-                .map_or(MAX_COMMAND_BUFFER, |left| left + TERMINATOR_SLACK);
+            // that had already arrived. Two bytes cannot hide a real header
+            // line: any header line costs at least its own terminator.
+            let budget = if headers_done {
+                MAX_COMMAND_BUFFER
+            } else {
+                collector
+                    .remaining_capacity()
+                    .map_or(MAX_COMMAND_BUFFER, |left| left + TERMINATOR_SLACK)
+            };
             let line = match self.next_line(budget).await? {
                 Line::Got(line) => line,
                 Line::Eof => {
@@ -696,61 +713,101 @@ impl<H: Handler> Session<H> {
                     return Ok(Flow::Close);
                 }
                 Line::TooLong => {
-                    debug!(
-                        "Message from {} crossed the size cap inside an unterminated line",
-                        self.client
-                    );
-                    reader.mark_too_large();
-                    self.buf.clear();
-                    discarding_line_tail = true;
+                    let partial = std::mem::take(&mut self.buf);
+                    match (too_large, headers_done) {
+                        // Already draining: these bytes go the way of the rest.
+                        (true, _) => {}
+                        // Nothing caps the body, so a line without an end is
+                        // not an error: take what has arrived and read on.
+                        // Only the first piece of a line can carry the
+                        // stuffing dot, and only a whole line can be the
+                        // terminator, which this is far too long to be.
+                        (false, true) if at_line_start => {
+                            body.extend_from_slice(partial.strip_prefix(b".").unwrap_or(&partial));
+                        }
+                        (false, true) => body.extend_from_slice(&partial),
+                        (false, false) => {
+                            debug!(
+                                "Header block from {} crossed the size cap inside an \
+                                 unterminated line",
+                                self.client
+                            );
+                            collector.mark_too_large();
+                            too_large = true;
+                        }
+                    }
+                    at_line_start = false;
                     continue;
                 }
             };
-            if discarding_line_tail {
-                discarding_line_tail = false;
-                continue;
-            }
             received += line.len();
             if received / 1_000_000 > logged_mb {
                 logged_mb = received / 1_000_000;
                 debug!("received {logged_mb} MB data");
             }
-            match reader.push_line(&line) {
+            if !at_line_start {
+                at_line_start = true;
+                if headers_done && !too_large {
+                    body.extend_from_slice(&line);
+                }
+                continue;
+            }
+            if too_large {
+                // Spec 6: the 552 is spoken at the terminator, never when the
+                // cap is crossed, so that the rest of the message is drained
+                // as a message instead of being read as commands.
+                if is_terminator(&line) {
+                    break Err(Rejection {
+                        code: 552,
+                        text: format!(
+                            "Header block exceeds maximum size of {} bytes",
+                            self.config.max_header_size
+                        ),
+                    });
+                }
+                continue;
+            }
+            if headers_done {
+                if is_terminator(&line) {
+                    debug!(
+                        "Body received {} Bytes. Resolving Body Promise.",
+                        body.len()
+                    );
+                    if let Some(e) = headers_error.take() {
+                        break Err(Rejection { code: 550, text: e });
+                    }
+                    break self.handler.message(std::mem::take(&mut body)).await;
+                }
+                body.extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
+                continue;
+            }
+            match collector.push_line(&line) {
                 None => {}
-                Some(DataEvent::HeadersComplete(h)) => {
+                Some(HeaderEvent::Complete(h)) => {
+                    headers_done = true;
                     debug!("Header received. Resolving Header Promise");
                     if let Err(e) = self.handler.headers(h).await {
                         headers_error = Some(e);
                     }
                 }
-                Some(DataEvent::TooLarge) => {
-                    too_large = true;
-                    break Err(Rejection {
-                        code: 552,
-                        text: format!(
-                            "Message exceeds maximum size of {} bytes",
-                            self.config.max_message_size
-                        ),
-                    });
-                }
-                Some(DataEvent::MessageComplete(body)) => {
-                    if let Some(h) = reader.take_pending_headers() {
+                Some(HeaderEvent::Terminator) => {
+                    // The terminator before any blank line: the message is a
+                    // header block and nothing else.
+                    if let Some(h) = collector.take_pending() {
                         debug!(
                             "Header received (empty Body). Resolving Header Promise and Empty Body Promise."
                         );
                         if let Err(e) = self.handler.headers(h).await {
                             headers_error = Some(e);
                         }
-                    } else {
-                        debug!(
-                            "Body received {} Bytes. Resolving Body Promise.",
-                            body.len()
-                        );
                     }
                     if let Some(e) = headers_error.take() {
                         break Err(Rejection { code: 550, text: e });
                     }
-                    break self.handler.message(body).await;
+                    break self.handler.message(Vec::new()).await;
+                }
+                Some(HeaderEvent::TooLarge) => {
+                    too_large = true;
                 }
             }
         };
