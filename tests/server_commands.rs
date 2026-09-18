@@ -8,6 +8,7 @@ use common::raw_client::RawClient;
 use common::{server_config, start_server};
 use smtp_proxy::relay::UpstreamVerdict;
 use smtp_proxy::server::Rejection;
+use smtp_proxy::server::data::WRITE_CHUNK;
 
 /// A connection that has been greeted. `require_starttls` and `require_auth`
 /// are both off, so the very next command falls through to `WantMail`.
@@ -502,4 +503,104 @@ async fn an_upstream_that_drops_mid_body_closes_the_client_connection() {
         c.expect_close().await,
         "a dead upstream must close the client too"
     );
+}
+
+/// A body of complete short lines whose total is the first at or above
+/// `WRITE_CHUNK`, so the framer stages every line and hands the sink its one
+/// and only `BodyPiece::Chunk` on the very last of them -- with nothing left
+/// over after it.
+///
+/// Short lines rather than one long one on purpose. Every read then ends on a
+/// line boundary, so the pump takes the `Line::Got` path each time and the
+/// test cannot come out differently depending on where the socket happened to
+/// split a 64 KiB write.
+fn body_of_exactly_one_write_chunk() -> String {
+    let line = format!("{}\r\n", "z".repeat(100));
+    let body = line.repeat(WRITE_CHUNK.div_ceil(line.len()));
+    assert!(body.len() >= WRITE_CHUNK);
+    assert!(
+        body.len() - line.len() < WRITE_CHUNK,
+        "the last line has to be the one that fills the chunk"
+    );
+    body
+}
+
+/// The mirror rule with something to say, and the only route that reaches
+/// `Session::mirror` at all: the sink has to be written *during* the body,
+/// which takes a staged `WRITE_CHUNK`. A smaller message stages and writes
+/// once, after the terminator, where there is nothing left to mirror -- which
+/// is the road `an_upstream_that_drops_mid_body_closes_the_client_connection`
+/// takes.
+///
+/// Three promises, one assertion each. The upstream's reply reaches the
+/// client verbatim and where the upstream gave it. What the client goes on
+/// writing is read away instead of being parsed as commands. And the
+/// transaction is cleared, so the session is ready for the next one.
+#[tokio::test]
+async fn an_upstream_that_refuses_mid_body_is_mirrored_and_the_rest_read_away() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    // In WantGreeting, so this greeting resets nothing: the count starts at
+    // zero.
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n"); // reset 1
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // The client is still inside DATA and still writing. A server that has
+    // already answered reads that only to resync, and a line that would draw
+    // a reply of its own as a command is how the difference becomes visible.
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    // So the next reply on the wire is this command's. Drop the drain from
+    // the mirror and the line above earns a 502 that arrives here instead.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
+    // MAIL opened the transaction and the mirror cleared it; NOOP is not a
+    // transaction boundary. Drop the `start_transaction` from the mirror and
+    // this is 1.
+    assert_eq!(factory.recorded().resets, 2);
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    // `finish` was never reached, so nothing was ever delivered.
+    assert!(factory.recorded().bodies.is_empty());
+}
+
+/// The other verdict on that same route. Nothing is invented on a dead
+/// upstream's behalf here either -- but here the client is still writing when
+/// the connection goes, which is what tells this apart from
+/// `an_upstream_that_drops_mid_body_closes_the_client_connection`.
+#[tokio::test]
+async fn an_upstream_that_drops_while_the_body_is_arriving_closes_the_client() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.sink_verdict = Some(UpstreamVerdict::Dropped));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One chunk's worth and not a byte more. The server has read all of it by
+    // the time the chunk is written, so nothing is left unread when it closes
+    // -- unread bytes would draw a reset and the close would stop being
+    // observable as a clean end of stream.
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert!(
+        c.expect_close().await,
+        "a dead upstream must close the client too, with no reply invented for it"
+    );
+    assert!(factory.recorded().bodies.is_empty());
 }
