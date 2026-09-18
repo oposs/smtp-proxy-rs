@@ -513,6 +513,9 @@ async fn the_envelope_reaches_the_upstream_before_the_body_ends() {
     assert!(c.command("DATA").await.starts_with("354"));
     c.write_raw("Subject: x\r\n\r\npartial body, no terminator yet\r\n")
         .await;
+    // The wait below is on the upstream's state, not on a reply, so nothing
+    // else will push these bytes out of the client's TLS buffer.
+    c.flush().await;
     // No terminator has been sent, so under a buffering proxy the upstream
     // would still be untouched.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -580,6 +583,10 @@ async fn a_client_that_hangs_up_mid_body_delivers_nothing() {
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
     c.write_raw("Subject: x\r\n\r\nhalf a body\r\n").await;
+    // Without this the half body would still be in the client's TLS buffer
+    // when the client goes away, and the test would silently shrink to "a
+    // client that hangs up right after DATA".
+    c.flush().await;
     // The envelope is already upstream, so this is the window the test is
     // about: everything but the terminator has been relayed.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
