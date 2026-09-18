@@ -568,6 +568,34 @@ async fn transparency_of_dots_and_multiple_mails_on_one_connection() {
     assert_eq!(r.api.calls()[1]["username"], "user");
 }
 
+/// Spec 5.1 and the seam it opens. The body reaches the sink verbatim, with
+/// the client's stuffing dot still on it, while the write path still stuffs
+/// the whole message once more (`relay.rs`, `fn normalize_and_stuff`). The
+/// sink has to undo the client's stuffing in between (`proxy.rs`, `fn
+/// unstuff_body`) or every stuffed line grows a third dot and the far end
+/// sees a message the client never wrote.
+///
+/// Three stuffed lines, because one dot is the easy case: a line that is
+/// nothing but a stuffed dot, one with text after it, and one whose dots
+/// keep going. Delete `unstuff_body` and each of them gains a dot.
+#[tokio::test]
+async fn a_stuffed_body_line_is_not_stuffed_a_second_time() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let msg = "Subject: x\r\n\r\n..foo\r\n..\r\n....bar\r\nplain\r\n";
+    assert!(
+        send_mail(&mut c, "a@b.com", &["x@y.com"], msg)
+            .await
+            .starts_with("250")
+    );
+    assert_eq!(
+        String::from_utf8(r.upstream.raw_messages()[0].clone()).unwrap(),
+        msg,
+        "the upstream must see exactly the bytes the client wrote"
+    );
+}
+
 #[tokio::test]
 async fn login_auth_end_to_end() {
     let r = rig(&["DSN"]).await;

@@ -12,9 +12,12 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info};
 
+use crate::relay::UpstreamVerdict;
 use crate::server::auth::{PASSWORD_CHALLENGE, USERNAME_CHALLENGE, decode_login, decode_plain};
-use crate::server::data::{HeaderCollector, HeaderEvent, is_terminator};
-use crate::server::{Handler, Rejection, ServerConfig};
+use crate::server::data::{
+    BodyFramer, BodyPiece, HeaderCollector, HeaderEvent, WRITE_CHUNK, is_terminator,
+};
+use crate::server::{BodySink, Handler, Rejection, ServerConfig};
 use crate::smtp::command::{Command, CommandError, parse_command, take_line};
 use crate::smtp::dsn::{DsnCommand, validate_dsn};
 use crate::smtp::reply::Reply;
@@ -45,6 +48,30 @@ enum Line {
     /// The budget ran out before a newline arrived. Nothing is consumed;
     /// the caller decides what to do with what is buffered.
     TooLong,
+}
+
+/// The Perl's cumulative `received <n> MB data` debug line
+/// (`Connection.pm`, `sub _dataLine`): one line per megabyte of DATA, header
+/// bytes and discarded bytes alike. It survives the split of DATA into a
+/// header phase, a body phase and a drain, which is the only reason it is a
+/// type rather than two locals.
+///
+/// Bytes of a line that outgrew the read budget are not counted, as they
+/// were not before: only complete lines reach [`ReceiptLog::note`].
+#[derive(Default)]
+struct ReceiptLog {
+    received: usize,
+    logged_mb: usize,
+}
+
+impl ReceiptLog {
+    fn note(&mut self, bytes: usize) {
+        self.received += bytes;
+        if self.received / 1_000_000 > self.logged_mb {
+            self.logged_mb = self.received / 1_000_000;
+            debug!("received {} MB data", self.logged_mb);
+        }
+    }
 }
 
 /// A client that simply went away. Routine, so it is logged once at info and
@@ -654,40 +681,28 @@ impl<H: Handler> Session<H> {
         }
     }
 
+    /// DATA, from the `354` to the reply that ends it.
+    ///
+    /// Three phases, in order: collect the header block, hand it to the
+    /// handler in exchange for a body sink, then pump body lines into that
+    /// sink until the terminator. Each phase has exactly one way out that is
+    /// not the next phase -- the client leaving, or a refusal -- and every
+    /// refusal is spoken at the terminator, never where it was decided, so
+    /// that the rest of the message is drained as a message instead of being
+    /// read as commands (spec 6).
     async fn read_message(&mut self) -> std::io::Result<Flow> {
         self.send(Reply::new(354, "End data with <CR><LF>.<CR><LF>"))
             .await?;
+        let mut log = ReceiptLog::default();
         let mut collector = HeaderCollector::new(self.config.max_header_size);
-        let mut headers_error: Option<String> = None;
-        let mut logged_mb = 0usize;
-        let mut received = 0usize;
-        // Set when *our own* header cap discarded the message. An upstream may
-        // now answer 552 as well (a handler rejection carries the upstream's
-        // own code), and that is a different thing entirely: it leaves no
-        // half-read transaction behind here.
-        let mut too_large = false;
-        // The header block is behind us and body lines are arriving.
-        //
-        // **Task 9 removes this bridge.** The body is still accumulated whole,
-        // and still unstuffed as it arrives, because the write path still
-        // re-stuffs it (`relay.rs`, `fn normalize_and_stuff`) and
-        // `Handler::message` still takes a finished body. Feeding that path
-        // the verbatim lines `BodyFramer` (`server::data`) produces would add
-        // a dot to every stuffed line. Task 8 replaces both halves at once,
-        // with the framer and a streaming sink.
-        let mut headers_done = false;
-        let mut body: Vec<u8> = Vec::new();
-        // False while the tail of a line that was already taken -- because it
-        // outgrew the read budget -- is still to come. That tail ends a line
-        // without beginning one, so it must not be read as a line of its own:
-        // a tail that happened to be `.` would end DATA early and leave the
-        // rest of the body to be parsed as commands.
-        let mut at_line_start = true;
-        let outcome: Result<String, Rejection> = loop {
+        // `true` while a body is still to come. The terminator can arrive
+        // inside the header block, and then there is nothing left to pump and
+        // nothing left to drain.
+        let (headers, body_follows) = loop {
             // An incomplete header line counts against the cap like any other
-            // bytes. Once the collector is discarding, or the header block is
-            // behind us, the cap has nothing left to say and a plain byte
-            // bound keeps the reader bounded.
+            // bytes. The collector never runs out of capacity here -- the two
+            // events that would empty it leave this loop -- so the fallback
+            // bound is a plain safety net and not a path.
             //
             // TERMINATOR_SLACK covers the two lines that cost nothing: the
             // terminator and the blank line that ends the headers. A header
@@ -699,118 +714,253 @@ impl<H: Handler> Session<H> {
             // discarded tail -- leaving the session waiting for a terminator
             // that had already arrived. Two bytes cannot hide a real header
             // line: any header line costs at least its own terminator.
-            let budget = if headers_done {
-                MAX_COMMAND_BUFFER
-            } else {
-                collector
-                    .remaining_capacity()
-                    .map_or(MAX_COMMAND_BUFFER, |left| left + TERMINATOR_SLACK)
-            };
+            let budget = collector
+                .remaining_capacity()
+                .map_or(MAX_COMMAND_BUFFER, |left| left + TERMINATOR_SLACK);
             let line = match self.next_line(budget).await? {
                 Line::Got(line) => line,
                 Line::Eof => {
                     info!("Client {} hung up during DATA", self.client);
                     return Ok(Flow::Close);
                 }
+                // The budget here is what the cap still allows, so a line with
+                // no end in sight has crossed it. What is buffered goes, and
+                // the drain starts mid-line: the rest of this line is still to
+                // come, and a tail that happened to be `.` must not be read as
+                // the terminator.
                 Line::TooLong => {
-                    let partial = std::mem::take(&mut self.buf);
-                    match (too_large, headers_done) {
-                        // Already draining: these bytes go the way of the rest.
-                        (true, _) => {}
-                        // Nothing caps the body, so a line without an end is
-                        // not an error: take what has arrived and read on.
-                        // Only the first piece of a line can carry the
-                        // stuffing dot, and only a whole line can be the
-                        // terminator, which this is far too long to be.
-                        (false, true) if at_line_start => {
-                            body.extend_from_slice(partial.strip_prefix(b".").unwrap_or(&partial));
-                        }
-                        (false, true) => body.extend_from_slice(&partial),
-                        (false, false) => {
-                            debug!(
-                                "Header block from {} crossed the size cap inside an \
-                                 unterminated line",
-                                self.client
-                            );
-                            collector.mark_too_large();
-                            too_large = true;
-                        }
-                    }
-                    at_line_start = false;
-                    continue;
+                    debug!(
+                        "Header block from {} crossed the size cap inside an unterminated line",
+                        self.client
+                    );
+                    // Both buffers go now rather than at the end of the
+                    // message: the drain below can run for as long as the
+                    // client keeps writing, and nothing will ever read either
+                    // of them again.
+                    self.buf.clear();
+                    collector.mark_too_large();
+                    return self.refuse_large_headers(false, &mut log).await;
                 }
             };
-            received += line.len();
-            if received / 1_000_000 > logged_mb {
-                logged_mb = received / 1_000_000;
-                debug!("received {logged_mb} MB data");
-            }
-            if !at_line_start {
-                at_line_start = true;
-                if headers_done && !too_large {
-                    body.extend_from_slice(&line);
-                }
-                continue;
-            }
-            if too_large {
-                // Spec 6: the 552 is spoken at the terminator, never when the
-                // cap is crossed, so that the rest of the message is drained
-                // as a message instead of being read as commands.
-                if is_terminator(&line) {
-                    break Err(Rejection {
-                        code: 552,
-                        text: format!(
-                            "Header block exceeds maximum size of {} bytes",
-                            self.config.max_header_size
-                        ),
-                    });
-                }
-                continue;
-            }
-            if headers_done {
-                if is_terminator(&line) {
-                    debug!(
-                        "Body received {} Bytes. Resolving Body Promise.",
-                        body.len()
-                    );
-                    if let Some(e) = headers_error.take() {
-                        break Err(Rejection { code: 550, text: e });
-                    }
-                    break self.handler.message(std::mem::take(&mut body)).await;
-                }
-                body.extend_from_slice(line.strip_prefix(b".").unwrap_or(&line));
-                continue;
-            }
+            log.note(line.len());
             match collector.push_line(&line) {
                 None => {}
                 Some(HeaderEvent::Complete(h)) => {
-                    headers_done = true;
                     debug!("Header received. Resolving Header Promise");
-                    if let Err(e) = self.handler.headers(h).await {
-                        headers_error = Some(e);
-                    }
+                    break (h, true);
                 }
                 Some(HeaderEvent::Terminator) => {
                     // The terminator before any blank line: the message is a
-                    // header block and nothing else.
-                    if let Some(h) = collector.take_pending() {
-                        debug!(
-                            "Header received (empty Body). Resolving Header Promise and Empty Body Promise."
-                        );
-                        if let Err(e) = self.handler.headers(h).await {
-                            headers_error = Some(e);
-                        }
-                    }
-                    if let Some(e) = headers_error.take() {
-                        break Err(Rejection { code: 550, text: e });
-                    }
-                    break self.handler.message(Vec::new()).await;
+                    // header block and nothing else. `take_pending` is `Some`
+                    // without fail here -- the two states that empty it, the
+                    // block delivered and the cap crossed, both leave this
+                    // loop -- and an empty block is the honest reading if it
+                    // ever were not.
+                    debug!(
+                        "Header received (empty Body). Resolving Header Promise and Empty Body Promise."
+                    );
+                    break (collector.take_pending().unwrap_or_default(), false);
                 }
                 Some(HeaderEvent::TooLarge) => {
-                    too_large = true;
+                    return self.refuse_large_headers(true, &mut log).await;
                 }
             }
         };
+        let mut sink = match self.handler.open_body(headers).await {
+            Ok(sink) => sink,
+            Err(Rejection { code, text }) => {
+                // The handler has refused in its own voice, and the client is
+                // still writing. Read the rest of the message away, then
+                // answer where every other DATA answer is given.
+                if body_follows
+                    && matches!(
+                        self.discard_to_terminator(true, &mut log).await?,
+                        Flow::Close
+                    )
+                {
+                    return Ok(Flow::Close);
+                }
+                self.state = State::WantMail;
+                return self.refuse_data(code, text).await;
+            }
+        };
+        if !body_follows {
+            return self.conclude(sink.finish().await).await;
+        }
+        let mut framer = BodyFramer::new();
+        let mut body_bytes = 0usize;
+        // Mirrors the framer's own view of where a line begins, as of the
+        // piece just pushed. The framer keeps it privately for the
+        // terminator; the session needs it for the one thing the framer
+        // cannot answer for, a drain that starts mid-line. Every arm below
+        // sets it before anything reads it, so it starts with no value.
+        let mut at_line_start;
+        loop {
+            let piece = match self.next_line(WRITE_CHUNK).await? {
+                Line::Got(line) => {
+                    log.note(line.len());
+                    at_line_start = true;
+                    framer.push(&line)
+                }
+                // No newline within a chunk's worth of bytes. There is no
+                // body cap to refuse it against, so it goes out as it is and
+                // the framer stays mid-line -- which is what stops `self.buf`
+                // growing with a body that has no line breaks at all.
+                //
+                // The slice is never empty, so `push_partial` needs no guard
+                // for one: `next_line` reports `TooLong` only once the buffer
+                // is already longer than the budget it was given.
+                Line::TooLong => {
+                    let partial = std::mem::take(&mut self.buf);
+                    at_line_start = false;
+                    framer.push_partial(&partial)
+                }
+                Line::Eof => {
+                    info!("Client {} hung up during DATA", self.client);
+                    // `sink` is dropped here: the upstream connection closes
+                    // with no terminator, so nothing is delivered.
+                    return Ok(Flow::Close);
+                }
+            };
+            match piece {
+                // Staged, and not yet a write's worth. Read on.
+                BodyPiece::Pending => {}
+                BodyPiece::Chunk(chunk) => {
+                    body_bytes += chunk.len();
+                    if let Err(verdict) = sink.write(&chunk).await {
+                        return self.mirror(verdict, at_line_start, &mut log).await;
+                    }
+                }
+                BodyPiece::Terminator => break,
+            }
+        }
+        // What is staged below a chunk is still body. Without this every
+        // message shorter than `WRITE_CHUNK` would be delivered empty.
+        let rest = framer.flush();
+        body_bytes += rest.len();
+        if !rest.is_empty()
+            && let Err(verdict) = sink.write(&rest).await
+        {
+            // No drain: the terminator has already been read, so what would
+            // be drained is the *next* client's commands.
+            return self.conclude(Err(verdict)).await;
+        }
+        debug!("Body received {body_bytes} Bytes. Resolving Body Promise.");
+        self.conclude(sink.finish().await).await
+    }
+
+    /// Spec 6: the `552` is spoken at the terminator, never when the cap is
+    /// crossed, so that the rest of the message is drained as a message
+    /// instead of being read as commands.
+    ///
+    /// `at_line_start` says whether the bytes still to come begin a line; see
+    /// [`Session::discard_to_terminator`].
+    async fn refuse_large_headers(
+        &mut self,
+        at_line_start: bool,
+        log: &mut ReceiptLog,
+    ) -> std::io::Result<Flow> {
+        if matches!(
+            self.discard_to_terminator(at_line_start, log).await?,
+            Flow::Close
+        ) {
+            return Ok(Flow::Close);
+        }
+        self.state = State::WantMail;
+        // Our own cap discarded the message, so there is a half-read
+        // transaction here to clear. An upstream that answers `552` is a
+        // different thing entirely and leaves none.
+        self.start_transaction();
+        self.refuse_data(
+            552,
+            format!(
+                "Header block exceeds maximum size of {} bytes",
+                self.config.max_header_size
+            ),
+        )
+        .await
+    }
+
+    /// Reads the rest of the message and throws it away, up to and including
+    /// the terminator. The one alternative -- answering where the refusal was
+    /// decided and going back to reading commands -- would parse the body as
+    /// commands.
+    ///
+    /// `at_line_start` is false when the tail of a line that was already taken
+    /// is still to come. That tail ends a line without beginning one, so it
+    /// must not be read as a line of its own: a tail that happened to be `.`
+    /// would end DATA early and leave the rest of the body to be parsed as
+    /// commands.
+    ///
+    /// The terminator is tested here rather than asked of the collector on
+    /// purpose: a `HeaderCollector` that is discarding answers `TooLarge` to
+    /// every line, the terminator included.
+    async fn discard_to_terminator(
+        &mut self,
+        mut at_line_start: bool,
+        log: &mut ReceiptLog,
+    ) -> std::io::Result<Flow> {
+        loop {
+            match self.next_line(MAX_COMMAND_BUFFER).await? {
+                Line::Got(line) => {
+                    log.note(line.len());
+                    if at_line_start && is_terminator(&line) {
+                        return Ok(Flow::Continue);
+                    }
+                    at_line_start = true;
+                }
+                Line::TooLong => {
+                    self.buf.clear();
+                    at_line_start = false;
+                }
+                Line::Eof => {
+                    info!("Client {} hung up during DATA", self.client);
+                    return Ok(Flow::Close);
+                }
+            }
+        }
+    }
+
+    /// The proxy is a mirror during DATA: whatever the upstream did to us,
+    /// we do to the client. A client is not insulated from what it would
+    /// have met talking to the upstream directly.
+    ///
+    /// This is the mid-body form, for a verdict that arrived while the client
+    /// was still writing. [`Session::conclude`] is the same rule once the
+    /// terminator is in.
+    async fn mirror(
+        &mut self,
+        verdict: UpstreamVerdict,
+        at_line_start: bool,
+        log: &mut ReceiptLog,
+    ) -> std::io::Result<Flow> {
+        match verdict {
+            // A verdict with nothing to say closes the client wherever it
+            // arrives, and there is nothing to drain for: the client is told
+            // by the close itself.
+            UpstreamVerdict::Dropped => self.conclude(Err(UpstreamVerdict::Dropped)).await,
+            UpstreamVerdict::Replied { code, text } => {
+                self.state = State::WantMail;
+                // Sent now, mid-DATA, exactly as the upstream sent it to us.
+                // What follows is body the client is still writing, and a
+                // server that has already answered reads it only to resync.
+                if matches!(self.refuse_data(code, text).await?, Flow::Close) {
+                    return Ok(Flow::Close);
+                }
+                let flow = self.discard_to_terminator(at_line_start, log).await?;
+                self.start_transaction();
+                Ok(flow)
+            }
+        }
+    }
+
+    /// The upstream's last word on a message whose terminator is already
+    /// read. [`Session::mirror`] without the drain, because there is nothing
+    /// left of the message to drain.
+    async fn conclude(
+        &mut self,
+        outcome: Result<String, UpstreamVerdict>,
+    ) -> std::io::Result<Flow> {
         self.state = State::WantMail;
         match outcome {
             Ok(message) => {
@@ -827,23 +977,33 @@ impl<H: Handler> Session<H> {
                     );
                     return Ok(Flow::Close);
                 }
+                Ok(Flow::Continue)
             }
-            Err(Rejection { code, text }) => {
-                debug!("DATA rejected for {} {text}", self.client);
-                if too_large {
-                    self.start_transaction();
-                }
-                if let Err(e) = self.send(Reply::new(code, text.clone())).await {
-                    if !is_hangup(&e) {
-                        return Err(e);
-                    }
-                    info!(
-                        "Client {} left before the rejection could be sent: {text}",
-                        self.client
-                    );
-                    return Ok(Flow::Close);
-                }
+            Err(UpstreamVerdict::Replied { code, text }) => self.refuse_data(code, text).await,
+            Err(UpstreamVerdict::Dropped) => {
+                info!(
+                    "Upstream closed during DATA for {}; closing the client too",
+                    self.client
+                );
+                Ok(Flow::Close)
             }
+        }
+    }
+
+    /// The reply that refuses a message, with spec 4.7's allowance for a
+    /// client that has already gone: the reply is dropped and logged at info,
+    /// never reported as an error.
+    async fn refuse_data(&mut self, code: u16, text: String) -> std::io::Result<Flow> {
+        debug!("DATA rejected for {} {text}", self.client);
+        if let Err(e) = self.send(Reply::new(code, text.clone())).await {
+            if !is_hangup(&e) {
+                return Err(e);
+            }
+            info!(
+                "Client {} left before the rejection could be sent: {text}",
+                self.client
+            );
+            return Ok(Flow::Close);
         }
         Ok(Flow::Continue)
     }

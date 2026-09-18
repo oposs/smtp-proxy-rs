@@ -3,15 +3,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use tokio::task::JoinHandle;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::{
-    ApiClient, ApiError, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
+    ApiClient, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
 };
 use crate::ratelimit::RateLimiter;
-use crate::relay::{Envelope, RelayConfig, UpstreamCaps, probe, relay};
-use crate::server::{Handler, HandlerFactory, Rejection};
+use crate::relay::{Envelope, RelayConfig, UpstreamCaps, UpstreamVerdict, probe, relay};
+use crate::server::{BodySink, Handler, HandlerFactory, Rejection};
 use crate::smtp::params::Param;
 
 pub struct ProxyConfig {
@@ -152,9 +151,6 @@ struct Transaction {
     mail_params: Vec<Param>,
     recipients: Vec<Recipient>,
     headers: Vec<RequestHeader>,
-    /// The API call, started as soon as the headers are in and awaited when
-    /// the body is complete, so it overlaps the body transfer (spec 2).
-    api_call: Option<JoinHandle<Result<CheckResponse, ApiError>>>,
 }
 
 pub struct ProxyHandler {
@@ -309,6 +305,34 @@ pub fn format_message(headers: &[RequestHeader], body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Undoes the client's dot stuffing on a body that arrived verbatim.
+///
+/// **Task 9 removes this, together with the second stuffing it undoes.**
+/// `BodyFramer` passes body lines through exactly as the client wrote them
+/// (`server::data`, spec 5.1), stuffing dot included, while the write path
+/// still stuffs the whole message a second time (`relay.rs`, `fn
+/// normalize_and_stuff`). Without this a client's `..foo` would leave the
+/// proxy as `...foo`.
+///
+/// A line begins at offset 0 or after a CRLF, which is exactly where
+/// `normalize_and_stuff` puts a dot back. The framer has already normalised
+/// every line ending to CRLF, so a bare CR is data here and begins no line.
+/// The body holds no terminator -- `BodyFramer::push` reports that without
+/// appending it -- so nothing here can be turned into one.
+fn unstuff_body(body: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(body.len());
+    let mut at_line_start = true;
+    for &b in body {
+        if at_line_start && b == b'.' {
+            at_line_start = false;
+            continue;
+        }
+        out.push(b);
+        at_line_start = out.ends_with(b"\r\n");
+    }
+    out
+}
+
 /// The one text for "the proxy could not establish that this message is
 /// allowed", shared by both refusals below so that the reply code is the
 /// only thing telling them apart. Splitting the wording would let a client
@@ -354,50 +378,52 @@ impl ProxyHandler {
             rcpt_parameters: t.recipients.clone(),
         }
     }
+}
 
-    async fn relay_message(
-        &mut self,
-        outcome: CheckResponse,
-        body: Vec<u8>,
-    ) -> Result<String, Rejection> {
+/// An owned mirror of [`Envelope`]. The sink outlives the transaction whose
+/// fields that type borrows, so it cannot hold the references.
+struct OwnedEnvelope {
+    from: String,
+    mail_params: Vec<Param>,
+    recipients: Vec<Recipient>,
+}
+
+/// Buffers, for now, and relays on `finish`. Task 9 replaces the innards
+/// with a live upstream session; the interface above it does not change.
+pub struct ProxySink {
+    factory: ProxyFactory,
+    client: SocketAddr,
+    envelope: OwnedEnvelope,
+    /// Merged and checked in `open_body`, because both are the proxy's own
+    /// decisions and `Rejection` is the only voice it has left once the sink
+    /// exists.
+    headers: Vec<RequestHeader>,
+    /// Kept for the two debug dumps on the relay error path, which is the
+    /// only place either is read.
+    request: CheckRequest,
+    outcome: CheckResponse,
+    message: Vec<u8>,
+}
+
+impl BodySink for ProxySink {
+    async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
+        self.message.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<String, UpstreamVerdict> {
         debug!("Relaying Mail to upstream SMTP Server");
-        // Cloned rather than taken: the debug dump on the error path below
-        // has to show the headers the API was asked about.
-        let headers = merge_headers(self.transaction.headers.clone(), &outcome.headers);
-        // On the merged list, so that a break the API introduced and a break
-        // the client sent are both caught, and caught before the connection
-        // costs anything. `escape_debug` because the name is the one thing
-        // that might itself carry the break being complained about.
-        if let Err(which) = assert_header_relayable(&headers) {
-            warn!(
-                "Refusing to relay header '{}' for {}: unfolded line break",
-                which.escape_debug(),
-                self.client
-            );
-            return Err(auth_service_failed());
-        }
-        let message = format_message(&headers, &body);
-        // Spec 5.5: the API may replace the envelope sender. `relay` runs the
-        // printable-ASCII check on it before it writes any command.
-        let from = outcome
-            .from
-            .clone()
-            // The Perl is `$apiResult->{from} || $mail{from}`, and an empty
-            // string is false there, so it keeps the client's sender rather
-            // than relaying the null return path and sending the bounces
-            // somewhere else.
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| self.transaction.from.clone());
+        let message = format_message(&self.headers, &unstuff_body(&self.message));
         let envelope = Envelope {
-            from: &from,
-            mail_params: &self.transaction.mail_params,
-            recipients: &self.transaction.recipients,
+            from: &self.envelope.from,
+            mail_params: &self.envelope.mail_params,
+            recipients: &self.envelope.recipients,
         };
         match relay(&self.factory.config.relay, envelope, &message).await {
             Ok(relayed) => {
                 self.factory.note_upstream_caps(relayed.caps);
                 debug!("Upstream server says: {}", relayed.message);
-                match &outcome.auth_id {
+                match &self.outcome.auth_id {
                     Some(id) => info!(
                         "Relayed mail successfully for {} using token {id}",
                         self.client
@@ -411,16 +437,19 @@ impl ProxyHandler {
             }
             Err(e) => {
                 info!("Mail refused by relay server ({e}) for {}", self.client);
-                debug!("Mail {}", self.check_request().redacted_json());
+                debug!("Mail {}", self.request.redacted_json());
                 // The Perl dumps the API result next to the mail: it is what
                 // says whether the refused message carried injected headers
                 // or a substituted sender.
                 // JSON like the line above it, because README promises that
                 // every debug dump on this branch is JSON.
-                debug!("ApiResult {}", outcome.json());
+                debug!("ApiResult {}", self.outcome.json());
                 // Spec 6, and the ruling of 2026-09-13: the upstream's own
                 // code, not a blanket 550. See `RelayError::client_code`.
-                Err(Rejection {
+                // `relay` never leaves the client without an answer, so
+                // `Dropped` -- the verdict with nothing to say -- cannot
+                // arise until task 9 drives the upstream from here.
+                Err(UpstreamVerdict::Replied {
                     code: e.client_code(),
                     text: e.to_string(),
                 })
@@ -430,6 +459,8 @@ impl ProxyHandler {
 }
 
 impl Handler for ProxyHandler {
+    type Sink = ProxySink;
+
     /// Spec 2: the credentials are accepted without being checked. They are
     /// forwarded to the API with the message, and a bad password surfaces
     /// there as `550 <reason>` after DATA, exactly as in the Perl.
@@ -468,66 +499,77 @@ impl Handler for ProxyHandler {
         Ok(())
     }
 
-    /// The headers are in; the body is still arriving. The API call starts
-    /// here and is awaited in `message`.
-    async fn headers(&mut self, headers: String) -> Result<(), String> {
+    /// Every decision the proxy makes on its own, in one place: ask the API,
+    /// merge the headers it returns, check them, and settle the envelope.
+    /// What comes back is a sink with no opinions left.
+    async fn open_body(&mut self, headers: String) -> Result<ProxySink, Rejection> {
         self.transaction.headers = parse_headers(&headers);
         debug!("Making call to auth/headers API");
-        let api = self.factory.config.api.clone();
         let request = self.check_request();
-        // `tokio::spawn` starts a task with no span of its own, so without
-        // this the spec 5.3 redacted-request dump that `ApiClient::check`
-        // writes on a failure would come out with no `[cid]` bracket at all
-        // (spec 8.1) -- on the one line an operator reads to find out why a
-        // customer's mail was refused.
-        self.transaction.api_call = Some(tokio::spawn(
-            async move { api.check(&request).await }.in_current_span(),
-        ));
-        Ok(())
-    }
-
-    async fn message(&mut self, body: Vec<u8>) -> Result<String, Rejection> {
-        // Unreachable from the session, which always delivers the headers
-        // before the body: a missing call means a bug, not a bad client, and
-        // silently relaying an unchecked mail would be the worse answer.
-        // Transient because the fault is ours: the sender did nothing to
-        // earn a permanent refusal, and a bug we later fix or restart out of
-        // makes the retry succeed.
-        let Some(call) = self.transaction.api_call.take() else {
-            warn!("No API call was started for {}", self.client);
-            return Err(auth_service_unavailable());
-        };
-        let outcome = match call.await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                warn!("Failed to call API ({e}) for {}", self.client);
-                return Err(auth_service_unavailable());
-            }
+        let outcome = match self.factory.config.api.check(&request).await {
+            Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
+                // Transient because the fault is ours: the sender did nothing
+                // to earn a permanent refusal, and an outage we come back from
+                // makes the retry succeed.
                 return Err(auth_service_unavailable());
             }
         };
         if !outcome.allow {
             let reason = outcome.reason.clone().unwrap_or_default();
             info!("Mail rejected by API ({reason}) for {}", self.client);
-            debug!("INPUT {}", self.check_request().redacted_json());
+            debug!("INPUT {}", request.redacted_json());
             // A policy refusal is permanent: the API looked at this message
-            // and said no. Unlike the relay paths below, there is nothing
-            // here for the client to retry.
+            // and said no. Unlike the relay paths, there is nothing here for
+            // the client to retry.
             return Err(Rejection {
                 code: 550,
                 text: reason,
             });
         }
-        self.relay_message(outcome, body).await
+        // Cloned rather than taken: the debug dump on the relay error path
+        // has to show the headers the API was asked about.
+        let merged = merge_headers(self.transaction.headers.clone(), &outcome.headers);
+        // On the merged list, so that a break the API introduced and a break
+        // the client sent are both caught, and caught before the connection
+        // costs anything. `escape_debug` because the name is the one thing
+        // that might itself carry the break being complained about.
+        if let Err(which) = assert_header_relayable(&merged) {
+            warn!(
+                "Refusing to relay header '{}' for {}: unfolded line break",
+                which.escape_debug(),
+                self.client
+            );
+            return Err(auth_service_failed());
+        }
+        // Spec 5.5: the API may replace the envelope sender. `relay` runs the
+        // printable-ASCII check on it before it writes any command.
+        let from = outcome
+            .from
+            .clone()
+            // The Perl is `$apiResult->{from} || $mail{from}`, and an empty
+            // string is false there, so it keeps the client's sender rather
+            // than relaying the null return path and sending the bounces
+            // somewhere else.
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| self.transaction.from.clone());
+        Ok(ProxySink {
+            factory: self.factory.clone(),
+            client: self.client,
+            envelope: OwnedEnvelope {
+                from,
+                mail_params: self.transaction.mail_params.clone(),
+                recipients: self.transaction.recipients.clone(),
+            },
+            headers: merged,
+            request,
+            outcome,
+            message: Vec::new(),
+        })
     }
 
     fn reset(&mut self) {
-        // An API call whose transaction is gone has nobody left to answer.
-        if let Some(call) = self.transaction.api_call.take() {
-            call.abort();
-        }
         self.transaction = Transaction::default();
     }
 
@@ -711,6 +753,47 @@ mod tests {
     fn the_refusal_names_the_header_and_not_its_value() {
         let e = assert_header_relayable(&[h("Good", "ok"), h("X-Bad", "a\r\nb")]).unwrap_err();
         assert_eq!(e, "X-Bad");
+    }
+
+    /// The invariant that makes this task's seam safe. `BodyFramer` hands
+    /// the sink the client's own bytes; `unstuff_body` takes one dot off
+    /// each stuffed line and `normalize_and_stuff` puts it back, so the far
+    /// end sees exactly what the client wrote. Make `unstuff_body` the
+    /// identity and every stuffed case below gains a dot.
+    #[test]
+    fn unstuffing_is_undone_exactly_by_the_stuffing_the_write_path_adds() {
+        for body in [
+            &b""[..],
+            b"plain\r\n",
+            b"..\r\n",
+            b"..foo\r\n",
+            b"....bar\r\n",
+            b"a\r\n..b\r\nc\r\n",
+            b"..a\r\n\r\n..b\r\n",
+            // A bare CR is body data, not a line ending, so the dot after it
+            // is not on a line start and neither side touches it.
+            b"mid\rcr\r\n",
+        ] {
+            assert_eq!(
+                crate::relay::normalize_and_stuff(&unstuff_body(body)),
+                body,
+                "round trip changed {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// The halves of that round trip, named, so a failure says which one
+    /// moved.
+    #[test]
+    fn unstuffing_takes_one_dot_off_a_line_start_and_no_other() {
+        assert_eq!(
+            unstuff_body(b"..foo\r\n"),
+            b"..foo\r\n".strip_prefix(b".").unwrap()
+        );
+        assert_eq!(unstuff_body(b"..\r\n"), b".\r\n");
+        assert_eq!(unstuff_body(b"a..b\r\n"), b"a..b\r\n");
+        assert_eq!(unstuff_body(b"a\r\n..b\r\n"), b"a\r\n.b\r\n");
     }
 
     #[test]

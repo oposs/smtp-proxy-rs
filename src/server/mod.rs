@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::relay::UpstreamVerdict;
 use crate::smtp::params::Param;
 
 /// The shutdown side of the server (spec 9.1). `token` is cancelled once a
@@ -93,8 +94,21 @@ impl Rejection {
     }
 }
 
+/// Consumes one message body. Obtained from [`Handler::open_body`] and owned
+/// for exactly the body's lifetime.
+///
+/// Dropping it without `finish` **aborts** the message: the upstream
+/// connection closes with no terminator sent, so nothing is delivered. That
+/// is the whole abort path -- there is no other.
+pub trait BodySink: Send {
+    fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<(), UpstreamVerdict>> + Send;
+    fn finish(self) -> impl Future<Output = Result<String, UpstreamVerdict>> + Send;
+}
+
 /// The application side of a connection. One instance per connection.
 pub trait Handler: Send + 'static {
+    type Sink: BodySink;
+
     fn auth(
         &mut self,
         authzid: &str,
@@ -111,13 +125,18 @@ pub trait Handler: Send + 'static {
         to: &str,
         params: &[Param],
     ) -> impl Future<Output = Result<(), Rejection>> + Send;
-    /// Header block complete; body still arriving.
-    fn headers(&mut self, headers: String) -> impl Future<Output = Result<(), String>> + Send;
-    /// Terminator arrived. Ok: text for `250 OK: <text>`. Err: the whole
-    /// reply, code included -- the session does not choose one. An upstream
-    /// that refused the message with a `451` has to reach the client as a
-    /// `451`, and only the handler knows what the upstream said.
-    fn message(&mut self, body: Vec<u8>) -> impl Future<Output = Result<String, Rejection>> + Send;
+    /// The header block is complete and the body is about to arrive. This is
+    /// where every decision the proxy makes on its own is made: the policy
+    /// verdict, the header merge, the upstream connection and the envelope.
+    ///
+    /// Once this returns a sink, the proxy has no opinions left -- from then
+    /// on it only relays what the upstream says. That is why the two error
+    /// types differ: `Rejection` is the proxy's own voice, `UpstreamVerdict`
+    /// is the upstream's.
+    fn open_body(
+        &mut self,
+        headers: String,
+    ) -> impl Future<Output = Result<Self::Sink, Rejection>> + Send;
     /// RSET, or EHLO/HELO while a transaction is running.
     fn reset(&mut self);
     fn dsn_available(&self) -> bool;

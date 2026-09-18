@@ -6,6 +6,7 @@ mod common;
 use common::fake_handler::ScriptedFactory;
 use common::raw_client::RawClient;
 use common::{server_config, start_server};
+use smtp_proxy::relay::UpstreamVerdict;
 use smtp_proxy::server::Rejection;
 
 /// A connection that has been greeted. `require_starttls` and `require_auth`
@@ -137,7 +138,10 @@ async fn full_transaction_reaches_the_handler() {
     assert_eq!(rec.rcpt.len(), 2);
     assert_eq!(rec.rcpt[1].1[0].value.as_deref(), Some("NEVER"));
     assert_eq!(rec.headers[0], "Subject: hi\r\nTo: a@b.com\r\n");
-    assert_eq!(rec.bodies[0], b"body line\r\n.dot line\r\n");
+    // The sink is given body lines verbatim (spec 5.1), so the client's
+    // stuffing dot is still on `..dot line`. Undoing it is the business of
+    // whoever writes the body upstream, not of the session.
+    assert_eq!(rec.bodies[0], b"body line\r\n..dot line\r\n");
     // Next transaction on the same connection.
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
 }
@@ -396,8 +400,8 @@ async fn a_header_block_that_fills_the_cap_exactly_still_ends_normally() {
 
 /// The body carries no cap any more, so a line longer than the reader will
 /// hold while it waits for a newline is not an error: it is taken in pieces
-/// and delivered whole. The stuffing dot rides on the first piece alone, and
-/// is undone exactly once.
+/// and delivered whole -- one line at the sink, not two, and with the
+/// stuffing dot that rode in on its first piece still in place.
 #[tokio::test]
 async fn a_body_line_longer_than_the_read_buffer_is_delivered_whole() {
     let factory = ScriptedFactory::default();
@@ -414,7 +418,7 @@ async fn a_body_line_longer_than_the_read_buffer_is_delivered_whole() {
     c.write_raw(&format!("..{long}\r\n.\r\n")).await;
     assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
     let rec = factory.recorded();
-    assert_eq!(rec.bodies[0], format!(".{long}\r\n").into_bytes());
+    assert_eq!(rec.bodies[0], format!("..{long}\r\n").into_bytes());
 }
 
 #[tokio::test]
@@ -473,4 +477,29 @@ async fn a_client_leaving_during_a_slow_message_does_not_stop_the_server() {
     let (mut c2, greeting) = RawClient::connect(addr).await;
     assert!(greeting.starts_with("220"));
     assert!(c2.command("NOOP").await.starts_with("250"));
+}
+
+/// The mirror rule at its cheapest: an upstream that dies mid-body takes the
+/// client connection with it, with no reply invented on its behalf.
+///
+/// It also pins the staged remainder down. The body here is six bytes, far
+/// below `WRITE_CHUNK`, so the only write the sink ever sees is the flush
+/// after the terminator. A pump that went straight from the terminator to
+/// `finish` would never call `write`, never meet the verdict, and answer
+/// `250` instead of closing.
+#[tokio::test]
+async fn an_upstream_that_drops_mid_body_closes_the_client_connection() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.sink_verdict = Some(UpstreamVerdict::Dropped));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\nbody\r\n.\r\n").await;
+    assert!(
+        c.expect_close().await,
+        "a dead upstream must close the client too"
+    );
 }
