@@ -571,6 +571,49 @@ async fn an_upstream_rejection_mid_body_reaches_the_client_verbatim() {
     );
 }
 
+/// The same refusal, read from the operator's side of the glass.
+///
+/// A refusal the upstream speaks mid-body never reaches `ProxySink::finish`:
+/// `read_message` hands the verdict to `mirror`, whose only output is a
+/// `debug!`. So the three-line report had to be added to `ProxySink::write`
+/// as well. Without it an operator grepping `Mail refused by relay server` --
+/// the line the README teaches and `conformance/t/connection-lifecycle.t`
+/// greps for -- misses exactly the newest failure mode on this branch, and at
+/// the default log level sees nothing about it at all.
+///
+/// The refusal text is unique to this test, so its line can be picked out of
+/// the log every test in this binary shares -- and so the assertion need not
+/// correlate through the `Mail {` dump, which the same fix emits and which
+/// would therefore go missing under the negation and take the test red at the
+/// wrong place.
+#[tokio::test]
+async fn a_refusal_mid_body_is_reported_to_the_operator() {
+    const REFUSAL: &str = "5.3.4 mid-body-probe over the limit";
+    let r = rig(&["DSN"]).await;
+    r.upstream.reject_during_data(4096, (552, REFUSAL));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    let line = format!("{}\r\n", "y".repeat(1022));
+    c.write_raw(&format!(
+        "Subject: x\r\n\r\n{}",
+        line.repeat(8 * 1024 * 1024 / line.len())
+    ))
+    .await;
+    assert_eq!(c.read_reply().await, format!("552 {REFUSAL}\r\n"));
+    c.write_raw(".\r\n").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.contains("Mail refused by relay server") && l.contains(REFUSAL)),
+        "a mid-body refusal left nothing above debug level; log:\n{text}"
+    );
+}
+
 /// A client that abandons the message mid-body must not deliver it. The sink
 /// is dropped without its terminator, so the upstream sees a connection that
 /// closed inside DATA and discards the transaction.

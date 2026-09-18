@@ -450,46 +450,79 @@ pub struct ProxySink {
     outcome: CheckResponse,
 }
 
+/// The three lines `relay_message` used to log on a refusal: the operator's
+/// sentence naming the failure, and the two debug dumps that say what was in
+/// the message that failed.
+///
+/// Both roads out of the body go through here -- a refusal the upstream
+/// speaks mid-body and one it speaks at the terminator -- so an operator
+/// grepping `Mail refused by relay server` sees every refused message,
+/// whichever stage it died at. `stage` is the SMTP command the failure is
+/// reported against: `DATA` while the body is still arriving, `DATA_END` at
+/// the terminator.
+///
+/// A free function taking the three fields rather than a method on
+/// [`ProxySink`], because `UpstreamSession::finish` consumes the session out
+/// of the sink and the report still has to be written from what is left.
+fn report_refusal(
+    client: SocketAddr,
+    request: &CheckRequest,
+    outcome: &CheckResponse,
+    verdict: &UpstreamVerdict,
+    stage: &'static str,
+) {
+    // Named for the log only. `into_relay_error` is what turns a lost
+    // connection into a sentence an operator can read; the verdict itself
+    // goes to the client untouched.
+    let reported = verdict.clone().into_relay_error(stage);
+    info!("Mail refused by relay server ({reported}) for {client}");
+    debug!("Mail {}", request.redacted_json());
+    // The Perl dumps the API result next to the mail: it is what says whether
+    // the refused message carried injected headers or a substituted sender.
+    // JSON like the line above it, because README promises that every debug
+    // dump on this branch is JSON.
+    debug!("ApiResult {}", outcome.json());
+}
+
 impl BodySink for ProxySink {
     async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
         // Straight out, exactly as the client wrote it. The client's own dot
         // stuffing is the wire encoding the upstream wants, so nothing here
         // touches it (spec 5.1).
-        self.upstream.write(chunk).await
+        let result = self.upstream.write(chunk).await;
+        if let Err(verdict) = &result {
+            // A refusal here never reaches `finish`: `read_message` hands the
+            // verdict straight to `mirror`, whose only output is a `debug!`.
+            // So this is the one place the operator's three lines can come
+            // from for the mid-body road -- the newest failure mode on this
+            // branch, and the one an operator is least likely to know about.
+            report_refusal(self.client, &self.request, &self.outcome, verdict, "DATA");
+        }
+        result
     }
 
     async fn finish(self) -> Result<String, UpstreamVerdict> {
-        match self.upstream.finish().await {
+        // Taken apart first: `UpstreamSession::finish` consumes the session,
+        // and the refusal report below reads the three fields beside it.
+        let Self {
+            upstream,
+            client,
+            request,
+            outcome,
+        } = self;
+        match upstream.finish().await {
             Ok(message) => {
                 debug!("Upstream server says: {message}");
-                match &self.outcome.auth_id {
-                    Some(id) => info!(
-                        "Relayed mail successfully for {} using token {id}",
-                        self.client
-                    ),
-                    None => info!(
-                        "Relayed mail successfully for {} using no token",
-                        self.client
-                    ),
+                match &outcome.auth_id {
+                    Some(id) => {
+                        info!("Relayed mail successfully for {client} using token {id}")
+                    }
+                    None => info!("Relayed mail successfully for {client} using no token"),
                 }
                 Ok(message)
             }
             Err(verdict) => {
-                // Named for the log only. `into_relay_error` is what turns
-                // a lost connection into a sentence an operator can read;
-                // the verdict itself goes to the client untouched.
-                let reported = verdict.clone().into_relay_error("DATA_END");
-                info!(
-                    "Mail refused by relay server ({reported}) for {}",
-                    self.client
-                );
-                debug!("Mail {}", self.request.redacted_json());
-                // The Perl dumps the API result next to the mail: it is what
-                // says whether the refused message carried injected headers
-                // or a substituted sender.
-                // JSON like the line above it, because README promises that
-                // every debug dump on this branch is JSON.
-                debug!("ApiResult {}", self.outcome.json());
+                report_refusal(client, &request, &outcome, &verdict, "DATA_END");
                 Err(verdict)
             }
         }
@@ -603,9 +636,12 @@ impl Handler for ProxyHandler {
             .unwrap_or_else(|| self.transaction.from.clone());
         // Every road out of the relay logs what `relay_message` used to log:
         // the operator's one line naming the failure, and the two debug dumps
-        // that say what was in the message that failed. The same three lines
-        // are in `ProxySink::finish`, which is where a failure lands once the
-        // body has started.
+        // that say what was in the message that failed. Once the body has
+        // started there are two such roads, not one, and they end in
+        // different places: a refusal at the terminator lands in
+        // `ProxySink::finish`, one spoken mid-body lands in
+        // `ProxySink::write` and never reaches `finish` at all. Both call
+        // `ProxySink::report_refusal`, which is the same three lines.
         let refuse = |e: RelayError| {
             info!("Mail refused by relay server ({e}) for {}", self.client);
             debug!("Mail {}", request.redacted_json());
