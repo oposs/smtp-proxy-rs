@@ -101,6 +101,11 @@ struct Inner {
     /// the last `clear()` -- so a test can tell an envelope that went out
     /// encrypted from one that went out in the clear.
     tls_commands: Vec<String>,
+    /// Count the body's bytes instead of storing them. See
+    /// [`RecordingUpstream::discard_body`].
+    discard_body: bool,
+    /// Body bytes counted while `discard_body` was set.
+    discarded_bytes: usize,
 }
 
 impl Inner {
@@ -122,6 +127,8 @@ impl Inner {
             implicit: false,
             tls_extensions: None,
             tls_commands: Vec::new(),
+            discard_body: false,
+            discarded_bytes: 0,
         }
     }
 }
@@ -292,6 +299,31 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().coalesce_mail_reply = true;
     }
 
+    /// Count the body's bytes instead of storing them, for the one test that
+    /// streams more than it would want to hold.
+    ///
+    /// **This is not a relaxation of the recording.** The strict, verbatim
+    /// recording stays the default for every other test, because a fake that
+    /// re-normalises what it stores cannot see a relay that fails to
+    /// normalise what it sends. This mode only exists so that the memory
+    /// test measures the proxy and not the fake.
+    ///
+    /// The flag is read once per body line, so setting it any time before
+    /// the body arrives -- after the rig is built, for instance -- takes
+    /// effect. A message received in this mode is never pushed to
+    /// `messages`, so [`RecordingUpstream::raw_messages`] stays empty for it.
+    pub fn discard_body(&self) {
+        self.inner.lock().unwrap().discard_body = true;
+    }
+
+    /// Bytes of body received while `discard_body` was set, counted across
+    /// every connection since the last `clear()`. Counted as each line
+    /// arrives, so a body cut short mid-transfer still shows what got
+    /// through.
+    pub fn discarded_bytes(&self) -> usize {
+        self.inner.lock().unwrap().discarded_bytes
+    }
+
     /// Drops every recorded connection and message. The startup probe's own
     /// EHLO and QUIT would otherwise shift every later command index.
     pub fn clear(&self) {
@@ -299,6 +331,7 @@ impl RecordingUpstream {
         i.connections.clear();
         i.messages.clear();
         i.tls_commands.clear();
+        i.discarded_bytes = 0;
     }
 }
 
@@ -363,7 +396,12 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 body_bytes = 0;
                 let (code, text) = {
                     let mut s = state.lock().unwrap();
-                    s.messages.push(std::mem::take(&mut message));
+                    // A discarded body was never collected, so there is
+                    // nothing to record: pushing the empty `message` would
+                    // put a message that does not exist into `messages`.
+                    if !s.discard_body {
+                        s.messages.push(std::mem::take(&mut message));
+                    }
                     match &s.reject_data_end {
                         Some((code, text)) => (*code, text.clone()),
                         None => (250, s.accept_text.clone()),
@@ -379,11 +417,23 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
             } else {
                 since_pause += raw.len();
                 body_bytes += raw.len();
-                message.extend_from_slice(&raw);
-                let (reject, drop_at) = {
-                    let s = state.lock().unwrap();
-                    (s.reject_during_data.clone(), s.drop_during_data)
+                // One lock for all three: the discard counter rides along
+                // with the fault flags rather than taking a lock of its own,
+                // because a gigabyte body reaches this line a million times.
+                let (reject, drop_at, discard) = {
+                    let mut s = state.lock().unwrap();
+                    if s.discard_body {
+                        s.discarded_bytes += raw.len();
+                    }
+                    (
+                        s.reject_during_data.clone(),
+                        s.drop_during_data,
+                        s.discard_body,
+                    )
                 };
+                if !discard {
+                    message.extend_from_slice(&raw);
+                }
                 if let Some(after) = drop_at
                     && body_bytes >= after
                 {
