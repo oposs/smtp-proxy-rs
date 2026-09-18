@@ -346,11 +346,14 @@ passes through in a hundredth of its size. A failure prints
 
 `MemoryMax` stays, but as a backstop rather than the assertion, so a runaway
 regression dies locally instead of eating into the 25 GiB slice every
-session on this machine shares:
+session on this machine shares. It is paired with `MemorySwapMax=0`, and the
+pair is not optional: the slice carries 20 GiB of swap next to its 25 GiB of
+memory, so a scope capping memory alone lets a runaway page out rather than
+die -- slower, and no protection at all for the sessions sharing the slice.
 
 ```
 cargo test --no-run --test streaming        # build OUTSIDE the scope
-systemd-run --user --scope -p MemoryMax=256M -- <the built binary> big_body
+systemd-run --user --scope -p MemoryMax=256M -p MemorySwapMax=0 -- <the built binary> big_body
 ```
 
 Building outside the scope matters. The project's usual pattern puts

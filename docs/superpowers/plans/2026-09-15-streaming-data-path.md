@@ -14,7 +14,7 @@
 
 - **Machine is shared.** Never more than 4 parallel jobs for builds and tests: `cargo test -j 4`. Never compile a parallelism number into the product.
 - **Every cargo call takes `timeout: 600000` and is waited for in the same turn.** Never end a turn with a build in flight.
-- **Memory.** All Claude sessions on this machine share one 25 GiB cgroup. Any test fed unbounded input runs under `systemd-run --user --scope -p MemoryMax=<n> -- <binary>`.
+- **Memory.** All Claude sessions on this machine share one 25 GiB cgroup. Any test fed unbounded input runs under `systemd-run --user --scope -p MemoryMax=<n> -p MemorySwapMax=0 -- <binary>`. **Both caps, always** (ruling 39): the slice carries 20 GiB of swap alongside its 25 GiB of memory, and a scope that sets `MemoryMax` alone inherits that swap, so a runaway degrades into 20 GiB of paging instead of dying -- the opposite of a backstop, and enough to take sibling sessions down with it.
 - **`CARGO_TARGET_DIR`** is per-worktree under `/scratch/oetiker/`. The inherited env points at the shared dir; do not use it.
 - **Containers are podman, not docker.**
 - **Cite greppable anchors, never line numbers** (ruling R40). Write ``(`session.rs`, `fn read_message`)``, not `session.rs:657`.
@@ -1701,14 +1701,14 @@ Move `start_proxy` into `tests/common/mod.rs` if it is currently private to `pro
 
 ```
 cargo test -j 4 --no-run --test streaming
-systemd-run --user --scope -p MemoryMax=256M -- <the built test binary> a_gigabyte_body --nocapture
+systemd-run --user --scope -p MemoryMax=256M -p MemorySwapMax=0 -- <the built test binary> a_gigabyte_body --nocapture
 ```
 
 The build is **outside** the scope on purpose: cargo's own footprint would otherwise land in the ceiling and blur the measurement. Read the printed peak, set `PEAK_CEILING` to a small multiple of it, and write the measured figure and the date into the comment.
 
 - [ ] **Step 4: Prove it can fail**
 
-Temporarily make `ProxySink::write` accumulate into a `Vec` instead of forwarding, and run the test again. It must fail — either on the assertion or by being OOM-killed at the 256M backstop. Restore the real implementation. Record the observation in the commit message: a memory test that has never been seen to fail is a memory test that asserts nothing.
+Temporarily make `ProxySink::write` accumulate into a `Vec` instead of forwarding, and run the test again. It must fail — either on the assertion or by being OOM-killed at the 256M backstop. The backstop only kills with `MemorySwapMax=0` set alongside `MemoryMax`; without it the held body swaps and the run survives to its assertion. Restore the real implementation. Record the observation in the commit message: a memory test that has never been seen to fail is a memory test that asserts nothing.
 
 - [ ] **Step 5: Gates and commit**
 

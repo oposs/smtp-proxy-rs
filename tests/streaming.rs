@@ -10,6 +10,29 @@
 //! second `#[tokio::test]` here would pollute the high-water mark of this
 //! one, whichever order they ran in, and the assertion would stop meaning
 //! what it says. A new memory test belongs in a new test binary.
+//!
+//! Counted in as well, and easy to miss: the rig installs `captured_log`
+//! (`tests/common/mod.rs`), whose `Vec<u8>` collects every log line the run
+//! produces and is never trimmed. It stays a few kilobytes here because the
+//! body is relayed, not logged -- but a change that logged per chunk would
+//! show up in this measurement as the proxy's memory, and it would not be.
+//!
+//! To reproduce the number by hand, build **outside** the scope so cargo's
+//! own footprint does not land in the measurement:
+//!
+//! ```text
+//! cargo test -j 4 --no-run --test streaming
+//! systemd-run --user --scope -p MemoryMax=256M -p MemorySwapMax=0 -- \
+//!     <the built test binary> a_gigabyte_body --nocapture
+//! ```
+//!
+//! **Both caps, always.** The slice every session on this machine shares
+//! carries 20 GiB of swap next to its 25 GiB of memory, and a scope that
+//! caps memory alone inherits that swap: a regression that holds the body
+//! then pages out for half a minute instead of dying, which is no backstop
+//! at all for the sessions sharing the slice. Measured, not assumed --
+//! under `MemoryMax=256M` on its own the held gigabyte swapped and the run
+//! survived to its assertion.
 mod common;
 
 use common::raw_client::RawClient;
