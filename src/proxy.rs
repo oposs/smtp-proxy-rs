@@ -296,37 +296,76 @@ pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String> 
 }
 
 /// Spec 5.4: `name: value` per header and then the empty line that ends the
-/// block -- dot-stuffed, because this goes out inside DATA
-/// (RFC 5321 4.5.2).
+/// block -- put into the form DATA requires, which is two jobs and not one.
 ///
-/// The stuffing is this side's job alone, and it is not symmetric with the
-/// body. A body line arrives already stuffed by the client and is relayed
-/// verbatim (spec 5.1), so it needs nothing. A *header* line does not:
-/// `HeaderCollector` unstuffs on the way in, so that the API and
-/// [`parse_headers`] see content rather than wire form (`server::data`).
-/// A client line `..X-Foo: y` is therefore held here as `.X-Foo: y`, and
-/// written raw it would reach the upstream as `X-Foo: y` -- a header name
-/// one character shorter than the one the client sent.
-/// [`assert_header_relayable`] refuses only `\r`, `\n` and `:` in a name, so
-/// a leading dot gets this far. Headers the API supplied are stuffed the
-/// same way: stuffing is a wire encoding, not a property of where a header
-/// came from.
+/// **Both jobs used to belong to `normalize_and_stuff` (`relay.rs`), which
+/// ran over the whole formatted message.** That function is gone with the
+/// buffering, and the body no longer needs either: it arrives already
+/// stuffed and already CRLF-framed by `BodyFramer` (`server::data`), and is
+/// relayed verbatim (spec 5.1). The header block needs both, because it is
+/// built here out of parsed content rather than passed through:
+///
+/// 1. [`normalize_breaks`] -- a folded value may carry a **bare LF** as its
+///    break. `HeaderCollector` appends header lines verbatim, [`parse_headers`]
+///    keeps whichever break arrived inside the folded value, and [`folds_at`]
+///    accepts a bare `\n` before a space or tab. Written out as it stands,
+///    that LF would go on the wire inside DATA, against RFC 5321 2.3.8.
+/// 2. [`dot_stuff`] -- `HeaderCollector` *unstuffs* on the way in, so that
+///    the API and [`parse_headers`] see content rather than wire form. A
+///    client line `..X-Foo: y` is therefore held here as `.X-Foo: y`, and
+///    written raw it would reach the upstream as `X-Foo: y`, a header name
+///    one character shorter than the one the client sent.
+///    [`assert_header_relayable`] refuses only `\r`, `\n` and `:` in a name,
+///    so a leading dot gets this far.
+///
+/// The two passes commute -- [`dot_stuff`] keys on the LF, which both break
+/// forms carry -- so the order is the reading order and nothing rests on it.
+/// Headers the API supplied go through both alike: this is a wire encoding,
+/// not a property of where a header came from.
 pub fn header_block(headers: &[RequestHeader]) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     for h in headers {
         out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
     }
     out.extend_from_slice(b"\r\n");
-    dot_stuff(&out)
+    dot_stuff(&normalize_breaks(&out))
+}
+
+/// Rewrites every `\r?\n` to `\r\n` (RFC 5321 2.3.8: inside DATA a line ends
+/// with CRLF and with nothing else).
+///
+/// A lone CR is left alone, exactly as the Perl's `s/\015?\012/\015\012/`
+/// left it: it is not a line ending, and turning it into one would split a
+/// header. [`assert_header_relayable`] refuses one in a value anyway, so the
+/// case is unreachable from here -- the rule is stated because the function
+/// has to have one, not because a header can carry it.
+fn normalize_breaks(block: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block.len() + 8);
+    let mut i = 0;
+    while i < block.len() {
+        match block[i] {
+            b'\n' => {
+                out.extend_from_slice(b"\r\n");
+                i += 1;
+            }
+            b'\r' if block.get(i + 1) == Some(&b'\n') => {
+                out.extend_from_slice(b"\r\n");
+                i += 2;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Doubles a `.` that begins a line (RFC 5321 4.5.2).
 ///
 /// A line begins at offset 0 and after every LF, which is what SMTP frames
-/// on. A folded header value may carry a bare LF as its break (see
-/// [`parse_headers`]), so both break forms start a line here; a lone CR
-/// starts none, and [`assert_header_relayable`] refuses one in a value
-/// anyway.
+/// on. Run after [`normalize_breaks`], so every LF here is the second byte of
+/// a CRLF and a lone CR begins no line.
 fn dot_stuff(block: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(block.len() + 8);
     let mut at_line_start = true;
@@ -813,17 +852,40 @@ mod tests {
 
     /// A folded value's continuation begins with a space or a tab, so the
     /// dot that follows it is not at a line start. The break itself may be a
-    /// bare LF (see `parse_headers`), and a dot behind *that* is.
+    /// bare LF (see `parse_headers`), and a dot behind *that* is -- which is
+    /// why `dot_stuff` runs on the normalised block and keys on the LF.
     #[test]
     fn stuffing_follows_the_line_starts_a_fold_makes() {
         assert_eq!(
             header_block(&[h("Subject", "a\r\n .b")]),
             b"Subject: a\r\n .b\r\n\r\n"
         );
-        assert_eq!(dot_stuff(b"a\n.b\n"), b"a\n..b\n");
+        assert_eq!(dot_stuff(b"a\r\n.b\r\n"), b"a\r\n..b\r\n");
         assert_eq!(dot_stuff(b".a\r\n"), b"..a\r\n");
         assert_eq!(dot_stuff(b""), b"");
         // A lone CR ends no line, so it starts none either.
         assert_eq!(dot_stuff(b"a\r.b"), b"a\r.b");
+    }
+
+    /// Ruling 35. A folded value keeps whichever break arrived
+    /// (`parse_headers`), and `folds_at` accepts a bare LF before a space or
+    /// a tab -- so a bare LF genuinely reaches `header_block`. Inside DATA a
+    /// line ends with CRLF and nothing else (RFC 5321 2.3.8). This was the
+    /// other half of what `normalize_and_stuff` did for the whole message.
+    #[test]
+    fn a_bare_lf_fold_is_normalised_on_the_way_out() {
+        assert_eq!(
+            header_block(&[h("Subject", "a\n b")]),
+            b"Subject: a\r\n b\r\n\r\n"
+        );
+        assert_eq!(
+            header_block(&[h("Subject", "a\n\tb"), h("To", "x@y.com")]),
+            b"Subject: a\r\n\tb\r\nTo: x@y.com\r\n\r\n"
+        );
+        assert_eq!(normalize_breaks(b"a\nb\r\nc\n"), b"a\r\nb\r\nc\r\n");
+        assert_eq!(normalize_breaks(b""), b"");
+        // A lone CR is not a line ending and is not made into one.
+        assert_eq!(normalize_breaks(b"a\rb"), b"a\rb");
+        assert_eq!(normalize_breaks(b"a\r\r\n"), b"a\r\r\n");
     }
 }

@@ -722,6 +722,36 @@ async fn a_stuffed_header_line_reaches_the_upstream_stuffed() {
     assert_eq!(r.api.calls()[0]["headers"][0]["name"], ".X-Foo");
 }
 
+/// Ruling 35. The header block is built out of parsed content, so it carries
+/// whichever break the client folded with -- and a bare LF is a legal fold to
+/// `folds_at` (`proxy.rs`). Inside DATA a line ends with CRLF and nothing
+/// else (RFC 5321 2.3.8), so `header_block` normalises. `normalize_and_stuff`
+/// used to do this for the whole message; the body keeps its own
+/// normalisation in `BodyFramer` (`server::data`), and this is the other
+/// path.
+#[tokio::test]
+async fn a_bare_lf_folded_header_reaches_the_upstream_as_crlf() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    // The reader takes a bare LF as a line ending, so this genuinely arrives
+    // as two lines and folds back into one value carrying the LF.
+    let msg = "Subject: a\n b\r\n\r\nbody\r\n";
+    assert!(
+        send_mail(&mut c, "a@b.com", &["x@y.com"], msg)
+            .await
+            .starts_with("250")
+    );
+    assert_eq!(
+        String::from_utf8(r.upstream.raw_messages()[0].clone()).unwrap(),
+        "Subject: a\r\n b\r\n\r\nbody\r\n",
+        "a bare LF must not reach the upstream inside DATA"
+    );
+    // The API saw the value the client meant, break and all: only the wire
+    // form is normalised.
+    assert_eq!(r.api.calls()[0]["headers"][0]["value"], "a\n b");
+}
+
 /// Ruling 31(a). The Perl counts the body as the *message* holds it: it
 /// strips the stuffing dot before accumulating (`Connection.pm`,
 /// `$line =~ s/^\.//`), so its count excludes it. The bytes on the wire keep
@@ -785,16 +815,16 @@ async fn an_upstream_reply_the_client_cannot_be_sent_becomes_451() {
     assert_eq!(c.command("NOOP").await, "250 OK\r\n");
 }
 
-/// Spec 5.1 and the seam it opens. The body reaches the sink verbatim, with
-/// the client's stuffing dot still on it, while the write path still stuffs
-/// the whole message once more (`relay.rs`, `fn normalize_and_stuff`). The
-/// sink has to undo the client's stuffing in between (`proxy.rs`, `fn
-/// unstuff_body`) or every stuffed line grows a third dot and the far end
-/// sees a message the client never wrote.
+/// Spec 5.1: the body is relayed **verbatim**. It arrives from `BodyFramer`
+/// exactly as the client wrote it, stuffing dot included (`server::data`),
+/// which is already the encoding the upstream wants -- so nothing on the way
+/// out touches it. Anything that re-stuffed it here would give every stuffed
+/// line a dot the client never sent, and anything that unstuffed it would
+/// take one away.
 ///
 /// Three stuffed lines, because one dot is the easy case: a line that is
 /// nothing but a stuffed dot, one with text after it, and one whose dots
-/// keep going. Delete `unstuff_body` and each of them gains a dot.
+/// keep going.
 #[tokio::test]
 async fn a_stuffed_body_line_is_not_stuffed_a_second_time() {
     let r = rig(&["DSN"]).await;
