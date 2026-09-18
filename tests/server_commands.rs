@@ -604,3 +604,115 @@ async fn an_upstream_that_drops_while_the_body_is_arriving_closes_the_client() {
     );
     assert!(factory.recorded().bodies.is_empty());
 }
+
+/// The drain's budget. `MAX_COMMAND_BUFFER` is private to `session.rs`, so
+/// the two tests below carry their own copy; they assert nothing about the
+/// number itself, only that a run longer than it has no line break in it.
+const DRAIN_BUDGET: usize = 64 * 1024;
+
+/// M5's guard. The mirror's drain must be told that it is starting in the
+/// middle of a line, not at a line start.
+///
+/// The body is one run of `WRITE_CHUNK + 1` bytes with no line break, so the
+/// pump takes the `Line::TooLong` road, leaves the framer mid-line, and hands
+/// the sink its chunk with `at_line_start` false. The client then finishes
+/// that same line with a lone dot. It ends a line without beginning one, so
+/// it is not a dot on a line of its own and must not end DATA. Read as the
+/// terminator it would hand the rest of the body to the command parser --
+/// client-controlled command injection, reachable by sending one body line
+/// longer than `WRITE_CHUNK`.
+///
+/// The body-side twin of `a_discarded_header_line_tail_is_not_mistaken_for_the_terminator`.
+/// Where that test spaces its writes with pauses, this one is ordered by the
+/// reply: the 451 cannot be sent until the whole over-long run has been read
+/// and reported `TooLong`, so waiting for it fixes where the split falls
+/// without a sleep.
+#[tokio::test]
+async fn a_body_line_tail_is_not_mistaken_for_the_terminator_by_the_drain() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One run past the chunk budget and no newline in it: `Line::TooLong`,
+    // which is the only way into the drain with a line half taken.
+    c.write_raw(&"y".repeat(WRITE_CHUNK + 1)).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // The tail of that same line, written only now that the reply proves the
+    // run was consumed whole.
+    c.write_raw(".\r\n").await;
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    // Whatever went before, this is the client's next command and its reply
+    // is the next thing on the wire. If the tail above ended DATA, the two
+    // lines after it were parsed as commands and their replies are queued
+    // ahead of this one.
+    assert_eq!(
+        c.command("NOOP").await,
+        "250 OK\r\n",
+        "the tail of an over-long body line ended DATA, and the rest of the body was read as commands"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+}
+
+/// M8's guard. The same rule one level in: a line that goes over budget
+/// *during* the drain leaves the drain mid-line too.
+///
+/// Here the verdict arrives on a line boundary, so the drain starts at a line
+/// start and M5's mutation would change nothing. What is under test is the
+/// `Line::TooLong` arm inside `discard_to_terminator`: it throws the
+/// oversized run away and must record that the tail of it is still to come.
+/// Set that to a line start instead and the lone dot ending the run is read
+/// as the terminator, with the same command-injection shape as above.
+#[tokio::test]
+async fn an_over_long_line_inside_the_drain_leaves_the_drain_mid_line() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // Complete lines, so the verdict lands with the drain at a line start.
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // Now over the drain's own budget, with no line break. The pause lets the
+    // server consume all of it and report `TooLong` before the tail arrives.
+    c.write_raw(&"z".repeat(DRAIN_BUDGET + 1)).await;
+    c.flush().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The tail of the run the drain just threw away.
+    c.write_raw(".\r\n").await;
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    assert_eq!(
+        c.command("NOOP").await,
+        "250 OK\r\n",
+        "the tail of an over-long line inside the drain ended DATA, and the rest of the body was read as commands"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+}
