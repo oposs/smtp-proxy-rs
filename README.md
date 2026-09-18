@@ -252,6 +252,20 @@ this is then relayed to the client.
   call. RFC 5321 4.2.3 `451` is "local error in processing", which is what
   this is. A header carrying an unfolded line break keeps the `550` above:
   that fault is in the message, and resending it unchanged cannot help.
+- **A dead upstream closes the client connection.** The Perl reads the whole
+  message into memory and only then opens the upstream, so it always has a
+  `451` to answer with. This proxy streams the body straight through, so by
+  the time an upstream can die the client has already been told `354` and is
+  mid-message. During DATA the proxy is a mirror: an upstream that *replies*
+  is relayed verbatim, code and text, and an upstream that drops takes the
+  client connection with it, because there is nothing left to say. A failure
+  *before* the body -- the connect, the envelope, the header block -- is still
+  answered with a reply code as it always was.
+- **A refused message costs the upstream one opened connection.** The upstream
+  connect runs alongside the API call, since the verdict is needed before
+  `MAIL FROM` and the connect is the only thing that can overlap it. A message
+  the API refuses therefore leaves a connection that was greeted and then
+  dropped. No envelope and no message reach it.
 - **The upstream's reply is bounded** at 4096 bytes per line and 65536 bytes
   in total. The Perl bounds neither, so a hostile or compromised upstream
   could feed an endless reply and exhaust memory. RFC 5321 4.5.3.1.5 caps a

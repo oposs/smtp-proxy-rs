@@ -137,13 +137,9 @@ async fn full_session_and_dsn_forwarding() {
         ],
         recipients: &recipients,
     };
-    let out = relay(
-        &config(&up),
-        env,
-        b"Subject: x\r\n\r\nbody\r\n.\r\nnot the end\r\n",
-    )
-    .await
-    .unwrap();
+    let out = relay(&config(&up), env, b"Subject: x\r\n\r\nbody\r\n")
+        .await
+        .unwrap();
     assert_eq!(out.message, "OK message accepted");
     assert!(out.caps.dsn);
     let cmds = up.commands();
@@ -157,33 +153,34 @@ async fn full_session_and_dsn_forwarding() {
     assert_eq!(cmds[3], "RCPT TO:<x@baz.com> NOTIFY=NEVER");
     assert_eq!(cmds[4], "DATA");
     assert_eq!(cmds[5], "QUIT");
-    // A line that is just a dot is stuffed on the way out, so the upstream
-    // reads the message whole instead of ending it early.
-    assert_eq!(
-        up.messages()[0],
-        "Subject: x\r\n\r\nbody\r\n..\r\nnot the end\r\n"
-    );
+    assert_eq!(up.messages()[0], "Subject: x\r\n\r\nbody\r\n");
 }
 
-/// I1. The Perl normalises and dot-stuffs in one regex *before* it decides
-/// whether the terminating dot needs a CRLF in front of it
-/// (`Mojo/SMTP/Client.pm:517,519`). Asserted on the raw recording: a fake
-/// that rebuilds the message from parsed lines re-normalises it and can
-/// therefore see neither half of this.
+/// The payload reaches the upstream **byte for byte**, and the terminator is
+/// placed against what the last byte was.
+///
+/// Nothing rewrites the payload any more: the proxy dot-stuffs where the
+/// content is assembled and the client's body is already stuffed, so a
+/// second pass here would stuff everything twice (`relay.rs`, `fn
+/// send_whole_message`). What survives of the old normalisation is the one
+/// decision `finish` still makes -- whether the terminating dot needs a CRLF
+/// in front of it. Asserted on the raw recording: a fake that rebuilt the
+/// message from parsed lines could see neither half of this.
 #[tokio::test]
-async fn the_relayed_payload_is_line_ending_normalised() {
-    let cases: [(&[u8], &[u8]); 5] = [
-        // A body with bare LF throughout: the upstream must see CRLF.
-        (b"Subject: x\n\nline\n", b"Subject: x\r\n\r\nline\r\n"),
-        // Ending in a bare LF: normalised first, so the dot follows
-        // immediately instead of after a spurious blank line.
-        (b"a\r\nb\n", b"a\r\nb\r\n"),
-        // Already CRLF-terminated: unchanged.
+async fn the_payload_is_relayed_verbatim_and_the_terminator_follows_its_last_byte() {
+    let cases: [(&[u8], &[u8]); 4] = [
+        // Bare LF throughout: passed on as it is, where the old write path
+        // would have rewritten every one of them to CRLF.
+        (b"Subject: x\n\nline\n", b"Subject: x\n\nline\n"),
+        // Already CRLF-terminated: unchanged, and the terminator follows
+        // immediately.
         (b"a\r\n", b"a\r\n"),
-        // No trailing newline at all: the terminator brings its own CRLF.
+        // Ending in a bare LF is still ending a line, so no blank line is
+        // manufactured in front of the dot.
+        (b"a\r\nb\n", b"a\r\nb\n"),
+        // No trailing newline at all: the terminator brings its own CRLF,
+        // which the recording shows as the line ending of the last line.
         (b"a", b"a\r\n"),
-        // A dot behind a bare LF is a line start too, so it is stuffed.
-        (b"a\n.\n", b"a\r\n..\r\n"),
     ];
     for (input, expected) in cases {
         let up = RecordingUpstream::in_memory(&["DSN"]);

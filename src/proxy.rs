@@ -9,7 +9,10 @@ use crate::api::{
     ApiClient, CheckRequest, CheckResponse, Recipient, RequestHeader, ResponseHeader,
 };
 use crate::ratelimit::RateLimiter;
-use crate::relay::{Envelope, RelayConfig, UpstreamCaps, UpstreamVerdict, probe, relay};
+use crate::relay::{
+    Envelope, RelayConfig, RelayError, UpstreamCaps, UpstreamSession, UpstreamVerdict,
+    assert_relayable, probe,
+};
 use crate::server::{BodySink, Handler, HandlerFactory, Rejection};
 use crate::smtp::params::Param;
 
@@ -258,7 +261,7 @@ fn folds_at(value: &[u8], i: usize) -> bool {
     matches!(value.get(after), Some(b' ' | b'\t'))
 }
 
-/// Refuses any header that would not survive `format_message` intact
+/// Refuses any header that would not survive [`header_block`] intact
 /// (spec 5.4 writes `name: value` and a CRLF, with no escaping of either
 /// half). A value carrying `\r\n\r\n` splits the relayed message and forges
 /// a body; one carrying a single `\r\n` forges a header.
@@ -292,45 +295,60 @@ pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String> 
     Ok(())
 }
 
-/// Spec 5.4: `name: value` per header, an empty line, then the body as it
-/// was received. Every header has passed [`assert_header_relayable`] by the
-/// time it gets here.
-pub fn format_message(headers: &[RequestHeader], body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(body.len() + 256);
+/// Spec 5.4: `name: value` per header and then the empty line that ends the
+/// block -- dot-stuffed, because this goes out inside DATA
+/// (RFC 5321 4.5.2).
+///
+/// The stuffing is this side's job alone, and it is not symmetric with the
+/// body. A body line arrives already stuffed by the client and is relayed
+/// verbatim (spec 5.1), so it needs nothing. A *header* line does not:
+/// `HeaderCollector` unstuffs on the way in, so that the API and
+/// [`parse_headers`] see content rather than wire form (`server::data`).
+/// A client line `..X-Foo: y` is therefore held here as `.X-Foo: y`, and
+/// written raw it would reach the upstream as `X-Foo: y` -- a header name
+/// one character shorter than the one the client sent.
+/// [`assert_header_relayable`] refuses only `\r`, `\n` and `:` in a name, so
+/// a leading dot gets this far. Headers the API supplied are stuffed the
+/// same way: stuffing is a wire encoding, not a property of where a header
+/// came from.
+pub fn header_block(headers: &[RequestHeader]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
     for h in headers {
         out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
     }
     out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(body);
+    dot_stuff(&out)
+}
+
+/// Doubles a `.` that begins a line (RFC 5321 4.5.2).
+///
+/// A line begins at offset 0 and after every LF, which is what SMTP frames
+/// on. A folded header value may carry a bare LF as its break (see
+/// [`parse_headers`]), so both break forms start a line here; a lone CR
+/// starts none, and [`assert_header_relayable`] refuses one in a value
+/// anyway.
+fn dot_stuff(block: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(block.len() + 8);
+    let mut at_line_start = true;
+    for &b in block {
+        if at_line_start && b == b'.' {
+            out.push(b'.');
+        }
+        out.push(b);
+        at_line_start = b == b'\n';
+    }
     out
 }
 
-/// Undoes the client's dot stuffing on a body that arrived verbatim.
-///
-/// **Task 9 removes this, together with the second stuffing it undoes.**
-/// `BodyFramer` passes body lines through exactly as the client wrote them
-/// (`server::data`, spec 5.1), stuffing dot included, while the write path
-/// still stuffs the whole message a second time (`relay.rs`, `fn
-/// normalize_and_stuff`). Without this a client's `..foo` would leave the
-/// proxy as `...foo`.
-///
-/// A line begins at offset 0 or after a CRLF, which is exactly where
-/// `normalize_and_stuff` puts a dot back. The framer has already normalised
-/// every line ending to CRLF, so a bare CR is data here and begins no line.
-/// The body holds no terminator -- `BodyFramer::push` reports that without
-/// appending it -- so nothing here can be turned into one.
-fn unstuff_body(body: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(body.len());
-    let mut at_line_start = true;
-    for &b in body {
-        if at_line_start && b == b'.' {
-            at_line_start = false;
-            continue;
-        }
-        out.push(b);
-        at_line_start = out.ends_with(b"\r\n");
+/// A failure on the way to the upstream, in the proxy's own voice. The codes
+/// are [`RelayError::client_code`]'s, unchanged: the upstream's own code
+/// where it gave one, `451` where it never answered at all, `550` for our own
+/// refusal of a malformed address.
+fn relay_error_to_rejection(e: RelayError) -> Rejection {
+    Rejection {
+        code: e.client_code(),
+        text: e.to_string(),
     }
-    out
 }
 
 /// The one text for "the proxy could not establish that this message is
@@ -380,49 +398,31 @@ impl ProxyHandler {
     }
 }
 
-/// An owned mirror of [`Envelope`]. The sink outlives the transaction whose
-/// fields that type borrows, so it cannot hold the references.
-struct OwnedEnvelope {
-    from: String,
-    mail_params: Vec<Param>,
-    recipients: Vec<Recipient>,
-}
-
-/// Buffers, for now, and relays on `finish`. Task 9 replaces the innards
-/// with a live upstream session; the interface above it does not change.
+/// The open upstream transaction, waiting for body. Everything the proxy had
+/// an opinion about was settled in [`ProxyHandler::open_body`]; from here on
+/// the only voice is the upstream's, which is why the errors are
+/// [`UpstreamVerdict`] and not [`Rejection`].
 pub struct ProxySink {
-    factory: ProxyFactory,
+    upstream: UpstreamSession,
     client: SocketAddr,
-    envelope: OwnedEnvelope,
-    /// Merged and checked in `open_body`, because both are the proxy's own
-    /// decisions and `Rejection` is the only voice it has left once the sink
-    /// exists.
-    headers: Vec<RequestHeader>,
     /// Kept for the two debug dumps on the relay error path, which is the
     /// only place either is read.
     request: CheckRequest,
     outcome: CheckResponse,
-    message: Vec<u8>,
 }
 
 impl BodySink for ProxySink {
     async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
-        self.message.extend_from_slice(chunk);
-        Ok(())
+        // Straight out, exactly as the client wrote it. The client's own dot
+        // stuffing is the wire encoding the upstream wants, so nothing here
+        // touches it (spec 5.1).
+        self.upstream.write(chunk).await
     }
 
     async fn finish(self) -> Result<String, UpstreamVerdict> {
-        debug!("Relaying Mail to upstream SMTP Server");
-        let message = format_message(&self.headers, &unstuff_body(&self.message));
-        let envelope = Envelope {
-            from: &self.envelope.from,
-            mail_params: &self.envelope.mail_params,
-            recipients: &self.envelope.recipients,
-        };
-        match relay(&self.factory.config.relay, envelope, &message).await {
-            Ok(relayed) => {
-                self.factory.note_upstream_caps(relayed.caps);
-                debug!("Upstream server says: {}", relayed.message);
+        match self.upstream.finish().await {
+            Ok(message) => {
+                debug!("Upstream server says: {message}");
                 match &self.outcome.auth_id {
                     Some(id) => info!(
                         "Relayed mail successfully for {} using token {id}",
@@ -433,10 +433,17 @@ impl BodySink for ProxySink {
                         self.client
                     ),
                 }
-                Ok(relayed.message)
+                Ok(message)
             }
-            Err(e) => {
-                info!("Mail refused by relay server ({e}) for {}", self.client);
+            Err(verdict) => {
+                // Named for the log only. `into_relay_error` is what turns
+                // a lost connection into a sentence an operator can read;
+                // the verdict itself goes to the client untouched.
+                let reported = verdict.clone().into_relay_error("DATA_END");
+                info!(
+                    "Mail refused by relay server ({reported}) for {}",
+                    self.client
+                );
                 debug!("Mail {}", self.request.redacted_json());
                 // The Perl dumps the API result next to the mail: it is what
                 // says whether the refused message carried injected headers
@@ -444,15 +451,7 @@ impl BodySink for ProxySink {
                 // JSON like the line above it, because README promises that
                 // every debug dump on this branch is JSON.
                 debug!("ApiResult {}", self.outcome.json());
-                // Spec 6, and the ruling of 2026-09-13: the upstream's own
-                // code, not a blanket 550. See `RelayError::client_code`.
-                // `relay` never leaves the client without an answer, so
-                // `Dropped` -- the verdict with nothing to say -- cannot
-                // arise until task 9 drives the upstream from here.
-                Err(UpstreamVerdict::Replied {
-                    code: e.client_code(),
-                    text: e.to_string(),
-                })
+                Err(verdict)
             }
         }
     }
@@ -506,7 +505,14 @@ impl Handler for ProxyHandler {
         self.transaction.headers = parse_headers(&headers);
         debug!("Making call to auth/headers API");
         let request = self.check_request();
-        let outcome = match self.factory.config.api.check(&request).await {
+        // The verdict is needed before MAIL FROM, which the API may rewrite,
+        // and before the headers go out -- both ahead of the body. So the
+        // connect is the only thing that can overlap the call, and it does.
+        let (verdict, upstream) = tokio::join!(
+            self.factory.config.api.check(&request),
+            UpstreamSession::connect(&self.factory.config.relay),
+        );
+        let outcome = match verdict {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!("Failed to call API ({e}) for {}", self.client);
@@ -520,6 +526,9 @@ impl Handler for ProxyHandler {
             let reason = outcome.reason.clone().unwrap_or_default();
             info!("Mail rejected by API ({reason}) for {}", self.client);
             debug!("INPUT {}", request.redacted_json());
+            // `upstream` is dropped here, unused. A refused message costs the
+            // upstream one opened connection and nothing else.
+            //
             // A policy refusal is permanent: the API looked at this message
             // and said no. Unlike the relay paths, there is nothing here for
             // the client to retry.
@@ -533,8 +542,8 @@ impl Handler for ProxyHandler {
         let merged = merge_headers(self.transaction.headers.clone(), &outcome.headers);
         // On the merged list, so that a break the API introduced and a break
         // the client sent are both caught, and caught before the connection
-        // costs anything. `escape_debug` because the name is the one thing
-        // that might itself carry the break being complained about.
+        // is used for anything. `escape_debug` because the name is the one
+        // thing that might itself carry the break being complained about.
         if let Err(which) = assert_header_relayable(&merged) {
             warn!(
                 "Refusing to relay header '{}' for {}: unfolded line break",
@@ -543,8 +552,7 @@ impl Handler for ProxyHandler {
             );
             return Err(auth_service_failed());
         }
-        // Spec 5.5: the API may replace the envelope sender. `relay` runs the
-        // printable-ASCII check on it before it writes any command.
+        // Spec 5.5: the API may replace the envelope sender.
         let from = outcome
             .from
             .clone()
@@ -554,18 +562,45 @@ impl Handler for ProxyHandler {
             // somewhere else.
             .filter(|f| !f.is_empty())
             .unwrap_or_else(|| self.transaction.from.clone());
+        // Every road out of the relay logs what `relay_message` used to log:
+        // the operator's one line naming the failure, and the two debug dumps
+        // that say what was in the message that failed. The same three lines
+        // are in `ProxySink::finish`, which is where a failure lands once the
+        // body has started.
+        let refuse = |e: RelayError| {
+            info!("Mail refused by relay server ({e}) for {}", self.client);
+            debug!("Mail {}", request.redacted_json());
+            debug!("ApiResult {}", outcome.json());
+            relay_error_to_rejection(e)
+        };
+        // Both checks before a single command goes out, exactly where
+        // `relay` used to run them: an address the API substituted must not
+        // be able to inject a further command into an authenticated upstream
+        // session.
+        assert_relayable(&from).map_err(&refuse)?;
+        for r in &self.transaction.recipients {
+            assert_relayable(&r.address).map_err(&refuse)?;
+        }
+        debug!("Relaying Mail to upstream SMTP Server");
+        let mut upstream = upstream.map_err(&refuse)?;
+        self.factory.note_upstream_caps(upstream.caps());
+        upstream
+            .open_transaction(Envelope {
+                from: &from,
+                mail_params: &self.transaction.mail_params,
+                recipients: &self.transaction.recipients,
+            })
+            .await
+            .map_err(&refuse)?;
+        upstream
+            .write(&header_block(&merged))
+            .await
+            .map_err(|v| refuse(v.into_relay_error("DATA")))?;
         Ok(ProxySink {
-            factory: self.factory.clone(),
+            upstream,
             client: self.client,
-            envelope: OwnedEnvelope {
-                from,
-                mail_params: self.transaction.mail_params.clone(),
-                recipients: self.transaction.recipients.clone(),
-            },
-            headers: merged,
             request,
             outcome,
-            message: Vec::new(),
         })
     }
 
@@ -755,50 +790,40 @@ mod tests {
         assert_eq!(e, "X-Bad");
     }
 
-    /// The invariant that makes this task's seam safe. `BodyFramer` hands
-    /// the sink the client's own bytes; `unstuff_body` takes one dot off
-    /// each stuffed line and `normalize_and_stuff` puts it back, so the far
-    /// end sees exactly what the client wrote. Make `unstuff_body` the
-    /// identity and every stuffed case below gains a dot.
     #[test]
-    fn unstuffing_is_undone_exactly_by_the_stuffing_the_write_path_adds() {
-        for body in [
-            &b""[..],
-            b"plain\r\n",
-            b"..\r\n",
-            b"..foo\r\n",
-            b"....bar\r\n",
-            b"a\r\n..b\r\nc\r\n",
-            b"..a\r\n\r\n..b\r\n",
-            // A bare CR is body data, not a line ending, so the dot after it
-            // is not on a line start and neither side touches it.
-            b"mid\rcr\r\n",
-        ] {
-            assert_eq!(
-                crate::relay::normalize_and_stuff(&unstuff_body(body)),
-                body,
-                "round trip changed {:?}",
-                String::from_utf8_lossy(body)
-            );
-        }
+    fn header_block_layout() {
+        let block = header_block(&[h("A", "1"), h("B", "2")]);
+        assert_eq!(block, b"A: 1\r\nB: 2\r\n\r\n");
     }
 
-    /// The halves of that round trip, named, so a failure says which one
-    /// moved.
+    /// The header block goes out inside DATA, so a name that begins with a
+    /// dot has to be stuffed or the upstream reads one character fewer than
+    /// the client sent. `HeaderCollector` took the client's own stuffing off
+    /// on the way in (`server::data`), which is how a name can begin with a
+    /// dot at all.
     #[test]
-    fn unstuffing_takes_one_dot_off_a_line_start_and_no_other() {
+    fn a_header_beginning_with_a_dot_is_stuffed() {
         assert_eq!(
-            unstuff_body(b"..foo\r\n"),
-            b"..foo\r\n".strip_prefix(b".").unwrap()
+            header_block(&[h(".X-Foo", "y")]),
+            b"...X-Foo: y\r\n\r\n".strip_prefix(b".").unwrap()
         );
-        assert_eq!(unstuff_body(b"..\r\n"), b".\r\n");
-        assert_eq!(unstuff_body(b"a..b\r\n"), b"a..b\r\n");
-        assert_eq!(unstuff_body(b"a\r\n..b\r\n"), b"a\r\n.b\r\n");
+        // Not at a line start, so untouched.
+        assert_eq!(header_block(&[h("X", ".v")]), b"X: .v\r\n\r\n");
     }
 
+    /// A folded value's continuation begins with a space or a tab, so the
+    /// dot that follows it is not at a line start. The break itself may be a
+    /// bare LF (see `parse_headers`), and a dot behind *that* is.
     #[test]
-    fn message_layout() {
-        let msg = format_message(&[h("A", "1"), h("B", "2")], b"body\r\n");
-        assert_eq!(msg, b"A: 1\r\nB: 2\r\n\r\nbody\r\n");
+    fn stuffing_follows_the_line_starts_a_fold_makes() {
+        assert_eq!(
+            header_block(&[h("Subject", "a\r\n .b")]),
+            b"Subject: a\r\n .b\r\n\r\n"
+        );
+        assert_eq!(dot_stuff(b"a\n.b\n"), b"a\n..b\n");
+        assert_eq!(dot_stuff(b".a\r\n"), b"..a\r\n");
+        assert_eq!(dot_stuff(b""), b"");
+        // A lone CR ends no line, so it starts none either.
+        assert_eq!(dot_stuff(b"a\r.b"), b"a\r.b");
     }
 }

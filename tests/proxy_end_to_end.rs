@@ -171,7 +171,11 @@ async fn denied_by_api() {
     )
     .await;
     assert_eq!(reply, "550 Weather too hot to email\r\n");
-    assert!(r.upstream.commands().is_empty());
+    // The upstream connection is opened in parallel with the API call, so a
+    // refused message costs one abandoned connection -- but no envelope and
+    // no message (`proxy.rs`, `fn open_body`).
+    assert_eq!(r.upstream.commands(), vec!["EHLO localhost.localdomain"]);
+    assert!(r.upstream.messages().is_empty());
     // The session is still usable.
     r.api
         .respond(serde_json::json!({ "allow": true, "headers": [] }));
@@ -262,7 +266,10 @@ async fn api_can_change_the_envelope_sender_but_not_inject_commands() {
         reply.starts_with("550 Refusing to relay the address"),
         "{reply}"
     );
-    assert!(r.upstream.commands().is_empty());
+    // The address is checked before the opened connection is used for
+    // anything, so the injected RCPT never reaches the wire.
+    assert_eq!(r.upstream.commands(), vec!["EHLO localhost.localdomain"]);
+    assert!(r.upstream.messages().is_empty());
 }
 
 /// M1. The Perl's `$apiResult->{from} || $mail{from}` is a truthiness test,
@@ -385,29 +392,49 @@ async fn an_upstream_5xx_still_reaches_the_client_as_that_5xx() {
     assert_eq!(c.command("NOOP").await, "250 OK\r\n");
 }
 
-/// Item 6. The upstream never answered, so there is no code to relay.
-/// `relay` opens a fresh connection per message, so an upstream restarted
-/// between two messages lands here: nothing about the message was wrong and
-/// the client should come back rather than discard it.
+/// Item 6. The upstream never answered, so there is no code to relay. A
+/// fresh connection is opened per message, so an upstream restarted between
+/// two messages lands here: nothing about the message was wrong and the
+/// client should come back rather than discard it.
+///
+/// This is `open_body`'s `Err` path, the one the sink never gets to exist
+/// on: the connect fails while the client is still writing headers, so the
+/// proxy answers in its own voice and reads the body away first.
 #[tokio::test]
 async fn an_unreachable_upstream_is_a_451_not_a_550() {
     // Port 1 on the loopback: privileged, unbound, and reliably refused.
     let r = rig_relaying_to(&["DSN"], Some(1)).await;
     let (mut c, _) = RawClient::connect(r.addr).await;
     c.login("user", "pass").await;
-    let reply = send_mail(
-        &mut c,
-        "sender@foobar.com",
-        &["receiver@foobaz.com"],
-        MESSAGE,
-    )
-    .await;
+    // Unique to this test, so its lines can be picked out of the log that
+    // every test in this binary shares.
+    let from = "unreachable-probe@foobar.com";
+    let reply = send_mail(&mut c, from, &["receiver@foobaz.com"], MESSAGE).await;
     assert!(reply.starts_with("451 "), "{reply}");
+    // The body was drained rather than parsed as commands, so the connection
+    // is still in step and serves the next transaction.
+    assert_eq!(c.command("MAIL FROM:<a@b.com>").await, "250 OK\r\n");
+    // And the operator is told why. This line used to come from the sink;
+    // a relay that fails before the body never reaches one, so without it
+    // here an unreachable upstream refuses mail with nothing in the log
+    // above debug level.
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    let cid = text
+        .lines()
+        .find(|l| l.contains("Mail {") && l.contains(from))
+        .and_then(cid_of)
+        .unwrap_or_else(|| panic!("no message dump for this test in:\n{text}"));
+    assert!(
+        text.lines()
+            .any(|l| cid_of(l) == Some(cid) && l.contains("Mail refused by relay server")),
+        "no refusal line for [{cid}] in:\n{text}"
+    );
 }
 
 /// Item 5. An API-supplied header value carrying `\r\n\r\n` would split the
 /// relayed message and forge a body. The mail is refused and nothing is
-/// relayed at all -- the upstream is never even connected to.
+/// relayed at all -- the upstream connection that was opened alongside the
+/// API call is abandoned without an envelope.
 #[tokio::test]
 async fn a_header_value_with_an_unfolded_break_is_not_relayed() {
     let r = rig(&["DSN"]).await;
@@ -425,8 +452,9 @@ async fn a_header_value_with_an_unfolded_break_is_not_relayed() {
     )
     .await;
     assert_eq!(reply, "550 authentication service failed\r\n");
-    assert!(
-        r.upstream.commands().is_empty(),
+    assert_eq!(
+        r.upstream.commands(),
+        vec!["EHLO localhost.localdomain"],
         "{:?}",
         r.upstream.commands()
     );
@@ -566,6 +594,195 @@ async fn transparency_of_dots_and_multiple_mails_on_one_connection() {
         serde_json::json!(["only@second.com"])
     );
     assert_eq!(r.api.calls()[1]["username"], "user");
+}
+
+/// Streaming, stated as a property of the wire: the upstream has the whole
+/// envelope while the client is still writing its body. Under the buffering
+/// design MAIL FROM could not go out until the terminator had arrived,
+/// because the API was not asked until then.
+#[tokio::test]
+async fn the_envelope_reaches_the_upstream_before_the_body_ends() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\npartial body, no terminator yet\r\n")
+        .await;
+    // No terminator has been sent, so under a buffering proxy the upstream
+    // would still be untouched.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while r.upstream.commands_matching("MAIL").is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "upstream never saw MAIL FROM"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    c.write_raw(".\r\n").await;
+    assert!(c.read_reply().await.starts_with("250"));
+}
+
+/// An upstream that refuses mid-body: its own code and text reach the
+/// client, and the session stays usable afterwards.
+///
+/// The reply is read **before the client has sent its terminator**, which is
+/// what makes this a test of streaming rather than of the reply mapping. A
+/// buffering proxy has relayed nothing at that point and has nothing to say,
+/// so the read would sit there until the client's own timeout. (The brief's
+/// single-write form cannot fail that way: with the terminator already sent,
+/// both designs answer `552`.)
+#[tokio::test]
+async fn an_upstream_rejection_mid_body_reaches_the_client_verbatim() {
+    let r = rig(&["DSN"]).await;
+    r.upstream.reject_during_data(4096, (552, "5.3.4 too big"));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    // Eight MiB, in lines: far past the upstream's patience, and far past
+    // anything the session is willing to hold, so this also says that a body
+    // bigger than memory would like survives the trip. Lines rather than one
+    // enormous one because the upstream reads line by line and would not
+    // reach its own rejection until the whole thing had arrived -- which is
+    // the buffering this test exists to rule out.
+    let line = format!("{}\r\n", "y".repeat(1022));
+    c.write_raw(&format!(
+        "Subject: x\r\n\r\n{}",
+        line.repeat(8 * 1024 * 1024 / line.len())
+    ))
+    .await;
+    assert_eq!(c.read_reply().await, "552 5.3.4 too big\r\n");
+    // The proxy is draining to the terminator, so the message can still be
+    // finished and the connection goes on serving.
+    c.write_raw(".\r\n").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert!(
+        r.upstream.messages().is_empty(),
+        "a refused message must not be recorded as delivered"
+    );
+}
+
+/// A client that abandons the message mid-body must not deliver it. The sink
+/// is dropped without its terminator, so the upstream sees a connection that
+/// closed inside DATA and discards the transaction.
+#[tokio::test]
+async fn a_client_that_hangs_up_mid_body_delivers_nothing() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\nhalf a body\r\n").await;
+    // The envelope is already upstream, so this is the window the test is
+    // about: everything but the terminator has been relayed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while r.upstream.commands_matching("DATA").is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "upstream never saw DATA"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(c);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        r.upstream.messages().is_empty(),
+        "an abandoned message must not be delivered"
+    );
+}
+
+/// The other half of the stuffing seam. `HeaderCollector` takes the client's
+/// stuffing dot off every *header* line so that the API sees content rather
+/// than wire form (`server::data`), so a header name beginning with a dot is
+/// held here one character short of what the client sent. Written raw it
+/// would reach the upstream as `X-Foo: y`; `header_block` stuffs it back
+/// (`proxy.rs`).
+#[tokio::test]
+async fn a_stuffed_header_line_reaches_the_upstream_stuffed() {
+    let r = rig(&["DSN"]).await;
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let msg = "..X-Foo: y\r\nSubject: x\r\n\r\nbody\r\n";
+    assert!(
+        send_mail(&mut c, "a@b.com", &["x@y.com"], msg)
+            .await
+            .starts_with("250")
+    );
+    assert_eq!(
+        String::from_utf8(r.upstream.raw_messages()[0].clone()).unwrap(),
+        msg,
+        "the upstream must see exactly the bytes the client wrote"
+    );
+    // And the API was asked about the header the client really meant, which
+    // is the unstuffed one.
+    assert_eq!(r.api.calls()[0]["headers"][0]["name"], ".X-Foo");
+}
+
+/// Ruling 31(a). The Perl counts the body as the *message* holds it: it
+/// strips the stuffing dot before accumulating (`Connection.pm`,
+/// `$line =~ s/^\.//`), so its count excludes it. The bytes on the wire keep
+/// theirs, so counting what goes upstream would report one byte per stuffed
+/// line too many.
+#[tokio::test]
+async fn the_body_byte_count_excludes_the_stuffing_dots() {
+    let r = rig(&["DSN"]).await;
+    // Unique to this test, so its lines can be picked out of the log that
+    // every test in this binary shares.
+    r.upstream.accept_text("accepted for the byte count");
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    // `..stuffed\r\n` is eleven bytes on the wire and ten in the message;
+    // `plain\r\n` is seven of each. The terminator is part of neither.
+    let msg = "Subject: x\r\n\r\n..stuffed\r\nplain\r\n";
+    assert!(
+        send_mail(&mut c, "a@b.com", &["x@y.com"], msg)
+            .await
+            .starts_with("250")
+    );
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    let cid = text
+        .lines()
+        .find(|l| l.contains("accepted for the byte count"))
+        .and_then(cid_of)
+        .unwrap_or_else(|| panic!("no acceptance line for this test in:\n{text}"));
+    let counted: Vec<&str> = text
+        .lines()
+        .filter(|l| cid_of(l) == Some(cid) && l.contains("Body received"))
+        .collect();
+    assert_eq!(counted.len(), 1, "expected one count line in:\n{text}");
+    assert!(
+        counted[0].contains("Body received 17 Bytes."),
+        "counted the stuffing dot: {}",
+        counted[0]
+    );
+}
+
+/// A reply code is three digits an upstream chose, and
+/// `Reply::wire` panics outside `200..=599`. During DATA the verdict goes
+/// straight at the client, so without the bound in
+/// `UpstreamVerdict::replied` a broken upstream would kill the session
+/// instead of the message.
+#[tokio::test]
+async fn an_upstream_reply_the_client_cannot_be_sent_becomes_451() {
+    let r = rig(&["DSN"]).await;
+    r.upstream
+        .reject_data_end(Some((100, "not a refusal at all")));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    assert_eq!(reply, "451 not a refusal at all\r\n");
+    // The session lived through it, which is the half a panic would take.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
 }
 
 /// Spec 5.1 and the seam it opens. The body reaches the sink verbatim, with

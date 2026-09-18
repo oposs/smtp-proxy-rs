@@ -1399,6 +1399,27 @@ These are deliberate. The gate will report them; they are not defects.
   the rest of the message is drained rather than read as commands. Both flags
   are this proxy's own; the Perl had neither, and no size cap of any kind, so
   the "same CLI flags as the Perl" constraint is untouched.
+- **Task 9: a dead upstream closes the client connection.** Where the Perl
+  (and this proxy until now) answered `451`, a proxy that has already begun
+  relaying has nothing to answer with: during DATA it mirrors the upstream, so
+  an upstream that drops takes the client connection with it. An upstream that
+  *replies* is still relayed verbatim, code and text. The Perl buffers the
+  whole message and only then opens the upstream, so it can never be in this
+  position and no Perl test produces it.
+- **Task 9: a refused message costs the upstream one opened connection.** The
+  upstream connect now runs alongside the API call, because the verdict is
+  needed before `MAIL FROM` and the connect is the only thing that can overlap
+  it. A message the API refuses -- or one whose merged headers or substituted
+  sender the proxy refuses -- therefore leaves an upstream connection that was
+  greeted and then dropped without a `QUIT`; no envelope and no message ever
+  reach it. The Perl connected only after it had a verdict, so it never did
+  this.
+- **Task 9: `Body received <n> Bytes` is absent on an API-rejected message.**
+  The Perl logs it for every message, because it buffers the whole body first
+  and the API decides afterwards. Here the verdict comes before the body, so a
+  refused message is drained rather than counted and the line is never
+  reached. Where it *is* logged the count matches the Perl's: unstuffed bytes,
+  the terminator excluded (`Connection.pm`, `$line =~ s/^\.//`).
 
 ### Test-suite notes for Tasks 20-21 (CI)
 

@@ -352,52 +352,6 @@ pub fn size_suffix(params: &[Param], upstream_announces_size: bool) -> String {
     format!(" SIZE={size}")
 }
 
-/// Rewrites every `\r?\n` to `\r\n` and doubles a dot that follows one
-/// (RFC 5321 4.5.2), in a single pass. This is the Perl's
-///
-/// ```text
-/// s/\015?\012(\.?)/\015\012$1$1/g
-/// ```
-///
-/// (`Mojo/SMTP/Client.pm:517`) written out. The order matters: the Perl
-/// decides the terminator from the *normalised* payload (`_has_nl`,
-/// `Client.pm:594`), so a body that ends in a bare `\n` already ends in CRLF
-/// by the time that decision is made and gains no extra blank line.
-///
-/// A dot at offset 0 is stuffed here where the Perl's non-coderef branch
-/// leaves it alone. The two cannot differ in this proxy -- the payload
-/// always begins with a header name or with the header/body blank line --
-/// and RFC 5321 4.5.2 asks for the stuffing, so it stays.
-pub fn normalize_and_stuff(message: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(message.len() + 16);
-    if message.first() == Some(&b'.') {
-        out.push(b'.');
-    }
-    let mut i = 0;
-    while i < message.len() {
-        let eol = match message[i] {
-            b'\n' => Some(1),
-            b'\r' if message.get(i + 1) == Some(&b'\n') => Some(2),
-            _ => None,
-        };
-        match eol {
-            Some(len) => {
-                out.extend_from_slice(b"\r\n");
-                i += len;
-                if message.get(i) == Some(&b'.') {
-                    out.extend_from_slice(b"..");
-                    i += 1;
-                }
-            }
-            None => {
-                out.push(message[i]);
-                i += 1;
-            }
-        }
-    }
-    out
-}
-
 /// The name in every EHLO and HELO this proxy sends upstream.
 ///
 /// `Mojo::SMTP::Client` has `has hello => 'localhost.localdomain'`
@@ -468,6 +422,33 @@ pub enum UpstreamVerdict {
 }
 
 impl UpstreamVerdict {
+    /// What the upstream said, in a form the client can actually be told.
+    ///
+    /// During DATA this verdict is mirrored straight at the client
+    /// (`server::session`, `fn mirror` and `fn conclude`), and
+    /// [`crate::smtp::reply::Reply::wire`] **panics** on a code outside
+    /// `200..=599` -- the session task would die and the client would be
+    /// answered nothing at all. A reply code is three digits an upstream
+    /// chose, `000` to `999`, so this constructor is the only thing between
+    /// those digits and that panic. **Every `Replied` built from an upstream
+    /// reply has to come through here.**
+    ///
+    /// The bound is `400..600` rather than the wider sendable range for the
+    /// reason [`RelayError::client_code`] gives, and to the same `451`: a 2xx
+    /// or 3xx mid-DATA is not a refusal at all, and relaying it would answer
+    /// the client `250` for a message nobody accepted. The upstream's text is
+    /// kept either way -- it is the only account of what happened.
+    fn replied(code: u16, text: String) -> Self {
+        UpstreamVerdict::Replied {
+            code: if (400..600).contains(&code) {
+                code
+            } else {
+                451
+            },
+            text,
+        }
+    }
+
     /// `command` is the step that was in flight, and it is the caller's to
     /// name: the body and the terminator are two different failures to an
     /// operator reading a log, and only the caller knows which one it drove.
@@ -961,10 +942,7 @@ impl UpstreamSession {
             };
             if early {
                 return Err(match read_reply(&mut self.reader, timeout).await {
-                    Ok(r) => UpstreamVerdict::Replied {
-                        code: r.code,
-                        text: r.text,
-                    },
+                    Ok(r) => UpstreamVerdict::replied(r.code, r.text),
                     Err(_) => UpstreamVerdict::Dropped,
                 });
             }
@@ -978,9 +956,11 @@ impl UpstreamSession {
         // that did not end in CRLF gets one first. `transact` used to make
         // this decision against the whole payload, which it still had in
         // hand; a driven session only remembers the last byte it wrote.
-        // The two agree: every LF `normalize_and_stuff` emits is the second
-        // byte of a CRLF, so "ends in LF" and "ends in CRLF" are the same
-        // question about its output.
+        // The test is on the LF alone because that is what SMTP frames on:
+        // a body whose last byte is an LF has ended its line, whatever came
+        // before it. The proxy's own framer (`server::data`, `struct
+        // BodyFramer`) emits no bare LF at all, so there the two questions
+        // are the same one.
         let tail: &[u8] = if self.last_written == Some(b'\n') {
             b".\r\n"
         } else {
@@ -997,10 +977,7 @@ impl UpstreamSession {
             Err(_) => return Err(UpstreamVerdict::Dropped),
         };
         if accepted.code / 100 != 2 {
-            return Err(UpstreamVerdict::Replied {
-                code: accepted.code,
-                text: accepted.text,
-            });
+            return Err(UpstreamVerdict::replied(accepted.code, accepted.text));
         }
         self.quit().await;
         Ok(accepted.text)
@@ -1039,6 +1016,11 @@ pub async fn probe_over<S: Io + 'static>(
 }
 
 /// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
+///
+/// The convenience form, for a caller that has the whole message in hand.
+/// The proxy does not: it drives an [`UpstreamSession`] itself so the body
+/// streams (`proxy.rs`, `fn open_body`). See [`send_whole_message`] for what
+/// the message has to already be.
 pub async fn relay(
     config: &RelayConfig,
     envelope: Envelope<'_>,
@@ -1075,6 +1057,13 @@ pub async fn relay_over<S: Io + 'static>(
 
 /// Drives an opened session through a message held whole in memory: what
 /// [`relay`] and [`relay_over`] both do once they have an upstream.
+///
+/// The message goes out **verbatim**. The proxy dot-stuffs where the content
+/// is assembled -- the client's body arrives already stuffed and the header
+/// block is stuffed as it is written (`proxy.rs`, `fn header_block`) -- so a
+/// second pass here would stuff everything twice. The caller therefore owns
+/// the encoding: a `message` holding a line that is nothing but a dot ends
+/// DATA where that line sits.
 async fn send_whole_message(
     mut up: UpstreamSession,
     envelope: Envelope<'_>,
@@ -1082,7 +1071,7 @@ async fn send_whole_message(
 ) -> Result<Relayed, RelayError> {
     let caps = up.caps();
     up.open_transaction(envelope).await?;
-    up.write(&normalize_and_stuff(message))
+    up.write(message)
         .await
         .map_err(|v| v.into_relay_error("DATA"))?;
     let message = up
@@ -1180,29 +1169,6 @@ mod tests {
     fn size_suffix_uses_the_first_of_a_duplicated_size_parameter() {
         let params = [p("SIZE", Some("1")), p("SIZE", Some("2"))];
         assert_eq!(size_suffix(&params, true), " SIZE=1");
-    }
-
-    #[test]
-    fn dot_stuffing_on_the_way_out() {
-        assert_eq!(
-            normalize_and_stuff(b"a\r\n.\r\n..x\r\n"),
-            b"a\r\n..\r\n...x\r\n"
-        );
-        assert_eq!(normalize_and_stuff(b".start"), b"..start");
-        assert_eq!(normalize_and_stuff(b"no dots\r\n"), b"no dots\r\n");
-    }
-
-    /// The Perl's one regex does both jobs, so a bare LF never reaches the
-    /// upstream and a dot behind one is stuffed just the same.
-    #[test]
-    fn bare_lf_is_normalised_on_the_way_out() {
-        assert_eq!(normalize_and_stuff(b"a\nb\n"), b"a\r\nb\r\n");
-        assert_eq!(normalize_and_stuff(b"a\n.b\n"), b"a\r\n..b\r\n");
-        assert_eq!(normalize_and_stuff(b"a\r\nb\n.\r\n"), b"a\r\nb\r\n..\r\n");
-        // A lone CR is not a line ending: `\015?\012` needs the LF.
-        assert_eq!(normalize_and_stuff(b"a\rb"), b"a\rb");
-        assert_eq!(normalize_and_stuff(b"a\r\r\n"), b"a\r\r\n");
-        assert_eq!(normalize_and_stuff(b""), b"");
     }
 
     fn rejected(code: u16) -> RelayError {

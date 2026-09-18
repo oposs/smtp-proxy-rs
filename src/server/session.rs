@@ -788,18 +788,32 @@ impl<H: Handler> Session<H> {
             return self.conclude(sink.finish().await).await;
         }
         let mut framer = BodyFramer::new();
+        // What the Perl's `Body received` counts: the body as the *message*
+        // holds it, which is the bytes the client sent with the stuffing dots
+        // taken back off (`Connection.pm`, `$line =~ s/^\.//` before
+        // `$handled .= $line`). Counted here, against what arrived, rather
+        // than against what goes upstream: the wire form keeps its stuffing
+        // and would count a dot the message does not have.
         let mut body_bytes = 0usize;
         // Mirrors the framer's own view of where a line begins, as of the
         // piece just pushed. The framer keeps it privately for the
-        // terminator; the session needs it for the one thing the framer
-        // cannot answer for, a drain that starts mid-line. Every arm below
-        // sets it before anything reads it, so it starts with no value.
-        let mut at_line_start;
+        // terminator; the session needs it for two things the framer cannot
+        // answer for: a drain that starts mid-line, and whether a leading dot
+        // is stuffing or content. The body starts at a line start.
+        let mut at_line_start = true;
         loop {
+            // The state the bytes about to be read begin in, before the arms
+            // below move it on.
+            let begins_line = at_line_start;
+            // What these bytes add to the message: their own length, less
+            // the stuffing dot if they begin a line with one. Set by every
+            // arm that reads bytes; the one that does not returns.
+            let arrived;
             let piece = match self.next_line(WRITE_CHUNK).await? {
                 Line::Got(line) => {
                     log.note(line.len());
                     at_line_start = true;
+                    arrived = line.len() - usize::from(begins_line && line.starts_with(b"."));
                     framer.push(&line)
                 }
                 // No newline within a chunk's worth of bytes. There is no
@@ -813,6 +827,7 @@ impl<H: Handler> Session<H> {
                 Line::TooLong => {
                     let partial = std::mem::take(&mut self.buf);
                     at_line_start = false;
+                    arrived = partial.len() - usize::from(begins_line && partial.starts_with(b"."));
                     framer.push_partial(&partial)
                 }
                 Line::Eof => {
@@ -822,11 +837,16 @@ impl<H: Handler> Session<H> {
                     return Ok(Flow::Close);
                 }
             };
+            // The terminator is not part of the message, so the line that
+            // carries it adds nothing. Decided from the framer's answer
+            // rather than re-tested here, so the two cannot disagree.
+            if !matches!(piece, BodyPiece::Terminator) {
+                body_bytes += arrived;
+            }
             match piece {
                 // Staged, and not yet a write's worth. Read on.
                 BodyPiece::Pending => {}
                 BodyPiece::Chunk(chunk) => {
-                    body_bytes += chunk.len();
                     if let Err(verdict) = sink.write(&chunk).await {
                         return self.mirror(verdict, at_line_start, &mut log).await;
                     }
@@ -837,7 +857,6 @@ impl<H: Handler> Session<H> {
         // What is staged below a chunk is still body. Without this every
         // message shorter than `WRITE_CHUNK` would be delivered empty.
         let rest = framer.flush();
-        body_bytes += rest.len();
         if !rest.is_empty()
             && let Err(verdict) = sink.write(&rest).await
         {
