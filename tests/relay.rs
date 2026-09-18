@@ -10,9 +10,95 @@ use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
-    Envelope, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamSession,
-    UpstreamTls, UpstreamTlsMode, probe, probe_over, relay, relay_over,
+    Envelope, Io, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamCaps,
+    UpstreamSession, UpstreamTls, UpstreamTlsMode, assert_relayable, probe, probe_over,
 };
+// The convenience constructor these tests drive `UpstreamSession` through.
+//
+// It lives here rather than in the library because nothing in `src/` calls
+// it: the proxy drives an `UpstreamSession` itself so that the body streams
+// (`proxy.rs`, `fn open_body`), and a caller holding a whole message in
+// memory is only ever a test. Shipped in the library it was `pub` API for
+// every downstream consumer, and a standing "is this dead code?" question.
+// The tests below exercise `UpstreamSession`; this is scaffolding they
+// happen to call.
+
+/// Outcome of a relayed message.
+#[derive(Clone, Debug)]
+struct Relayed {
+    /// Text of the 250 reply to the final dot (the upstream queue id). A
+    /// multi-line reply arrives here with its lines joined by `\n`;
+    /// `smtp::reply::sanitize` folds those away before a client sees it.
+    message: String,
+    caps: UpstreamCaps,
+}
+
+/// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
+///
+/// The convenience form, for a caller that has the whole message in hand.
+/// The proxy does not: it drives an [`UpstreamSession`] itself so the body
+/// streams (`proxy.rs`, `fn open_body`). See [`send_whole_message`] for what
+/// the message has to already be.
+async fn relay(
+    config: &RelayConfig,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    // Before the connection, so that an address the API substituted cannot
+    // even cost a TCP handshake.
+    assert_relayable(envelope.from)?;
+    for r in envelope.recipients {
+        assert_relayable(&r.address)?;
+    }
+    send_whole_message(UpstreamSession::connect(config).await?, envelope, message).await
+}
+
+/// [`relay`] over a stream the caller supplies, without TLS. See
+/// [`Io`].
+async fn relay_over<S: Io + 'static>(
+    stream: S,
+    timeout: Duration,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    assert_relayable(envelope.from)?;
+    for r in envelope.recipients {
+        assert_relayable(&r.address)?;
+    }
+    send_whole_message(
+        UpstreamSession::over(stream, timeout).await?,
+        envelope,
+        message,
+    )
+    .await
+}
+
+/// Drives an opened session through a message held whole in memory: what
+/// [`relay`] and [`relay_over`] both do once they have an upstream.
+///
+/// The message goes out **verbatim**. The proxy dot-stuffs where the content
+/// is assembled -- the client's body arrives already stuffed and the header
+/// block is stuffed as it is written (`proxy.rs`, `fn header_block`) -- so a
+/// second pass here would stuff everything twice. The caller therefore owns
+/// the encoding: a `message` holding a line that is nothing but a dot ends
+/// DATA where that line sits.
+async fn send_whole_message(
+    mut up: UpstreamSession,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    let caps = up.caps();
+    up.open_transaction(envelope).await?;
+    up.write(message)
+        .await
+        .map_err(|v| v.into_relay_error("DATA"))?;
+    let message = up
+        .finish()
+        .await
+        .map_err(|v| v.into_relay_error("DATA_END"))?;
+    Ok(Relayed { message, caps })
+}
+
 use smtp_proxy::smtp::params::Param;
 
 /// How many bytes may sit in flight on the in-memory connections the timing

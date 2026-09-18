@@ -194,10 +194,10 @@ impl RelayError {
     /// deletes the mail the other asked it to queue.
     ///
     /// `Io`, `Timeout`, `Tls` and `NoStartTls` carry no upstream code at all,
-    /// because the upstream never answered. [`relay`] opens a fresh
-    /// connection per message, so an upstream restarted between two messages
-    /// lands in this group: nothing about the message was wrong, so `451`
-    /// and the client comes back.
+    /// because the upstream never answered. [`UpstreamSession::connect`]
+    /// opens a fresh connection per message, so an upstream restarted between
+    /// two messages lands in this group: nothing about the message was wrong,
+    /// so `451` and the client comes back.
     ///
     /// `Address` stays `550`. That is *our* refusal of a malformed address,
     /// it is permanent, and it is not the upstream's opinion at all.
@@ -276,16 +276,6 @@ impl UpstreamCaps {
             size_announced: extensions.contains("SIZE"),
         }
     }
-}
-
-/// Outcome of a relayed message.
-#[derive(Clone, Debug)]
-pub struct Relayed {
-    /// Text of the 250 reply to the final dot (the upstream queue id). A
-    /// multi-line reply arrives here with its lines joined by `\n`;
-    /// `smtp::reply::sanitize` folds those away before a client sees it.
-    pub message: String,
-    pub caps: UpstreamCaps,
 }
 
 /// RFC 5321 4.1.2 builds a path out of printable ASCII; the angle brackets
@@ -1013,72 +1003,6 @@ pub async fn probe_over<S: Io + 'static>(
     let (mut up, caps) = greet(Box::new(stream), timeout, &UpstreamTls::off(), "").await?;
     up.quit().await;
     Ok(caps)
-}
-
-/// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
-///
-/// The convenience form, for a caller that has the whole message in hand.
-/// The proxy does not: it drives an [`UpstreamSession`] itself so the body
-/// streams (`proxy.rs`, `fn open_body`). See [`send_whole_message`] for what
-/// the message has to already be.
-pub async fn relay(
-    config: &RelayConfig,
-    envelope: Envelope<'_>,
-    message: &[u8],
-) -> Result<Relayed, RelayError> {
-    // Before the connection, so that an address the API substituted cannot
-    // even cost a TCP handshake.
-    assert_relayable(envelope.from)?;
-    for r in envelope.recipients {
-        assert_relayable(&r.address)?;
-    }
-    send_whole_message(UpstreamSession::connect(config).await?, envelope, message).await
-}
-
-/// [`relay`] over a stream the caller supplies, without TLS. See
-/// [`Io`].
-pub async fn relay_over<S: Io + 'static>(
-    stream: S,
-    timeout: Duration,
-    envelope: Envelope<'_>,
-    message: &[u8],
-) -> Result<Relayed, RelayError> {
-    assert_relayable(envelope.from)?;
-    for r in envelope.recipients {
-        assert_relayable(&r.address)?;
-    }
-    send_whole_message(
-        UpstreamSession::over(stream, timeout).await?,
-        envelope,
-        message,
-    )
-    .await
-}
-
-/// Drives an opened session through a message held whole in memory: what
-/// [`relay`] and [`relay_over`] both do once they have an upstream.
-///
-/// The message goes out **verbatim**. The proxy dot-stuffs where the content
-/// is assembled -- the client's body arrives already stuffed and the header
-/// block is stuffed as it is written (`proxy.rs`, `fn header_block`) -- so a
-/// second pass here would stuff everything twice. The caller therefore owns
-/// the encoding: a `message` holding a line that is nothing but a dot ends
-/// DATA where that line sits.
-async fn send_whole_message(
-    mut up: UpstreamSession,
-    envelope: Envelope<'_>,
-    message: &[u8],
-) -> Result<Relayed, RelayError> {
-    let caps = up.caps();
-    up.open_transaction(envelope).await?;
-    up.write(message)
-        .await
-        .map_err(|v| v.into_relay_error("DATA"))?;
-    let message = up
-        .finish()
-        .await
-        .map_err(|v| v.into_relay_error("DATA_END"))?;
-    Ok(Relayed { message, caps })
 }
 
 #[cfg(test)]
