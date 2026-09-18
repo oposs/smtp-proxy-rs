@@ -4,7 +4,14 @@
 
 ### New
 
-- `--max_message_size`, default 1 GiB; a larger message is answered 552
+- `--max_header_size`, default 1 MiB; a header block larger than that is
+  answered `552 Header block exceeds maximum size of <n> bytes`. It replaces
+  the `--max_message_size` this section used to announce: the body is streamed
+  to the upstream rather than held, so the proxy has no size opinion of its
+  own about the message as a whole. The only stated limit is the upstream's
+- the upstream's `SIZE` limit is advertised to clients on EHLO, and a client's
+  own `SIZE=` on MAIL FROM is forwarded to the upstream. The Perl announced
+  neither, so a client learned a message was too large only after sending it
 - `--version`
 - `--upstream_tls`, default opportunistic, so the connection to the upstream
   uses STARTTLS when the upstream offers it, with certificate verification
@@ -70,6 +77,14 @@
   without this an unauthenticated client could hold every slot for ever by
   sending nothing at all. The wait for the client's *first* command has a
   shorter deadline of its own, `--greeting_timeout` above
+- UPGRADE NOTE: an upstream that dies in the middle of a message now closes the
+  client connection instead of answering `451` at the terminator. During DATA
+  the proxy is a mirror: it has already relayed the body it received, so it
+  cannot honestly promise to hold a message it no longer has, and a silent
+  close is what RFC 5321 leaves a client to retry on. A client that expected a
+  `451` sees a dropped connection instead; both mean "try again", but a client
+  that treats an unexpected close as a hard failure has to be reconfigured. An
+  upstream that *answers* mid-body is still relayed verbatim
 
 ### Fixed
 
