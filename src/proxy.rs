@@ -641,7 +641,9 @@ impl Handler for ProxyHandler {
         // different places: a refusal at the terminator lands in
         // `ProxySink::finish`, one spoken mid-body lands in
         // `ProxySink::write` and never reaches `finish` at all. Both call
-        // `ProxySink::report_refusal`, which is the same three lines.
+        // the free `report_refusal`, which is the same three lines -- free
+        // rather than a method because `UpstreamSession::finish` consumes
+        // the session out of the sink.
         let refuse = |e: RelayError| {
             info!("Mail refused by relay server ({e}) for {}", self.client);
             debug!("Mail {}", request.redacted_json());

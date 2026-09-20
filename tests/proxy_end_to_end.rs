@@ -626,9 +626,12 @@ async fn a_client_that_hangs_up_mid_body_delivers_nothing() {
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
     c.write_raw("Subject: x\r\n\r\nhalf a body\r\n").await;
-    // Without this the half body would still be in the client's TLS buffer
-    // when the client goes away, and the test would silently shrink to "a
-    // client that hangs up right after DATA".
+    // Puts the half body on the wire instead of leaving it in rustls'
+    // output buffer; see `RawClient::flush` for why a write alone does not.
+    // It is not what keeps this test honest: the framer stages everything
+    // below `WRITE_CHUNK`, so `half a body\r\n` never reaches the upstream
+    // either way, and the poll loop below fails hard if the client's bytes
+    // are stuck, so nothing here can shrink silently.
     c.flush().await;
     // The envelope is already upstream, so this is the window the test is
     // about: everything but the terminator has been relayed.

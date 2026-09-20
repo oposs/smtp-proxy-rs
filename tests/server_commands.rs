@@ -608,6 +608,13 @@ async fn an_upstream_that_drops_while_the_body_is_arriving_closes_the_client() {
 /// The drain's budget. `MAX_COMMAND_BUFFER` is private to `session.rs`, so
 /// the two tests below carry their own copy; they assert nothing about the
 /// number itself, only that a run longer than it has no line break in it.
+///
+/// The copy can only decay in one direction. `session.rs` tests `buf.len() >
+/// max_incomplete`, so a *smaller* budget there still reports `TooLong` on
+/// these runs and the tests go on exercising the road they are about. It is
+/// *growth* that would make them vacuous: a budget above the 65537-byte runs
+/// they send would take the line as a line, and `TooLong` would never be
+/// reached.
 const DRAIN_BUDGET: usize = 64 * 1024;
 
 /// M5's guard. The mirror's drain must be told that it is starting in the
