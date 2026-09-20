@@ -6,6 +6,7 @@ mod common;
 
 use common::raw_client::RawClient;
 use common::{captured_log, rig, rig_relaying_to};
+use smtp_proxy::server::data::WRITE_CHUNK;
 
 async fn send_mail(c: &mut RawClient, from: &str, to: &[&str], message: &str) -> String {
     assert_eq!(
@@ -612,6 +613,153 @@ async fn a_refusal_mid_body_is_reported_to_the_operator() {
             .any(|l| l.contains("Mail refused by relay server") && l.contains(REFUSAL)),
         "a mid-body refusal left nothing above debug level; log:\n{text}"
     );
+}
+
+/// The stage a lost upstream is reported against has to be the step the
+/// proxy was driving, because the body and the terminator are two different
+/// failures to an operator reading a log
+/// (`UpstreamVerdict::into_relay_error`). The proxy writes body on both
+/// sides of the terminator: the framer stages everything below
+/// `WRITE_CHUNK`, so a message shorter than that reaches the upstream only
+/// through the flush `session::read_message` does *after* the terminator is
+/// in, and a failure there belongs to `DATA_END`, not to the body.
+///
+/// Both halves below lose the same upstream at the same moment -- it resets
+/// the connection as soon as it has the head of the header block, long
+/// before either body is written -- and differ in nothing but the size of
+/// the message, which is what decides which write meets the dead socket.
+///
+/// Why a reset and not a plain hangup, which would leave it open whether
+/// the write or `finish` reported the loss: see
+/// `RecordingUpstream::reset_during_data`.
+///
+/// `Body received N Bytes` is what keeps each half honest. It is logged
+/// between the last body write and `finish`, so a run that reached it took
+/// the other road, and the stage read off the log would be `finish`'s report
+/// rather than the write's. Asserted before the stages, so a half that
+/// misses its road says so instead of reading as a pass.
+#[tokio::test]
+async fn the_stage_of_a_lost_upstream_is_the_step_the_proxy_was_driving() {
+    // Short enough to be staged whole, so the flush after the terminator is
+    // the first and only write of it.
+    const SHORT: usize = 4097;
+    let r = rig(&["DSN"]).await;
+    // One byte is the head of the header block, which goes upstream from
+    // `open_body`: the upstream is gone before any body is written.
+    r.upstream.reset_during_data(1);
+
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let short_client = c.local_addr();
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    // The blank line is what makes the proxy open the upstream body, so the
+    // reset is drawn by these bytes and not by the ones below.
+    c.write_raw("Subject: x\r\n\r\n").await;
+    c.flush().await;
+    wait_for_reset(&r.upstream, 1).await;
+    c.write_raw(&format!("{}\r\n", "a".repeat(SHORT - 2))).await;
+    c.write_raw(".\r\n").await;
+    c.flush().await;
+    let short_stage = stage_reported_for(short_client).await;
+
+    // The same loss met a chunk earlier. The body is the smallest whole
+    // number of lines that reaches `WRITE_CHUNK`, so the framer's chunk is
+    // the last thing the client sends: the proxy has read all of it before
+    // it gives the message up, and the client is never left writing into a
+    // session that has already closed.
+    let line = format!("{}\r\n", "b".repeat(1021));
+    let body = line.repeat(WRITE_CHUNK.div_ceil(line.len()));
+    assert!(body.len() >= WRITE_CHUNK && body.len() - line.len() < WRITE_CHUNK);
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let long_client = c.local_addr();
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    c.flush().await;
+    wait_for_reset(&r.upstream, 2).await;
+    c.write_raw(&body).await;
+    c.flush().await;
+    let long_stage = stage_reported_for(long_client).await;
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    assert!(
+        !text.contains(&format!("Body received {SHORT} Bytes")),
+        "the short message got past its last write, so this run says nothing \
+         about the write after the terminator; log:\n{text}"
+    );
+    assert!(
+        !text.contains(&format!("Body received {} Bytes", body.len())),
+        "the long message got past its chunk, so this run says nothing about \
+         a mid-body write; log:\n{text}"
+    );
+    assert_eq!(
+        short_stage, "DATA_END",
+        "a message written only after the terminator must not be reported \
+         against the body"
+    );
+    assert_eq!(
+        long_stage, "DATA",
+        "a chunk written while the client is still sending is the body"
+    );
+}
+
+/// Waits for the upstream to have hung up on `n` connections, and then for
+/// the reset to have reached the proxy. The count is raised before the
+/// transport is dropped, so the sleep is what covers the close itself; it is
+/// four orders of magnitude more than a loopback RST needs, and a run where
+/// it was not enough fails on a `Body received` guard rather than passing.
+async fn wait_for_reset(upstream: &common::upstream::RecordingUpstream, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while upstream.hangups() < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upstream never hung up"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+/// The stage named in the single `Mail refused by relay server` line this
+/// client's connection left in the log every test in this binary shares.
+/// The sentence is `lost the upstream during {stage}: ...`, and the client's
+/// own address is what picks its line out of everyone else's.
+///
+/// Waited for rather than read once: the proxy writes it as it gives the
+/// message up, so its arrival is also what says the session is over. The
+/// client cannot be asked instead -- it is on TLS, and a server that drops
+/// the connection without a `close_notify` is an error to rustls, not an end
+/// of stream.
+async fn stage_reported_for(client: std::net::SocketAddr) -> String {
+    let marker = format!("for {client}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("Mail refused by relay server") && l.ends_with(&marker))
+            .collect();
+        match lines.as_slice() {
+            [] => assert!(
+                std::time::Instant::now() < deadline,
+                "no refusal was ever reported for {client}"
+            ),
+            [line] => {
+                return line
+                    .split("during ")
+                    .nth(1)
+                    .and_then(|rest| rest.split(':').next())
+                    .unwrap_or("<the line names no stage>")
+                    .to_string();
+            }
+            more => panic!("expected one refusal line for {client}; got {more:#?}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// A client that abandons the message mid-body must not deliver it. The sink

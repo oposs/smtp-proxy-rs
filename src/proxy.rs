@@ -484,8 +484,15 @@ fn report_refusal(
     debug!("ApiResult {}", outcome.json());
 }
 
-impl BodySink for ProxySink {
-    async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
+impl ProxySink {
+    /// One piece of body, reported against the SMTP step the caller says it
+    /// belongs to. Both [`BodySink`] writes are this, and they differ in
+    /// nothing else.
+    async fn write_stage(
+        &mut self,
+        chunk: &[u8],
+        stage: &'static str,
+    ) -> Result<(), UpstreamVerdict> {
         // Straight out, exactly as the client wrote it. The client's own dot
         // stuffing is the wire encoding the upstream wants, so nothing here
         // touches it (spec 5.1).
@@ -496,9 +503,22 @@ impl BodySink for ProxySink {
             // So this is the one place the operator's three lines can come
             // from for the mid-body road -- the newest failure mode on this
             // branch, and the one an operator is least likely to know about.
-            report_refusal(self.client, &self.request, &self.outcome, verdict, "DATA");
+            report_refusal(self.client, &self.request, &self.outcome, verdict, stage);
         }
         result
+    }
+}
+
+impl BodySink for ProxySink {
+    async fn write(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
+        self.write_stage(chunk, "DATA").await
+    }
+
+    /// The terminator is already read, so these bytes are part of `DATA_END`
+    /// and not of the body -- the same failure `finish` below reports, met
+    /// one step earlier.
+    async fn write_final(&mut self, chunk: &[u8]) -> Result<(), UpstreamVerdict> {
+        self.write_stage(chunk, "DATA_END").await
     }
 
     async fn finish(self) -> Result<String, UpstreamVerdict> {

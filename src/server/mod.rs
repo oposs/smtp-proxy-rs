@@ -102,6 +102,28 @@ impl Rejection {
 /// is the whole abort path -- there is no other.
 pub trait BodySink: Send {
     fn write(&mut self, chunk: &[u8]) -> impl Future<Output = Result<(), UpstreamVerdict>> + Send;
+
+    /// The last piece of body, written once the terminator has already been
+    /// read.
+    ///
+    /// The same bytes as [`BodySink::write`], but a different SMTP step:
+    /// what fails here fails at `DATA_END`, because the client has finished
+    /// sending and only the staged tail was left to push. Which of the two
+    /// it is cannot be read off the bytes, and
+    /// [`crate::relay::UpstreamVerdict::into_relay_error`] says whose
+    /// question it is -- the caller's. So it is a method and not a string
+    /// argument: the two call sites in [`crate::server::session`] are
+    /// already distinct, and no caller can name the phase wrongly.
+    ///
+    /// The default is `write`, which is the right answer for a sink that
+    /// does not tell the two apart.
+    fn write_final(
+        &mut self,
+        chunk: &[u8],
+    ) -> impl Future<Output = Result<(), UpstreamVerdict>> + Send {
+        self.write(chunk)
+    }
+
     fn finish(self) -> impl Future<Output = Result<String, UpstreamVerdict>> + Send;
 }
 

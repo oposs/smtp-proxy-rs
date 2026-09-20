@@ -82,6 +82,14 @@ struct Inner {
     reject_during_data: Option<(usize, u16, String)>,
     /// After this many body bytes have been consumed, close the connection.
     drop_during_data: Option<usize>,
+    /// Close with `SO_LINGER 0`, so that the close is an RST and not a FIN.
+    /// Read once per accepted connection, before the transport is boxed.
+    reset_on_close: bool,
+    /// How many connections `drop_during_data` has hung up, across every
+    /// connection since the last `clear()`. Counted before the transport is
+    /// dropped, so a test can wait for the hangup it asked for instead of
+    /// sleeping for it.
+    hangups: usize,
     /// Answer EHLO and the MAIL that follows it in a *single* write, and then
     /// say nothing to MAIL itself. The relay's read of the EHLO reply then
     /// pulls the MAIL reply off the socket too, so it is sitting in the
@@ -122,6 +130,8 @@ impl Inner {
             data_pace: None,
             reject_during_data: None,
             drop_during_data: None,
+            reset_on_close: false,
+            hangups: 0,
             coalesce_mail_reply: false,
             tls: None,
             implicit: false,
@@ -160,6 +170,15 @@ impl RecordingUpstream {
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                if state.lock().unwrap().reset_on_close {
+                    // Deprecated in tokio because a *non-zero* `SO_LINGER`
+                    // blocks the thread that drops the socket until the send
+                    // queue drains. Zero is the opposite: the close returns
+                    // at once, discarding what is queued and sending an RST,
+                    // which is the whole point of this fault.
+                    #[allow(deprecated)]
+                    stream.set_linger(Some(Duration::ZERO)).unwrap();
+                }
                 tokio::spawn(serve_one(Box::new(stream), state.clone()));
             }
         });
@@ -293,6 +312,33 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().drop_during_data = Some(after_bytes);
     }
 
+    /// [`RecordingUpstream::drop_during_data`], but the connection is
+    /// **reset** rather than closed: `SO_LINGER 0` makes the close an RST.
+    ///
+    /// A FIN is not enough for a test that cares *which* write meets the
+    /// dead upstream. `UpstreamSession::write` races its own write against
+    /// a read of the upstream, and after a FIN both are ready at once -- the
+    /// write lands in the kernel's send buffer and the read sees end of
+    /// stream -- so which branch the `select!` picks decides whether the
+    /// loss is reported by that write or only later by `finish`. After an
+    /// RST both halves error, so it is reported by the write, whichever
+    /// branch wins.
+    ///
+    /// The flag is read when a connection is accepted, so it has to be set
+    /// before the connection it is meant for is made. The rig's own startup
+    /// probe is over by the time a test can call this.
+    pub fn reset_during_data(&self, after_bytes: usize) {
+        let mut i = self.inner.lock().unwrap();
+        i.drop_during_data = Some(after_bytes);
+        i.reset_on_close = true;
+    }
+
+    /// How many connections have hung up under
+    /// [`RecordingUpstream::drop_during_data`] since the last `clear()`.
+    pub fn hangups(&self) -> usize {
+        self.inner.lock().unwrap().hangups
+    }
+
     /// Send the MAIL reply already with the EHLO reply, in one write. See
     /// `Inner::coalesce_mail_reply`.
     pub fn coalesce_mail_reply(&self) {
@@ -332,6 +378,7 @@ impl RecordingUpstream {
         i.messages.clear();
         i.tls_commands.clear();
         i.discarded_bytes = 0;
+        i.hangups = 0;
     }
 }
 
@@ -437,6 +484,10 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 if let Some(after) = drop_at
                     && body_bytes >= after
                 {
+                    // Counted before the transport is dropped, so a test
+                    // that waits for this sees it no later than the close
+                    // itself. See `RecordingUpstream::hangups`.
+                    state.lock().unwrap().hangups += 1;
                     return;
                 }
                 if let Some((after, code, text)) = reject

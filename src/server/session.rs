@@ -857,8 +857,11 @@ impl<H: Handler> Session<H> {
         // What is staged below a chunk is still body. Without this every
         // message shorter than `WRITE_CHUNK` would be delivered empty.
         let rest = framer.flush();
+        // `write_final`, not `write`: the terminator is in, so a failure on
+        // these bytes is the terminator's and is reported against
+        // `DATA_END`. See [`BodySink::write_final`].
         if !rest.is_empty()
-            && let Err(verdict) = sink.write(&rest).await
+            && let Err(verdict) = sink.write_final(&rest).await
         {
             // No drain: the terminator has already been read, so what would
             // be drained is the *next* client's commands.

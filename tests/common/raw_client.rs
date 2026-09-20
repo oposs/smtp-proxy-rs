@@ -16,18 +16,30 @@ pub use smtp_proxy::relay::{Io, NoVerify};
 pub struct RawClient {
     stream: Box<dyn Io>,
     buf: Vec<u8>,
+    /// The address the *server* knows this connection by, kept from before
+    /// the transport was boxed (and possibly replaced by TLS). It is what
+    /// the proxy prints as `for {client}`, so a test can pick its own
+    /// connection's lines out of a log every test in the binary shares.
+    local: SocketAddr,
 }
 
 impl RawClient {
     /// Connects and returns the client together with the 220 greeting.
     pub async fn connect(addr: SocketAddr) -> (Self, String) {
         let stream = TcpStream::connect(addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
         let mut c = Self {
             stream: Box::new(stream),
             buf: Vec::new(),
+            local,
         };
         let greeting = c.read_reply().await;
         (c, greeting)
+    }
+
+    /// The address the server sees this client at. See `RawClient::local`.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
     }
 
     pub async fn command(&mut self, line: &str) -> String {
