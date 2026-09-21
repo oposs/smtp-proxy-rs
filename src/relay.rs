@@ -165,11 +165,7 @@ pub enum RelayError {
     /// The upstream answered outside the expected class. The string is the
     /// reply text without its code, which is what the client gets in its 550.
     #[error("{text}")]
-    Rejected {
-        command: &'static str,
-        code: u16,
-        text: String,
-    },
+    Rejected { code: u16, text: String },
     #[error(
         "Refusing to relay the address '{0}': it contains characters that cannot appear in an SMTP command line"
     )]
@@ -442,6 +438,13 @@ impl UpstreamVerdict {
     /// `command` is the step that was in flight, and it is the caller's to
     /// name: the body and the terminator are two different failures to an
     /// operator reading a log, and only the caller knows which one it drove.
+    ///
+    /// It reaches a log on the `Dropped` road alone. A `Replied` upstream
+    /// becomes `Rejected`, whose whole rendering is the upstream's own reply
+    /// text -- that is the Perl's `Mail refused by relay server ($error)`
+    /// line, and `$error` there stringifies to the text and nothing else.
+    /// So there is no slot to put the step in without diverging, and
+    /// `Rejected` deliberately does not carry one.
     pub fn into_relay_error(self, command: &'static str) -> RelayError {
         match self {
             // Deliberately vague about *how* the upstream was lost, because
@@ -457,11 +460,7 @@ impl UpstreamVerdict {
                     "lost the upstream during {command}: it stopped reading, closed the connection, or answered unintelligibly"
                 ),
             )),
-            UpstreamVerdict::Replied { code, text } => RelayError::Rejected {
-                command,
-                code,
-                text,
-            },
+            UpstreamVerdict::Replied { code, text } => RelayError::Rejected { code, text },
         }
     }
 }
@@ -605,11 +604,7 @@ async fn send_command<W: AsyncWrite + Unpin>(
 }
 
 /// Logs a reply and requires it to be in the class the command expected.
-fn require_class(
-    name: &'static str,
-    reply: UpstreamReply,
-    expect_class: u16,
-) -> Result<UpstreamReply, RelayError> {
+fn require_class(reply: UpstreamReply, expect_class: u16) -> Result<UpstreamReply, RelayError> {
     debug!(
         "upstream -> {} {}",
         reply.code,
@@ -617,7 +612,6 @@ fn require_class(
     );
     if reply.code / 100 != expect_class {
         return Err(RelayError::Rejected {
-            command: name,
             code: reply.code,
             text: reply.text,
         });
@@ -640,13 +634,12 @@ impl Upstream {
     /// inside a method they are.
     async fn command(
         &mut self,
-        name: &'static str,
         line: String,
         expect_class: u16,
     ) -> Result<UpstreamReply, RelayError> {
         send_command(&mut self.stream, self.timeout, &line).await?;
         let reply = read_reply(&mut self.stream, self.timeout).await?;
-        require_class(name, reply, expect_class)
+        require_class(reply, expect_class)
     }
 
     /// Greeting and EHLO (HELO fallback on 5xx), then STARTTLS if the mode
@@ -663,15 +656,14 @@ impl Upstream {
         let greeting = read_reply(&mut self.stream, self.timeout).await?;
         if greeting.code / 100 != 2 {
             return Err(RelayError::Rejected {
-                command: "CONNECT",
                 code: greeting.code,
                 text: greeting.text,
             });
         }
-        let mut extensions = match self.command("EHLO", format!("EHLO {HELLO}"), 2).await {
+        let mut extensions = match self.command(format!("EHLO {HELLO}"), 2).await {
             Ok(reply) => parse_extensions(&reply.raw),
             Err(RelayError::Rejected { code, .. }) if code / 100 == 5 => {
-                self.command("HELO", format!("HELO {HELLO}"), 2).await?;
+                self.command(format!("HELO {HELLO}"), 2).await?;
                 Extensions::default()
             }
             Err(e) => return Err(e),
@@ -688,10 +680,9 @@ impl Upstream {
             }
         };
         if want_tls {
-            self.command("STARTTLS", "STARTTLS".into(), 2).await?;
+            self.command("STARTTLS".into(), 2).await?;
             self.upgrade(tls, server_name).await?;
-            extensions =
-                parse_extensions(&self.command("EHLO", format!("EHLO {HELLO}"), 2).await?.raw);
+            extensions = parse_extensions(&self.command(format!("EHLO {HELLO}"), 2).await?.raw);
         }
         Ok(extensions)
     }
@@ -715,7 +706,7 @@ impl Upstream {
     }
 
     async fn quit(&mut self) {
-        let _ = self.command("QUIT", "QUIT".into(), 2).await;
+        let _ = self.command("QUIT".into(), 2).await;
     }
 }
 
@@ -838,13 +829,12 @@ impl UpstreamSession {
     /// separate fields.
     async fn command(
         &mut self,
-        name: &'static str,
         line: String,
         expect_class: u16,
     ) -> Result<UpstreamReply, RelayError> {
         send_command(&mut self.writer, self.timeout, &line).await?;
         let reply = read_reply(&mut self.reader, self.timeout).await?;
-        require_class(name, reply, expect_class)
+        require_class(reply, expect_class)
     }
 
     /// MAIL, every RCPT, then DATA. Returns once the upstream has answered
@@ -856,16 +846,16 @@ impl UpstreamSession {
             dsn_suffix(envelope.mail_params, is_mail_dsn_keyword, self.caps.dsn),
             size_suffix(envelope.mail_params, self.caps.size_announced),
         );
-        self.command("MAIL", mail, 2).await?;
+        self.command(mail, 2).await?;
         for r in envelope.recipients {
             let rcpt = format!(
                 "RCPT TO:<{}>{}",
                 r.address,
                 dsn_suffix(&r.parameters, is_rcpt_dsn_keyword, self.caps.dsn)
             );
-            self.command("RCPT", rcpt, 2).await?;
+            self.command(rcpt, 2).await?;
         }
-        self.command("DATA", "DATA".into(), 3).await?;
+        self.command("DATA".into(), 3).await?;
         Ok(())
     }
 
@@ -974,7 +964,7 @@ impl UpstreamSession {
     }
 
     async fn quit(&mut self) {
-        let _ = self.command("QUIT", "QUIT".into(), 2).await;
+        let _ = self.command("QUIT".into(), 2).await;
     }
 }
 
@@ -1097,7 +1087,6 @@ mod tests {
 
     fn rejected(code: u16) -> RelayError {
         RelayError::Rejected {
-            command: "DATA_END",
             code,
             text: "text".into(),
         }

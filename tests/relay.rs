@@ -411,11 +411,9 @@ async fn upstream_rejection_carries_its_text() {
         recipients: &recipients,
     };
     match relay(&config(&up), env, b"x\r\n").await {
-        Err(RelayError::Rejected {
-            command: "MAIL",
-            code: 553,
-            text,
-        }) => assert_eq!(text, "Sorry, I don't send from there"),
+        Err(RelayError::Rejected { code: 553, text }) => {
+            assert_eq!(text, "Sorry, I don't send from there")
+        }
         other => panic!("{other:?}"),
     }
 }
