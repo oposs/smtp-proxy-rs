@@ -57,7 +57,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         require_starttls: true,
         require_auth: true,
         tls: Some(tls),
-        max_message_size: config.max_message_size,
+        max_header_size: config.max_header_size,
         smtplog,
         idle_timeout: Duration::from_secs(600),
         // 0 means "no separate greeting deadline", so the ordinary

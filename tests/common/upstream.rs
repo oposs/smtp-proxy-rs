@@ -74,6 +74,29 @@ struct Inner {
     /// a body several times bigger than the buffers can hold, which puts
     /// every pause safely inside the transfer.
     data_pace: Option<(usize, Duration, usize)>,
+    /// After this many body bytes have been consumed, send this reply and
+    /// stop reading entirely: an upstream that refuses mid-transfer and
+    /// leaves the sender to notice. The unread bytes are what fill the
+    /// relay's send buffer, so a relay that does not watch for a reply while
+    /// writing blocks here until its inactivity timer fires.
+    reject_during_data: Option<(usize, u16, String)>,
+    /// After this many body bytes have been consumed, close the connection.
+    drop_during_data: Option<usize>,
+    /// Close with `SO_LINGER 0`, so that the close is an RST and not a FIN.
+    /// Read once per accepted connection, before the transport is boxed.
+    reset_on_close: bool,
+    /// How many connections `drop_during_data` has hung up, across every
+    /// connection since the last `clear()`. Counted before the transport is
+    /// dropped, so a test can wait for the hangup it asked for instead of
+    /// sleeping for it.
+    hangups: usize,
+    /// Answer EHLO and the MAIL that follows it in a *single* write, and then
+    /// say nothing to MAIL itself. The relay's read of the EHLO reply then
+    /// pulls the MAIL reply off the socket too, so it is sitting in the
+    /// handshake's `BufReader` when the session splits -- the one way to put
+    /// bytes where `UpstreamSession::from_handshake` has to carry them across
+    /// the split, since nothing else this fake does pipelines behind EHLO.
+    coalesce_mail_reply: bool,
     /// `Some` for an upstream that can do TLS. Then `STARTTLS` is announced
     /// and answered, or, with `implicit`, the connection is a TLS one from
     /// its first byte and STARTTLS is neither announced nor accepted.
@@ -86,6 +109,11 @@ struct Inner {
     /// the last `clear()` -- so a test can tell an envelope that went out
     /// encrypted from one that went out in the clear.
     tls_commands: Vec<String>,
+    /// Count the body's bytes instead of storing them. See
+    /// [`RecordingUpstream::discard_body`].
+    discard_body: bool,
+    /// Body bytes counted while `discard_body` was set.
+    discarded_bytes: usize,
 }
 
 impl Inner {
@@ -100,10 +128,17 @@ impl Inner {
             reject_data_end: None,
             data_stall: None,
             data_pace: None,
+            reject_during_data: None,
+            drop_during_data: None,
+            reset_on_close: false,
+            hangups: 0,
+            coalesce_mail_reply: false,
             tls: None,
             implicit: false,
             tls_extensions: None,
             tls_commands: Vec::new(),
+            discard_body: false,
+            discarded_bytes: 0,
         }
     }
 }
@@ -135,6 +170,15 @@ impl RecordingUpstream {
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
+                if state.lock().unwrap().reset_on_close {
+                    // Deprecated in tokio because a *non-zero* `SO_LINGER`
+                    // blocks the thread that drops the socket until the send
+                    // queue drains. Zero is the opposite: the close returns
+                    // at once, discarding what is queued and sending an RST,
+                    // which is the whole point of this fault.
+                    #[allow(deprecated)]
+                    stream.set_linger(Some(Duration::ZERO)).unwrap();
+                }
                 tokio::spawn(serve_one(Box::new(stream), state.clone()));
             }
         });
@@ -256,6 +300,76 @@ impl RecordingUpstream {
         self.inner.lock().unwrap().data_pace = Some((bytes, pause, times));
     }
 
+    /// Refuse the message once `after_bytes` of body have been consumed, and
+    /// then stop reading without hanging up. See `Inner::reject_during_data`.
+    pub fn reject_during_data(&self, after_bytes: usize, reply: (u16, &str)) {
+        self.inner.lock().unwrap().reject_during_data =
+            Some((after_bytes, reply.0, reply.1.to_string()));
+    }
+
+    /// Hang up once `after_bytes` of body have been consumed, saying nothing.
+    pub fn drop_during_data(&self, after_bytes: usize) {
+        self.inner.lock().unwrap().drop_during_data = Some(after_bytes);
+    }
+
+    /// [`RecordingUpstream::drop_during_data`], but the connection is
+    /// **reset** rather than closed: `SO_LINGER 0` makes the close an RST.
+    ///
+    /// A FIN is not enough for a test that cares *which* write meets the
+    /// dead upstream. `UpstreamSession::write` races its own write against
+    /// a read of the upstream, and after a FIN both are ready at once -- the
+    /// write lands in the kernel's send buffer and the read sees end of
+    /// stream -- so which branch the `select!` picks decides whether the
+    /// loss is reported by that write or only later by `finish`. After an
+    /// RST both halves error, so it is reported by the write, whichever
+    /// branch wins.
+    ///
+    /// The flag is read when a connection is accepted, so it has to be set
+    /// before the connection it is meant for is made. The rig's own startup
+    /// probe is over by the time a test can call this.
+    pub fn reset_during_data(&self, after_bytes: usize) {
+        let mut i = self.inner.lock().unwrap();
+        i.drop_during_data = Some(after_bytes);
+        i.reset_on_close = true;
+    }
+
+    /// How many connections have hung up under
+    /// [`RecordingUpstream::drop_during_data`] since the last `clear()`.
+    pub fn hangups(&self) -> usize {
+        self.inner.lock().unwrap().hangups
+    }
+
+    /// Send the MAIL reply already with the EHLO reply, in one write. See
+    /// `Inner::coalesce_mail_reply`.
+    pub fn coalesce_mail_reply(&self) {
+        self.inner.lock().unwrap().coalesce_mail_reply = true;
+    }
+
+    /// Count the body's bytes instead of storing them, for the one test that
+    /// streams more than it would want to hold.
+    ///
+    /// **This is not a relaxation of the recording.** The strict, verbatim
+    /// recording stays the default for every other test, because a fake that
+    /// re-normalises what it stores cannot see a relay that fails to
+    /// normalise what it sends. This mode only exists so that the memory
+    /// test measures the proxy and not the fake.
+    ///
+    /// The flag is read once per body line, so setting it any time before
+    /// the body arrives -- after the rig is built, for instance -- takes
+    /// effect. A message received in this mode is never pushed to
+    /// `messages`, so [`RecordingUpstream::raw_messages`] stays empty for it.
+    pub fn discard_body(&self) {
+        self.inner.lock().unwrap().discard_body = true;
+    }
+
+    /// Bytes of body received while `discard_body` was set, counted across
+    /// every connection since the last `clear()`. Counted as each line
+    /// arrives, so a body cut short mid-transfer still shows what got
+    /// through.
+    pub fn discarded_bytes(&self) -> usize {
+        self.inner.lock().unwrap().discarded_bytes
+    }
+
     /// Drops every recorded connection and message. The startup probe's own
     /// EHLO and QUIT would otherwise shift every later command index.
     pub fn clear(&self) {
@@ -263,6 +377,8 @@ impl RecordingUpstream {
         i.connections.clear();
         i.messages.clear();
         i.tls_commands.clear();
+        i.discarded_bytes = 0;
+        i.hangups = 0;
     }
 }
 
@@ -304,6 +420,9 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
     let mut message: Vec<u8> = Vec::new();
     let mut since_pause = 0usize;
     let mut pauses_done = 0usize;
+    // Body bytes consumed in the current message, which is what the
+    // mid-transfer faults are measured against.
+    let mut body_bytes = 0usize;
     let mut stall_after_reply: Option<Duration> = None;
     loop {
         // `read_until` rather than `lines()`: the body has to be recorded
@@ -321,9 +440,15 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 in_data = false;
                 since_pause = 0;
                 pauses_done = 0;
+                body_bytes = 0;
                 let (code, text) = {
                     let mut s = state.lock().unwrap();
-                    s.messages.push(std::mem::take(&mut message));
+                    // A discarded body was never collected, so there is
+                    // nothing to record: pushing the empty `message` would
+                    // put a message that does not exist into `messages`.
+                    if !s.discard_body {
+                        s.messages.push(std::mem::take(&mut message));
+                    }
                     match &s.reject_data_end {
                         Some((code, text)) => (*code, text.clone()),
                         None => (250, s.accept_text.clone()),
@@ -338,7 +463,52 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 }
             } else {
                 since_pause += raw.len();
-                message.extend_from_slice(&raw);
+                body_bytes += raw.len();
+                // One lock for all three: the discard counter rides along
+                // with the fault flags rather than taking a lock of its own,
+                // because a gigabyte body reaches this line a million times.
+                let (reject, drop_at, discard) = {
+                    let mut s = state.lock().unwrap();
+                    if s.discard_body {
+                        s.discarded_bytes += raw.len();
+                    }
+                    (
+                        s.reject_during_data.clone(),
+                        s.drop_during_data,
+                        s.discard_body,
+                    )
+                };
+                if !discard {
+                    message.extend_from_slice(&raw);
+                }
+                if let Some(after) = drop_at
+                    && body_bytes >= after
+                {
+                    // Counted before the transport is dropped, so a test
+                    // that waits for this sees it no later than the close
+                    // itself. See `RecordingUpstream::hangups`.
+                    state.lock().unwrap().hangups += 1;
+                    return;
+                }
+                if let Some((after, code, text)) = reject
+                    && body_bytes >= after
+                {
+                    if io
+                        .write_all(format!("{code} {text}\r\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Park instead of returning. Returning would drop the
+                    // transport, and a connection closed with megabytes still
+                    // unread is a *different* fault: the sender would meet the
+                    // close rather than the reply. What this fault means is an
+                    // upstream that has answered and stopped reading, so the
+                    // task has to stay alive holding its end open. The runtime
+                    // drops it when the test ends.
+                    std::future::pending::<()>().await;
+                }
                 let pace = state.lock().unwrap().data_pace;
                 if let Some((bytes, pause, times)) = pace
                     && pauses_done < times
@@ -359,6 +529,7 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
             state.lock().unwrap().tls_commands.push(line.clone());
         }
         let upper = line.to_ascii_uppercase();
+        let coalesce = state.lock().unwrap().coalesce_mail_reply;
         let reply = if upper.starts_with("EHLO") {
             let (rejection, ext) = {
                 let s = state.lock().unwrap();
@@ -385,9 +556,18 @@ async fn serve_one(stream: Box<dyn Io>, state: Arc<Mutex<Inner>>) {
                 if ext.is_empty() {
                     r.push_str("250 HELP\r\n");
                 }
+                // The MAIL reply rides along in this same write, so that the
+                // relay's read of the EHLO reply takes it off the socket too.
+                if coalesce {
+                    r.push_str("250 OK\r\n");
+                }
                 r
             }
         } else if upper.starts_with("MAIL") {
+            if coalesce {
+                // Already answered, with the EHLO reply.
+                continue;
+            }
             let rejection = state.lock().unwrap().reject_mail.clone();
             match rejection {
                 Some(text) => format!("553 {text}\r\n"),

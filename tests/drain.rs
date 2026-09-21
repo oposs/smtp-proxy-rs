@@ -50,6 +50,9 @@ async fn idle_sessions_get_421_and_in_flight_messages_finish() {
     assert_eq!(busy.command("RCPT TO:<x@y.com>").await, "250 OK\r\n");
     assert!(busy.command("DATA").await.starts_with("354"));
     busy.write_raw("S: x\r\n\r\n.\r\n").await;
+    // The wait is on the handler, not on a reply, so the message has to be
+    // pushed out by hand.
+    busy.flush().await;
     wait_until("the message to reach the handler", || {
         factory.recorded().message_started == 1
     })

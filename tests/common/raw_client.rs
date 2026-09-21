@@ -16,18 +16,30 @@ pub use smtp_proxy::relay::{Io, NoVerify};
 pub struct RawClient {
     stream: Box<dyn Io>,
     buf: Vec<u8>,
+    /// The address the *server* knows this connection by, kept from before
+    /// the transport was boxed (and possibly replaced by TLS). It is what
+    /// the proxy prints as `for {client}`, so a test can pick its own
+    /// connection's lines out of a log every test in the binary shares.
+    local: SocketAddr,
 }
 
 impl RawClient {
     /// Connects and returns the client together with the 220 greeting.
     pub async fn connect(addr: SocketAddr) -> (Self, String) {
         let stream = TcpStream::connect(addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
         let mut c = Self {
             stream: Box::new(stream),
             buf: Vec::new(),
+            local,
         };
         let greeting = c.read_reply().await;
         (c, greeting)
+    }
+
+    /// The address the server sees this client at. See `RawClient::local`.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
     }
 
     pub async fn command(&mut self, line: &str) -> String {
@@ -39,9 +51,33 @@ impl RawClient {
         self.stream.write_all(data.as_bytes()).await.unwrap();
     }
 
+    /// Pushes everything written so far out onto the wire.
+    ///
+    /// `write_all` on a `tokio_rustls` stream only hands the plaintext to
+    /// rustls; the ciphertext it produces can be left in rustls' own output
+    /// buffer with nothing left to drive it to the socket. A client that then
+    /// waits for the server deadlocks against a server waiting for those
+    /// bytes. So the rule is: flush wherever this client is about to block on
+    /// the server -- once per wait, not once per write.
+    ///
+    /// Not once per write on purpose. `tests/streaming.rs` calls `write_raw`
+    /// about a million times for its 1 GiB body, and a flush each time would
+    /// force a TLS record and a write syscall per 1022-byte line -- on the
+    /// one test whose subject is how little memory that buffering costs.
+    ///
+    /// Waiting for a reply already flushes: `read_reply`, `expect_close` and
+    /// `expect_close_after_failed_handshake` all call this. Call it by hand
+    /// only where a test waits on server-side state instead of on a reply.
+    pub async fn flush(&mut self) {
+        // A failure here means the peer is already gone. What that means is
+        // for the read that follows to decide, so it is not an error yet.
+        let _ = self.stream.flush().await;
+    }
+
     /// Reads until a line whose code is followed by a space. Panics after 30 s.
     pub async fn read_reply(&mut self) -> String {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            self.flush().await;
             loop {
                 if let Some(end) = complete_reply_len(&self.buf) {
                     return String::from_utf8(self.buf.drain(..end).collect()).unwrap();
@@ -65,6 +101,7 @@ impl RawClient {
     /// must fail this check, so the QUIT-close and line-too-long-close
     /// callers keep their original guarantee.
     pub async fn expect_close(&mut self) -> bool {
+        self.flush().await;
         let mut chunk = [0u8; 64];
         matches!(
             tokio::time::timeout(
@@ -86,6 +123,7 @@ impl RawClient {
     /// any other stray byte the server might leak, so it must not replace
     /// the strict `expect_close` there.
     pub async fn expect_close_after_failed_handshake(&mut self) -> bool {
+        self.flush().await;
         let mut chunk = [0u8; 4096];
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

@@ -10,9 +10,95 @@ use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
-    Envelope, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamTls,
-    UpstreamTlsMode, probe, probe_over, relay, relay_over,
+    Envelope, Io, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamCaps,
+    UpstreamSession, UpstreamTls, UpstreamTlsMode, assert_relayable, probe, probe_over,
 };
+// The convenience constructor these tests drive `UpstreamSession` through.
+//
+// It lives here rather than in the library because nothing in `src/` calls
+// it: the proxy drives an `UpstreamSession` itself so that the body streams
+// (`proxy.rs`, `fn open_body`), and a caller holding a whole message in
+// memory is only ever a test. Shipped in the library it was `pub` API for
+// every downstream consumer, and a standing "is this dead code?" question.
+// The tests below exercise `UpstreamSession`; this is scaffolding they
+// happen to call.
+
+/// Outcome of a relayed message.
+#[derive(Clone, Debug)]
+struct Relayed {
+    /// Text of the 250 reply to the final dot (the upstream queue id). A
+    /// multi-line reply arrives here with its lines joined by `\n`;
+    /// `smtp::reply::sanitize` folds those away before a client sees it.
+    message: String,
+    caps: UpstreamCaps,
+}
+
+/// A whole session: EHLO, MAIL, RCPT.., DATA, message, QUIT.
+///
+/// The convenience form, for a caller that has the whole message in hand.
+/// The proxy does not: it drives an [`UpstreamSession`] itself so the body
+/// streams (`proxy.rs`, `fn open_body`). See [`send_whole_message`] for what
+/// the message has to already be.
+async fn relay(
+    config: &RelayConfig,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    // Before the connection, so that an address the API substituted cannot
+    // even cost a TCP handshake.
+    assert_relayable(envelope.from)?;
+    for r in envelope.recipients {
+        assert_relayable(&r.address)?;
+    }
+    send_whole_message(UpstreamSession::connect(config).await?, envelope, message).await
+}
+
+/// [`relay`] over a stream the caller supplies, without TLS. See
+/// [`Io`].
+async fn relay_over<S: Io + 'static>(
+    stream: S,
+    timeout: Duration,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    assert_relayable(envelope.from)?;
+    for r in envelope.recipients {
+        assert_relayable(&r.address)?;
+    }
+    send_whole_message(
+        UpstreamSession::over(stream, timeout).await?,
+        envelope,
+        message,
+    )
+    .await
+}
+
+/// Drives an opened session through a message held whole in memory: what
+/// [`relay`] and [`relay_over`] both do once they have an upstream.
+///
+/// The message goes out **verbatim**. The proxy dot-stuffs where the content
+/// is assembled -- the client's body arrives already stuffed and the header
+/// block is stuffed as it is written (`proxy.rs`, `fn header_block`) -- so a
+/// second pass here would stuff everything twice. The caller therefore owns
+/// the encoding: a `message` holding a line that is nothing but a dot ends
+/// DATA where that line sits.
+async fn send_whole_message(
+    mut up: UpstreamSession,
+    envelope: Envelope<'_>,
+    message: &[u8],
+) -> Result<Relayed, RelayError> {
+    let caps = up.caps();
+    up.open_transaction(envelope).await?;
+    up.write(message)
+        .await
+        .map_err(|v| v.into_relay_error("DATA"))?;
+    let message = up
+        .finish()
+        .await
+        .map_err(|v| v.into_relay_error("DATA_END"))?;
+    Ok(Relayed { message, caps })
+}
+
 use smtp_proxy::smtp::params::Param;
 
 /// How many bytes may sit in flight on the in-memory connections the timing
@@ -76,11 +162,13 @@ fn p(k: &str, v: Option<&str>) -> Param {
 #[tokio::test]
 async fn probe_reports_dsn() {
     let up = RecordingUpstream::start(&["DSN"]).await;
-    assert!(probe(&config(&up)).await.unwrap());
+    assert!(probe(&config(&up)).await.unwrap().dsn);
     // One probe so far, so the all-connections view holds a single QUIT.
     assert_eq!(up.commands_matching("QUIT").len(), 1);
     up.set_extensions(&["SIZE 1000"]);
-    assert!(!probe(&config(&up)).await.unwrap());
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(!caps.dsn);
+    assert_eq!(caps.size, Some(1000));
     assert!(
         probe(&RelayConfig {
             host: "127.0.0.1".into(),
@@ -92,6 +180,22 @@ async fn probe_reports_dsn() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn probe_reports_the_upstream_size_limit() {
+    let up = RecordingUpstream::start(&["DSN", "SIZE 10240000"]).await;
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(caps.dsn);
+    assert_eq!(caps.size, Some(10_240_000));
+}
+
+#[tokio::test]
+async fn probe_reports_no_limit_when_size_is_absent() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    let caps = probe(&config(&up)).await.unwrap();
+    assert!(caps.dsn);
+    assert_eq!(caps.size, None);
 }
 
 #[tokio::test]
@@ -119,15 +223,11 @@ async fn full_session_and_dsn_forwarding() {
         ],
         recipients: &recipients,
     };
-    let out = relay(
-        &config(&up),
-        env,
-        b"Subject: x\r\n\r\nbody\r\n.\r\nnot the end\r\n",
-    )
-    .await
-    .unwrap();
+    let out = relay(&config(&up), env, b"Subject: x\r\n\r\nbody\r\n")
+        .await
+        .unwrap();
     assert_eq!(out.message, "OK message accepted");
-    assert!(out.upstream_dsn);
+    assert!(out.caps.dsn);
     let cmds = up.commands();
     // The greeting name is the Perl's fixed one, never this host's name.
     assert_eq!(cmds[0], "EHLO localhost.localdomain");
@@ -139,33 +239,34 @@ async fn full_session_and_dsn_forwarding() {
     assert_eq!(cmds[3], "RCPT TO:<x@baz.com> NOTIFY=NEVER");
     assert_eq!(cmds[4], "DATA");
     assert_eq!(cmds[5], "QUIT");
-    // A line that is just a dot is stuffed on the way out, so the upstream
-    // reads the message whole instead of ending it early.
-    assert_eq!(
-        up.messages()[0],
-        "Subject: x\r\n\r\nbody\r\n..\r\nnot the end\r\n"
-    );
+    assert_eq!(up.messages()[0], "Subject: x\r\n\r\nbody\r\n");
 }
 
-/// I1. The Perl normalises and dot-stuffs in one regex *before* it decides
-/// whether the terminating dot needs a CRLF in front of it
-/// (`Mojo/SMTP/Client.pm:517,519`). Asserted on the raw recording: a fake
-/// that rebuilds the message from parsed lines re-normalises it and can
-/// therefore see neither half of this.
+/// The payload reaches the upstream **byte for byte**, and the terminator is
+/// placed against what the last byte was.
+///
+/// Nothing rewrites the payload any more: the proxy dot-stuffs where the
+/// content is assembled and the client's body is already stuffed, so a
+/// second pass here would stuff everything twice (`relay.rs`, `fn
+/// send_whole_message`). What survives of the old normalisation is the one
+/// decision `finish` still makes -- whether the terminating dot needs a CRLF
+/// in front of it. Asserted on the raw recording: a fake that rebuilt the
+/// message from parsed lines could see neither half of this.
 #[tokio::test]
-async fn the_relayed_payload_is_line_ending_normalised() {
-    let cases: [(&[u8], &[u8]); 5] = [
-        // A body with bare LF throughout: the upstream must see CRLF.
-        (b"Subject: x\n\nline\n", b"Subject: x\r\n\r\nline\r\n"),
-        // Ending in a bare LF: normalised first, so the dot follows
-        // immediately instead of after a spurious blank line.
-        (b"a\r\nb\n", b"a\r\nb\r\n"),
-        // Already CRLF-terminated: unchanged.
+async fn the_payload_is_relayed_verbatim_and_the_terminator_follows_its_last_byte() {
+    let cases: [(&[u8], &[u8]); 4] = [
+        // Bare LF throughout: passed on as it is, where the old write path
+        // would have rewritten every one of them to CRLF.
+        (b"Subject: x\n\nline\n", b"Subject: x\n\nline\n"),
+        // Already CRLF-terminated: unchanged, and the terminator follows
+        // immediately.
         (b"a\r\n", b"a\r\n"),
-        // No trailing newline at all: the terminator brings its own CRLF.
+        // Ending in a bare LF is still ending a line, so no blank line is
+        // manufactured in front of the dot.
+        (b"a\r\nb\n", b"a\r\nb\n"),
+        // No trailing newline at all: the terminator brings its own CRLF,
+        // which the recording shows as the line ending of the last line.
         (b"a", b"a\r\n"),
-        // A dot behind a bare LF is a line start too, so it is stuffed.
-        (b"a\n.\n", b"a\r\n..\r\n"),
     ];
     for (input, expected) in cases {
         let up = RecordingUpstream::in_memory(&["DSN"]);
@@ -214,7 +315,7 @@ async fn ehlo_refused_falls_back_to_helo() {
     .await
     .unwrap();
     assert_eq!(out.message, "OK message accepted");
-    assert!(!out.upstream_dsn);
+    assert!(!out.caps.dsn);
     let cmds = up.commands();
     assert_eq!(cmds[0], "EHLO localhost.localdomain");
     assert_eq!(cmds[1], "HELO localhost.localdomain");
@@ -237,9 +338,63 @@ async fn dsn_parameters_are_dropped_without_upstream_dsn() {
     let out = relay(&config(&up), env, b"Subject: x\r\n\r\n")
         .await
         .unwrap();
-    assert!(!out.upstream_dsn);
+    assert!(!out.caps.dsn);
     assert_eq!(up.commands()[1], "MAIL FROM:<>");
     assert_eq!(up.commands()[2], "RCPT TO:<x@baz.com>");
+}
+
+#[tokio::test]
+async fn the_clients_size_is_forwarded_when_the_upstream_announces_size() {
+    let up = RecordingUpstream::start(&["SIZE 10240000"]).await;
+    let params = vec![Param {
+        keyword: "SIZE".into(),
+        value: Some("4096".into()),
+    }];
+    let recipients = vec![Recipient {
+        address: "a@b.com".into(),
+        parameters: vec![],
+    }];
+    relay(
+        &config(&up),
+        Envelope {
+            from: "x@y.com",
+            mail_params: &params,
+            recipients: &recipients,
+        },
+        b"Subject: x\r\n\r\nbody\r\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        up.commands_matching("MAIL"),
+        vec!["MAIL FROM:<x@y.com> SIZE=4096"]
+    );
+}
+
+/// An upstream that never announced SIZE would answer 555 to the parameter.
+#[tokio::test]
+async fn the_clients_size_is_dropped_when_the_upstream_is_silent_about_size() {
+    let up = RecordingUpstream::start(&["DSN"]).await;
+    let params = vec![Param {
+        keyword: "SIZE".into(),
+        value: Some("4096".into()),
+    }];
+    let recipients = vec![Recipient {
+        address: "a@b.com".into(),
+        parameters: vec![],
+    }];
+    relay(
+        &config(&up),
+        Envelope {
+            from: "x@y.com",
+            mail_params: &params,
+            recipients: &recipients,
+        },
+        b"Subject: x\r\n\r\nbody\r\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(up.commands_matching("MAIL"), vec!["MAIL FROM:<x@y.com>"]);
 }
 
 #[tokio::test]
@@ -316,8 +471,17 @@ async fn a_slow_but_steady_upstream_is_not_timed_out() {
 /// The other half of the same coin: an upstream that stops reading
 /// altogether for longer than the timeout must still be given up on, so the
 /// chunking has not simply removed the protection.
+///
+/// Spec 6.2: a hung upstream -- not dropped, not replying -- cannot be
+/// mirrored, because mirroring "hangs forever" would leak a connection per
+/// hung upstream. So the inactivity timer turns it into
+/// `UpstreamVerdict::Dropped`, which reaches the caller as `Io` rather than
+/// as `Timeout`. Both answer the client `451`, and the assertion below is no
+/// weaker for it: paired with `elapsed < stall` it still pins the failure to
+/// the write timer, because nothing but the write can fail while the
+/// upstream is asleep.
 #[tokio::test]
-async fn an_upstream_that_stops_reading_still_times_out() {
+async fn an_upstream_that_stops_reading_is_given_up_on() {
     let up = RecordingUpstream::in_memory(&["DSN"]);
     // Far longer than the timeout, and — the point of the duplex — longer
     // than this test may take if the timer that fires is the right one.
@@ -342,7 +506,7 @@ async fn an_upstream_that_stops_reading_still_times_out() {
     .await
     .unwrap_err();
     let elapsed = started.elapsed();
-    assert!(matches!(err, RelayError::Timeout), "{err:?}");
+    assert!(matches!(err, RelayError::Io(_)), "{err:?}");
     assert!(up.messages().is_empty());
     // Returning before the stall is over is what pins the timeout to the
     // write: nothing else can make progress until the upstream reads again.
@@ -352,6 +516,170 @@ async fn an_upstream_that_stops_reading_still_times_out() {
     assert!(
         elapsed < stall,
         "the timeout did not come from the write: {elapsed:?}"
+    );
+}
+
+/// An upstream that refuses mid-body and stops reading. The relay has to
+/// surface the upstream's own code rather than its own impatience: the
+/// unread body fills the transport, so a relay that only writes blocks here
+/// until its inactivity timer fires and reports a `Timeout` for a message
+/// the upstream has already answered.
+///
+/// A `tokio::io::duplex` pair rather than a socket, for the same reason the
+/// pacing tests use one: what blocks a write is then [`DUPLEX_CAPACITY`] and
+/// not whatever `tcp_wmem` the host chose. The elapsed-time assertion is
+/// what makes this test non-vacuous — it fails if the reply was noticed only
+/// after the write timer gave up.
+#[tokio::test]
+async fn a_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    // Four 1 KiB lines in, which is less than one write chunk and less than
+    // half the body, so the refusal lands while the relay is still writing.
+    up.reject_during_data(4096, (552, "5.3.4 too big"));
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(
+        up.connect_duplex(DUPLEX_CAPACITY),
+        timeout,
+        env,
+        &body(512 << 10),
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    match err {
+        RelayError::Rejected { code, ref text, .. } => {
+            assert_eq!(code, 552);
+            assert_eq!(text, "5.3.4 too big");
+        }
+        other => panic!("expected the upstream's 552, got {other:?}"),
+    }
+    assert!(
+        elapsed < timeout,
+        "the reply was noticed only after the write timer: {elapsed:?}"
+    );
+}
+
+/// The same refusal, over TLS -- and a plaintext fixture cannot stand in for
+/// this one.
+///
+/// `tokio_rustls`' `poll_write` takes the plaintext into rustls' send buffer
+/// and reports it written even when the socket took no ciphertext at all (see
+/// `relay.rs`, `fn flush`). So against a TLS upstream `write_all` returns
+/// straight away and the transfer does not actually block there: it blocks in
+/// the *flush*. A relay that races only the write against the reader is
+/// therefore still blind here -- it sits in an unwatched flush until its
+/// inactivity timer fires and reports a dead connection, while the upstream's
+/// `552` waits unread. Both halves of pushing a chunk out have to be inside
+/// the race.
+#[tokio::test]
+async fn a_tls_rejection_during_the_body_is_reported_as_the_upstreams_reply() {
+    let up = RecordingUpstream::in_memory_implicit_tls(&["DSN"]);
+    up.reject_during_data(4096, (552, "5.3.4 too big"));
+    let stream = tls_over_duplex(&up).await;
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(stream, timeout, env, &body(512 << 10))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    match err {
+        RelayError::Rejected { code, ref text, .. } => {
+            assert_eq!(code, 552);
+            assert_eq!(text, "5.3.4 too big");
+        }
+        other => panic!("expected the upstream's 552, got {other:?}"),
+    }
+    assert!(
+        elapsed < timeout,
+        "the reply was noticed only after the write timer: {elapsed:?}"
+    );
+    // The session really was a TLS one; a plaintext duplex would not have
+    // exercised any of this.
+    assert!(up.tls_commands().iter().any(|c| c.starts_with("MAIL")));
+}
+
+/// The same shape, but the upstream simply goes away. That has no reply to
+/// report, so it must not become a fabricated one.
+#[tokio::test]
+async fn a_drop_during_the_body_is_not_reported_as_a_rejection() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    up.drop_during_data(4096);
+    let recipients = one_recipient();
+    let env = Envelope {
+        from: "a@b.com",
+        mail_params: &[],
+        recipients: &recipients,
+    };
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let err = relay_over(
+        up.connect_duplex(DUPLEX_CAPACITY),
+        timeout,
+        env,
+        &body(512 << 10),
+    )
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(err, RelayError::Io(_)),
+        "a dead connection has no verdict to report, got {err:?}"
+    );
+    assert!(
+        elapsed < timeout,
+        "the close was noticed only after the write timer: {elapsed:?}"
+    );
+}
+
+/// Two properties nothing else in the suite reaches, in one session.
+///
+/// The upstream answers EHLO and the MAIL that follows it in a *single*
+/// write, so the MAIL reply is already sitting in the handshake's `BufReader`
+/// when `UpstreamSession::from_handshake` takes the stream apart. Those bytes
+/// are carried across the split in front of the read half; without that carry
+/// `into_inner` drops them and the session waits out its timeout for a reply
+/// it has already been sent.
+///
+/// And the body is handed over in two `write` calls rather than one, which is
+/// all any other test does — so the chunk loop and the record of the last
+/// byte written are otherwise unproven across calls.
+#[tokio::test]
+async fn pipelined_bytes_survive_the_split_and_a_body_may_arrive_in_pieces() {
+    let up = RecordingUpstream::in_memory(&["DSN"]);
+    up.coalesce_mail_reply();
+    let recipients = one_recipient();
+    let mut session =
+        UpstreamSession::over(up.connect_duplex(DUPLEX_CAPACITY), Duration::from_secs(5))
+            .await
+            .unwrap();
+    session
+        .open_transaction(Envelope {
+            from: "a@b.com",
+            mail_params: &[],
+            recipients: &recipients,
+        })
+        .await
+        .unwrap();
+    session.write(b"Subject: x\r\n\r\nfirst\r\n").await.unwrap();
+    session.write(b"second\r\n").await.unwrap();
+    let accepted = session.finish().await.unwrap();
+    assert_eq!(accepted, "OK message accepted");
+    assert_eq!(
+        up.messages(),
+        vec!["Subject: x\r\n\r\nfirst\r\nsecond\r\n".to_string()]
     );
 }
 
@@ -475,6 +803,7 @@ async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
         probe(&tls_config(&up, UpstreamTlsMode::Implicit, false))
             .await
             .unwrap()
+            .dsn
     );
     // An upstream that announces DSN only inside TLS: reading the extension
     // list from the first EHLO would miss it.
@@ -484,6 +813,7 @@ async fn implicit_tls_and_dsn_from_the_tls_ehlo() {
         probe(&tls_config(&up, UpstreamTlsMode::Opportunistic, false))
             .await
             .unwrap()
+            .dsn
     );
 }
 

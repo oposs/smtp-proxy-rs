@@ -154,8 +154,8 @@ Options:
           optional detailed log file of SMTP commands and responses
       --credentials
           include username and password info in the smtplog
-      --max_message_size <MAX_MESSAGE_SIZE>
-          largest message accepted, in bytes [default: 1073741824]
+      --max_header_size <MAX_HEADER_SIZE>
+          largest header block accepted, in bytes [default: 1048576]
       --upstream_tls <UPSTREAM_TLS>
           TLS on the connection to the upstream: off, opportunistic (STARTTLS when offered),
           required (STARTTLS always), implicit (TLS from the first byte) [default: opportunistic]
@@ -197,14 +197,16 @@ this is then relayed to the client.
 
 - TLS 1.0 and 1.1 are no longer offered (rustls only implements TLS 1.2 and
   1.3).
-- A message larger than 1 GiB is refused with 552; the limit is configurable
-  with `--max_message_size`.
+- A header block larger than 1 MiB is refused with 552; the limit is
+  configurable with `--max_header_size`. The message as a whole carries no
+  proxy limit: the only stated limit is the upstream's `SIZE`, which is
+  advertised to the client and forwarded on `MAIL FROM`.
 - A command line that reaches 64 KiB without ending is answered
   `500 Line too long` and the connection is closed. The Perl grew its command
   buffer without any limit. RFC 5321 4.5.3.1.4 caps a command line at 512
   octets, so no working client can reach this.
 - Debug-level data dumps are JSON rather than Perl `Data::Dumper` output.
-- Eleven new flags: `--version`, `--max_message_size`, `--upstream_tls`,
+- Eleven new flags: `--version`, `--max_header_size`, `--upstream_tls`,
   `--upstream_tls_ca`, `--upstream_tls_insecure`, `--max_connections`,
   `--max_connections_per_ip`, `--max_messages_per_minute`, `--max_recipients`,
   `--drain_timeout` and `--greeting_timeout`. Every flag the Perl had is still
@@ -250,6 +252,20 @@ this is then relayed to the client.
   call. RFC 5321 4.2.3 `451` is "local error in processing", which is what
   this is. A header carrying an unfolded line break keeps the `550` above:
   that fault is in the message, and resending it unchanged cannot help.
+- **A dead upstream closes the client connection.** The Perl reads the whole
+  message into memory and only then opens the upstream, so it always has a
+  `451` to answer with. This proxy streams the body straight through, so by
+  the time an upstream can die the client has already been told `354` and is
+  mid-message. During DATA the proxy is a mirror: an upstream that *replies*
+  is relayed verbatim, code and text, and an upstream that drops takes the
+  client connection with it, because there is nothing left to say. A failure
+  *before* the body -- the connect, the envelope, the header block -- is still
+  answered with a reply code as it always was.
+- **A refused message costs the upstream one opened connection.** The upstream
+  connect runs alongside the API call, since the verdict is needed before
+  `MAIL FROM` and the connect is the only thing that can overlap it. A message
+  the API refuses therefore leaves a connection that was greeted and then
+  dropped. No envelope and no message reach it.
 - **The upstream's reply is bounded** at 4096 bytes per line and 65536 bytes
   in total. The Perl bounds neither, so a hostile or compromised upstream
   could feed an endless reply and exhaust memory. RFC 5321 4.5.3.1.5 caps a
@@ -334,3 +350,19 @@ this is then relayed to the client.
   session inside `DATA` or waiting on the API or the upstream is allowed to
   finish and reply. After `--drain_timeout` seconds (default 30) whatever is
   still open is closed without a reply. A second signal exits immediately.
+- **`SIZE` is advertised.** The Perl announced no SIZE extension. This proxy
+  relays the upstream's stated limit to the client, so a client learns the
+  real limit before it sends. When the upstream states none, or has not been
+  reached yet, no SIZE line is sent.
+- **A client's `SIZE=` on `MAIL FROM` is forwarded to the upstream.** The
+  Perl's `MAIL FROM` carries only a DSN-keyword suffix and drops `SIZE=`
+  entirely. This proxy passes it on when the upstream announced SIZE at
+  EHLO, so the upstream can refuse an oversized message before the transfer
+  instead of after. When the upstream never announced SIZE, the parameter is
+  still dropped, with a warning logged, to avoid a `555` on a parameter the
+  upstream never offered.
+- **A malformed EHLO line whose keyword is preceded by extra whitespace (for
+  example `250- SIZE 10240000`) is accepted.** The Perl's
+  `/^\d{3}[- ](\S+)/` fails to match such a line and drops it entirely.
+  Consequence: against such an upstream this proxy may learn -- and therefore
+  advertise -- an extension the Perl would have ignored.

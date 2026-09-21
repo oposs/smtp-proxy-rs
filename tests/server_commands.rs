@@ -6,7 +6,9 @@ mod common;
 use common::fake_handler::ScriptedFactory;
 use common::raw_client::RawClient;
 use common::{server_config, start_server};
+use smtp_proxy::relay::UpstreamVerdict;
 use smtp_proxy::server::Rejection;
+use smtp_proxy::server::data::WRITE_CHUNK;
 
 /// A connection that has been greeted. `require_starttls` and `require_auth`
 /// are both off, so the very next command falls through to `WantMail`.
@@ -46,6 +48,37 @@ async fn dsn_is_announced_only_when_available() {
     let r = c.command("EHLO client.example.com").await;
     assert!(!r.contains("DSN"), "{r}");
     assert!(r.ends_with("250 AUTH PLAIN LOGIN\r\n"), "{r}");
+}
+
+#[tokio::test]
+async fn ehlo_announces_the_size_limit_the_handler_reports() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = Some(10_240_000));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("EHLO x").await;
+    assert!(reply.contains("SIZE 10240000"), "got {reply:?}");
+}
+
+#[tokio::test]
+async fn ehlo_omits_size_when_the_handler_reports_none() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = None);
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("EHLO x").await;
+    assert!(!reply.contains("SIZE"), "got {reply:?}");
+}
+
+/// HELO takes no extension list at all, so the limit must not leak into it.
+#[tokio::test]
+async fn helo_never_announces_size() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.size_limit = Some(64));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    let reply = c.command("HELO x").await;
+    assert!(!reply.contains("SIZE"), "got {reply:?}");
 }
 
 #[tokio::test]
@@ -106,7 +139,10 @@ async fn full_transaction_reaches_the_handler() {
     assert_eq!(rec.rcpt.len(), 2);
     assert_eq!(rec.rcpt[1].1[0].value.as_deref(), Some("NEVER"));
     assert_eq!(rec.headers[0], "Subject: hi\r\nTo: a@b.com\r\n");
-    assert_eq!(rec.bodies[0], b"body line\r\n.dot line\r\n");
+    // The sink is given body lines verbatim (spec 5.1), so the client's
+    // stuffing dot is still on `..dot line`. Undoing it is the business of
+    // whoever writes the body upstream, not of the session.
+    assert_eq!(rec.bodies[0], b"body line\r\n..dot line\r\n");
     // Next transaction on the same connection.
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
 }
@@ -266,21 +302,26 @@ async fn auth_continuation_with_a_line_break_is_confused() {
 }
 
 #[tokio::test]
-async fn message_over_the_cap_is_refused_with_552() {
+async fn header_block_over_the_cap_is_refused_with_552() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    c.write_raw(&format!("Subject: x\r\n\r\n{}\r\n.\r\n", "y".repeat(100)))
-        .await;
+    // The body is not capped any more, so the oversized part has to be a
+    // header for the cap to see it at all.
+    c.write_raw(&format!(
+        "Subject: {}\r\n\r\nbody\r\n.\r\n",
+        "y".repeat(100)
+    ))
+    .await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
@@ -300,27 +341,26 @@ async fn a_command_line_that_never_ends_is_cut_off() {
 }
 
 #[tokio::test]
-async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
+async fn a_header_line_that_never_ends_is_capped_at_the_header_size() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    c.write_raw("Subject: x\r\n\r\n").await;
-    // 256 KiB of body in a single line with no newline anywhere. The cap is
-    // 64 bytes, so the server has to throw these away as they arrive instead
-    // of buffering them while it waits for the end of the line.
+    // 256 KiB of header in a single line with no newline anywhere. The cap
+    // is 64 bytes, so the server has to throw these away as they arrive
+    // instead of buffering them while it waits for the end of the line.
     for _ in 0..4 {
         c.write_raw(&"y".repeat(64 * 1024)).await;
     }
     c.write_raw("\r\n.\r\n").await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     // The connection survives and the next transaction works.
@@ -329,21 +369,22 @@ async fn a_data_line_that_never_ends_is_capped_at_the_message_size() {
 }
 
 #[tokio::test]
-async fn a_message_that_fills_the_cap_exactly_still_ends_normally() {
+async fn a_header_block_that_fills_the_cap_exactly_still_ends_normally() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    // 12 bytes of header plus a 52 byte body line is exactly the 64 byte cap,
-    // and the blank line between them costs nothing. That leaves no capacity
-    // at all for the terminator, which also costs nothing.
-    c.write_raw("Subject: x\r\n\r\n").await;
-    c.write_raw(&format!("{}\r\n", "z".repeat(50))).await;
+    // "Subject: " plus 53 characters plus CRLF is exactly the 64 byte cap,
+    // so the header block leaves no capacity at all for the terminator --
+    // which costs nothing.
+    let subject = format!("Subject: {}\r\n", "z".repeat(53));
+    assert_eq!(subject.len(), 64);
+    c.write_raw(&subject).await;
     // The terminator arrives split across two reads. The lone dot must not be
     // read as an over-cap line: doing so would discard the message, swallow
     // the rest of the terminator as a discarded tail, and leave the session
@@ -354,41 +395,64 @@ async fn a_message_that_fills_the_cap_exactly_still_ends_normally() {
     c.write_raw("\r\n").await;
     assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
     let rec = factory.recorded();
-    assert_eq!(rec.headers[0], "Subject: x\r\n");
-    assert_eq!(rec.bodies[0].len(), 52);
+    assert_eq!(rec.headers[0], subject);
+    assert!(rec.bodies[0].is_empty());
+}
+
+/// The body carries no cap any more, so a line longer than the reader will
+/// hold while it waits for a newline is not an error: it is taken in pieces
+/// and delivered whole -- one line at the sink, not two, and with the
+/// stuffing dot that rode in on its first piece still in place.
+#[tokio::test]
+async fn a_body_line_longer_than_the_read_buffer_is_delivered_whole() {
+    let factory = ScriptedFactory::default();
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One body line of 128 KiB: twice the 64 KiB the reader holds before it
+    // gives up on finding the end of the line.
+    let long = "z".repeat(128 * 1024);
+    c.write_raw(&format!("..{long}\r\n.\r\n")).await;
+    assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
+    let rec = factory.recorded();
+    assert_eq!(rec.bodies[0], format!("..{long}\r\n").into_bytes());
 }
 
 #[tokio::test]
-async fn a_discarded_data_line_tail_is_not_mistaken_for_the_terminator() {
+async fn a_discarded_header_line_tail_is_not_mistaken_for_the_terminator() {
     let factory = ScriptedFactory::default();
     let mut config = server_config(false, false);
-    config.max_message_size = 64;
+    config.max_header_size = 64;
     let addr = start_server(config, factory.clone()).await;
     let (mut c, _) = RawClient::connect(addr).await;
     assert!(c.command("EHLO x").await.starts_with("250"));
     assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
-    // The header block leaves 52 of the 64 bytes unspent, and the reader
-    // holds two bytes of slack for a half-read terminator, so 55 bytes
-    // without a newline are what tips the message over the cap. Each sleep
-    // lets the server consume what was sent and go back to waiting with an
-    // empty buffer, which fixes where the discard falls.
-    c.write_raw("Subject: x\r\n\r\n").await;
+    // The first header line leaves 52 of the 64 bytes unspent, and the
+    // collector holds two bytes of slack for a half-read terminator, so 55
+    // bytes without a newline are what tips the block over the cap. Each
+    // sleep lets the server consume what was sent and go back to waiting with
+    // an empty buffer, which fixes where the discard falls.
+    c.write_raw("Subject: x\r\n").await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.write_raw(&"y".repeat(55)).await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    // The rest of that same body line now happens to be a lone dot. It ends
+    // The rest of that same header line now happens to be a lone dot. It ends
     // the line, but the line began 55 bytes ago, so this is not a dot on a
     // line of its own and must not end the message. Reading it as the
-    // terminator would reply 552 here and leave the rest of the body to be
+    // terminator would reply 552 here and leave the rest of the message to be
     // parsed as commands.
     c.write_raw(".\r\n").await;
     c.write_raw("still inside the message\r\n").await;
     c.write_raw(".\r\n").await;
     assert_eq!(
         c.read_reply().await,
-        "552 Message exceeds maximum size of 64 bytes\r\n"
+        "552 Header block exceeds maximum size of 64 bytes\r\n"
     );
     assert!(factory.recorded().bodies.is_empty());
     // Nothing from the message body was taken for a command.
@@ -414,4 +478,248 @@ async fn a_client_leaving_during_a_slow_message_does_not_stop_the_server() {
     let (mut c2, greeting) = RawClient::connect(addr).await;
     assert!(greeting.starts_with("220"));
     assert!(c2.command("NOOP").await.starts_with("250"));
+}
+
+/// The mirror rule at its cheapest: an upstream that dies mid-body takes the
+/// client connection with it, with no reply invented on its behalf.
+///
+/// It also pins the staged remainder down. The body here is six bytes, far
+/// below `WRITE_CHUNK`, so the only write the sink ever sees is the flush
+/// after the terminator. A pump that went straight from the terminator to
+/// `finish` would never call `write`, never meet the verdict, and answer
+/// `250` instead of closing.
+#[tokio::test]
+async fn an_upstream_that_drops_mid_body_closes_the_client_connection() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.sink_verdict = Some(UpstreamVerdict::Dropped));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\nbody\r\n.\r\n").await;
+    assert!(
+        c.expect_close().await,
+        "a dead upstream must close the client too"
+    );
+}
+
+/// A body of complete short lines whose total is the first at or above
+/// `WRITE_CHUNK`, so the framer stages every line and hands the sink its one
+/// and only `BodyPiece::Chunk` on the very last of them -- with nothing left
+/// over after it.
+///
+/// Short lines rather than one long one on purpose. Every read then ends on a
+/// line boundary, so the pump takes the `Line::Got` path each time and the
+/// test cannot come out differently depending on where the socket happened to
+/// split a 64 KiB write.
+fn body_of_exactly_one_write_chunk() -> String {
+    let line = format!("{}\r\n", "z".repeat(100));
+    let body = line.repeat(WRITE_CHUNK.div_ceil(line.len()));
+    assert!(body.len() >= WRITE_CHUNK);
+    assert!(
+        body.len() - line.len() < WRITE_CHUNK,
+        "the last line has to be the one that fills the chunk"
+    );
+    body
+}
+
+/// The mirror rule with something to say, and the only route that reaches
+/// `Session::mirror` at all: the sink has to be written *during* the body,
+/// which takes a staged `WRITE_CHUNK`. A smaller message stages and writes
+/// once, after the terminator, where there is nothing left to mirror -- which
+/// is the road `an_upstream_that_drops_mid_body_closes_the_client_connection`
+/// takes.
+///
+/// Three promises, one assertion each. The upstream's reply reaches the
+/// client verbatim and where the upstream gave it. What the client goes on
+/// writing is read away instead of being parsed as commands. And the
+/// transaction is cleared, so the session is ready for the next one.
+#[tokio::test]
+async fn an_upstream_that_refuses_mid_body_is_mirrored_and_the_rest_read_away() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    // In WantGreeting, so this greeting resets nothing: the count starts at
+    // zero.
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n"); // reset 1
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // The client is still inside DATA and still writing. A server that has
+    // already answered reads that only to resync, and a line that would draw
+    // a reply of its own as a command is how the difference becomes visible.
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    // So the next reply on the wire is this command's. Drop the drain from
+    // the mirror and the line above earns a 502 that arrives here instead.
+    assert_eq!(c.command("NOOP").await, "250 OK\r\n");
+    // MAIL opened the transaction and the mirror cleared it; NOOP is not a
+    // transaction boundary. Drop the `start_transaction` from the mirror and
+    // this is 1.
+    assert_eq!(factory.recorded().resets, 2);
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    // `finish` was never reached, so nothing was ever delivered.
+    assert!(factory.recorded().bodies.is_empty());
+}
+
+/// The other verdict on that same route. Nothing is invented on a dead
+/// upstream's behalf here either -- but here the client is still writing when
+/// the connection goes, which is what tells this apart from
+/// `an_upstream_that_drops_mid_body_closes_the_client_connection`.
+#[tokio::test]
+async fn an_upstream_that_drops_while_the_body_is_arriving_closes_the_client() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| s.sink_verdict = Some(UpstreamVerdict::Dropped));
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One chunk's worth and not a byte more. The server has read all of it by
+    // the time the chunk is written, so nothing is left unread when it closes
+    // -- unread bytes would draw a reset and the close would stop being
+    // observable as a clean end of stream.
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert!(
+        c.expect_close().await,
+        "a dead upstream must close the client too, with no reply invented for it"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+}
+
+/// The drain's budget. `MAX_COMMAND_BUFFER` is private to `session.rs`, so
+/// the two tests below carry their own copy; they assert nothing about the
+/// number itself, only that a run longer than it has no line break in it.
+///
+/// The copy can only decay in one direction. `session.rs` tests `buf.len() >
+/// max_incomplete`, so a *smaller* budget there still reports `TooLong` on
+/// these runs and the tests go on exercising the road they are about. It is
+/// *growth* that would make them vacuous: a budget above the 65537-byte runs
+/// they send would take the line as a line, and `TooLong` would never be
+/// reached.
+const DRAIN_BUDGET: usize = 64 * 1024;
+
+/// M5's guard. The mirror's drain must be told that it is starting in the
+/// middle of a line, not at a line start.
+///
+/// The body is one run of `WRITE_CHUNK + 1` bytes with no line break, so the
+/// pump takes the `Line::TooLong` road, leaves the framer mid-line, and hands
+/// the sink its chunk with `at_line_start` false. The client then finishes
+/// that same line with a lone dot. It ends a line without beginning one, so
+/// it is not a dot on a line of its own and must not end DATA. Read as the
+/// terminator it would hand the rest of the body to the command parser --
+/// client-controlled command injection, reachable by sending one body line
+/// longer than `WRITE_CHUNK`.
+///
+/// The body-side twin of `a_discarded_header_line_tail_is_not_mistaken_for_the_terminator`.
+/// Where that test spaces its writes with pauses, this one is ordered by the
+/// reply: the 451 cannot be sent until the whole over-long run has been read
+/// and reported `TooLong`, so waiting for it fixes where the split falls
+/// without a sleep.
+#[tokio::test]
+async fn a_body_line_tail_is_not_mistaken_for_the_terminator_by_the_drain() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // One run past the chunk budget and no newline in it: `Line::TooLong`,
+    // which is the only way into the drain with a line half taken.
+    c.write_raw(&"y".repeat(WRITE_CHUNK + 1)).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // The tail of that same line, written only now that the reply proves the
+    // run was consumed whole.
+    c.write_raw(".\r\n").await;
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    // Whatever went before, this is the client's next command and its reply
+    // is the next thing on the wire. If the tail above ended DATA, the two
+    // lines after it were parsed as commands and their replies are queued
+    // ahead of this one.
+    assert_eq!(
+        c.command("NOOP").await,
+        "250 OK\r\n",
+        "the tail of an over-long body line ended DATA, and the rest of the body was read as commands"
+    );
+    assert!(factory.recorded().bodies.is_empty());
+}
+
+/// M8's guard. The same rule one level in: a line that goes over budget
+/// *during* the drain leaves the drain mid-line too.
+///
+/// Here the verdict arrives on a line boundary, so the drain starts at a line
+/// start and M5's mutation would change nothing. What is under test is the
+/// `Line::TooLong` arm inside `discard_to_terminator`: it throws the
+/// oversized run away and must record that the tail of it is still to come.
+/// Set that to a line start instead and the lone dot ending the run is read
+/// as the terminator, with the same command-injection shape as above.
+#[tokio::test]
+async fn an_over_long_line_inside_the_drain_leaves_the_drain_mid_line() {
+    let factory = ScriptedFactory::default();
+    factory.set(|s| {
+        s.sink_verdict = Some(UpstreamVerdict::Replied {
+            code: 451,
+            text: "4.3.0 upstream had enough".into(),
+        })
+    });
+    let addr = start_server(server_config(false, false), factory.clone()).await;
+    let (mut c, _) = RawClient::connect(addr).await;
+    assert!(c.command("EHLO x").await.starts_with("250"));
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    c.write_raw("Subject: x\r\n\r\n").await;
+    // Complete lines, so the verdict lands with the drain at a line start.
+    c.write_raw(&body_of_exactly_one_write_chunk()).await;
+    assert_eq!(
+        c.read_reply().await,
+        "451 4.3.0 upstream had enough\r\n",
+        "the upstream's own reply, sent where the upstream sent it"
+    );
+    // Now over the drain's own budget, with no line break. The pause lets the
+    // server consume all of it and report `TooLong` before the tail arrives.
+    c.write_raw(&"z".repeat(DRAIN_BUDGET + 1)).await;
+    c.flush().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // The tail of the run the drain just threw away.
+    c.write_raw(".\r\n").await;
+    c.write_raw("this is body, not a command\r\n").await;
+    c.write_raw(".\r\n").await;
+    assert_eq!(
+        c.command("NOOP").await,
+        "250 OK\r\n",
+        "the tail of an over-long line inside the drain ended DATA, and the rest of the body was read as commands"
+    );
+    assert!(factory.recorded().bodies.is_empty());
 }

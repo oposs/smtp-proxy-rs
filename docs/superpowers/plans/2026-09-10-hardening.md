@@ -1373,6 +1373,53 @@ These are deliberate. The gate will report them; they are not defects.
   satisfied either way and `src/` is not to change for this. Making `left
   before` deterministic would mean polling the client socket for readability
   before every reply -- real complexity bought for a log line.
+- **Task 3: `SIZE` is advertised.** The Perl announced no SIZE extension. This
+  proxy relays the upstream's stated limit to the client, so a client learns
+  the real limit before it sends. When the upstream states none, or has not
+  been reached yet, no SIZE line is sent.
+- **Task 4: a client's `SIZE=` on `MAIL FROM` is forwarded to the upstream.**
+  The Perl's `_cmd_from` builds `MAIL FROM:<addr>` plus only a DSN-keyword
+  suffix and drops `SIZE=` entirely. This proxy passes it on when the
+  upstream announced SIZE at EHLO, so the upstream can refuse an oversized
+  message before the transfer instead of after. When the upstream never
+  announced SIZE, the parameter is still dropped, with a warning logged, to
+  avoid a `555` on a parameter the upstream never offered.
+- **Task 1: a malformed EHLO line whose keyword is preceded by extra
+  whitespace (for example `250- SIZE 10240000`) is accepted.** The Perl's
+  `/^\d{3}[- ](\S+)/` fails to match such a line and drops it entirely.
+  Consequence: against such an upstream this proxy may learn -- and therefore
+  advertise -- an extension the Perl would have ignored.
+- **Task 7: `--max_message_size` is gone, replaced by `--max_header_size`
+  (default 1 MiB).** The proxy stopped having an opinion about message size:
+  the only stated limit is the upstream's `SIZE`, advertised to the client and
+  forwarded on `MAIL FROM` (the two bullets above). The header block is the
+  one thing the proxy still holds whole -- it parses it -- so it is the one
+  thing still capped, and a block over the cap is refused with `552 Header
+  block exceeds maximum size of <n> bytes`, spoken at the terminator so that
+  the rest of the message is drained rather than read as commands. Both flags
+  are this proxy's own; the Perl had neither, and no size cap of any kind, so
+  the "same CLI flags as the Perl" constraint is untouched.
+- **Task 9: a dead upstream closes the client connection.** Where the Perl
+  (and this proxy until now) answered `451`, a proxy that has already begun
+  relaying has nothing to answer with: during DATA it mirrors the upstream, so
+  an upstream that drops takes the client connection with it. An upstream that
+  *replies* is still relayed verbatim, code and text. The Perl buffers the
+  whole message and only then opens the upstream, so it can never be in this
+  position and no Perl test produces it.
+- **Task 9: a refused message costs the upstream one opened connection.** The
+  upstream connect now runs alongside the API call, because the verdict is
+  needed before `MAIL FROM` and the connect is the only thing that can overlap
+  it. A message the API refuses -- or one whose merged headers or substituted
+  sender the proxy refuses -- therefore leaves an upstream connection that was
+  greeted and then dropped without a `QUIT`; no envelope and no message ever
+  reach it. The Perl connected only after it had a verdict, so it never did
+  this.
+- **Task 9: `Body received <n> Bytes` is absent on an API-rejected message.**
+  The Perl logs it for every message, because it buffers the whole body first
+  and the API decides afterwards. Here the verdict comes before the body, so a
+  refused message is drained rather than counted and the line is never
+  reached. Where it *is* logged the count matches the Perl's: unstuffed bytes,
+  the terminator excluded (`Connection.pm`, `$line =~ s/^\.//`).
 
 ### Test-suite notes for Tasks 20-21 (CI)
 

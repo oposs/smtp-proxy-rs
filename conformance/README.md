@@ -198,6 +198,15 @@ rate limiting, no recipient cap, no max-connections flag and no signal handling:
 `421` drain. There is nothing to compare them against and no test here tries.
 The Rust suite covers them.
 
+**Mid-stream upstream failure is invisible here.** The proxy streams the body
+to the upstream as it arrives, so an upstream can die or refuse *while the
+client is still writing*. The Perl buffers the whole message and only then
+opens the upstream, so its tests cannot produce either event: there is no Perl
+assertion for a mid-body rejection relayed verbatim, for an upstream that drops
+mid-body and takes the client connection with it, or for the connection a
+refused message opens and abandons. The Rust suite covers all three
+(`tests/proxy_end_to_end.rs`), and they are on the plan's divergence list.
+
 **The approved divergences are, as it turns out, mostly outside these nine
 files.** None of them forced an assertion change, which is a real result and not
 a lucky one — but it also means this gate does not confirm them. Not exercised
