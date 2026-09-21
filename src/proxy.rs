@@ -482,6 +482,14 @@ fn report_refusal(
     // JSON like the line above it, because README promises that every debug
     // dump on this branch is JSON.
     debug!("ApiResult {}", outcome.json());
+    // After the Perl's three lines, not inside them: the sentence above is
+    // the Perl's own and `$error` there is the upstream's reply text and
+    // nothing else, so the step has no slot in it that would not be a
+    // divergence (`UpstreamVerdict::into_relay_error`). It is worth saying
+    // anyway -- a 552 at DATA and a 552 at DATA_END are different operational
+    // problems -- and on the mid-body road nothing else says it, because
+    // `UpstreamSession::write` reads the early reply itself without logging.
+    debug!("Refused at {stage} for {client}");
 }
 
 impl ProxySink {
