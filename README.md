@@ -155,7 +155,9 @@ Options:
       --credentials
           include username and password info in the smtplog
       --max_header_size <MAX_HEADER_SIZE>
-          largest header block accepted, in bytes [default: 1048576]
+          largest header block accepted, in bytes; must be at least 1, because the header block is
+          held in memory -- unlike the limits below, 0 does not mean unlimited and is refused at
+          startup [default: 1048576]
       --upstream_tls <UPSTREAM_TLS>
           TLS on the connection to the upstream: off, opportunistic (STARTTLS when offered),
           required (STARTTLS always), implicit (TLS from the first byte) [default: opportunistic]
