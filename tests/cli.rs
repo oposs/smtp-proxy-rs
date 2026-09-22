@@ -258,6 +258,69 @@ fn usage_errors_exit_1_with_at_most_one_usage_block() {
     }
 }
 
+/// A run that cannot hang. `run` above waits for the child to close its
+/// pipes, which a proxy that *starts* never does -- and the whole point of
+/// this case is that the binary must refuse the value instead of starting.
+/// Without the deadline a regression would leave a real daemon listening and
+/// the test waiting on it for ever, rather than reporting a failure.
+fn run_bounded(args: &[String]) -> (Option<i32>, String, String) {
+    let out = bin().args(args).timeout(DEADLINE).output().unwrap();
+    (
+        out.status.code(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// `--max_header_size 0` used to be accepted, and then refused every message
+/// carrying any header at all with 552 -- the opposite of the "0 means
+/// unlimited" its four sibling limits document. Unlimited is not an option
+/// here, because the header block is the one part of a message this proxy
+/// holds in memory, so the value has to be refused at startup.
+#[test]
+fn max_header_size_zero_is_refused_at_startup() {
+    let mut args = complete_args();
+    args.push("--max_header_size".to_string());
+    args.push("0".to_string());
+    let (code, stdout, stderr) = run_bounded(&args);
+    assert_eq!(
+        code,
+        Some(1),
+        "--max_header_size 0 must exit 1 rather than start\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(stdout, "", "nothing belongs on stdout");
+    assert!(
+        stderr.contains("--max_header_size"),
+        "the complaint must name the flag:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("unlimited"),
+        "the complaint must say 0 is not unlimited:\n{stderr}"
+    );
+}
+
+/// The help text is where an operator meets the rule, so it has to carry it.
+#[test]
+fn help_says_max_header_size_has_no_unlimited() {
+    let out = bin()
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(out).unwrap();
+    let flag = text
+        .split("--max_header_size <MAX_HEADER_SIZE>")
+        .nth(1)
+        .unwrap_or_else(|| panic!("--max_header_size is not offered:\n{text}"));
+    let help = flag.split("--upstream_tls").next().unwrap();
+    assert!(
+        help.contains("unlimited"),
+        "--max_header_size help does not mention that 0 is not unlimited:\n{help}"
+    );
+}
+
 /// `--man` is a help action, so it succeeds and prints the long about to
 /// stdout. Grouped here because it is the one flag of this family that
 /// must *not* look like a usage error.

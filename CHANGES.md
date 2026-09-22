@@ -47,6 +47,11 @@
   The Perl exited and dropped every session where it stood. A second signal
   exits at once
 - 0 disables any of the four limits above
+- `--max_header_size` is the exception: 0 there is refused at startup with a
+  message naming the flag, rather than accepted and then applied literally
+  as a cap that every message carrying any header at all exceeds. There is
+  no unlimited setting for it, because the header block is the one part of a
+  message the proxy holds in memory
 - packaging: a release builds a statically linked musl binary, a Debian package
   carrying it together with a systemd unit and `/etc/default/smtp-proxy`, and a
   container image on ghcr.io

@@ -73,7 +73,9 @@ pub struct Cli {
     #[arg(
         long = "max_header_size",
         default_value_t = 1 << 20,
-        help = "largest header block accepted, in bytes"
+        help = "largest header block accepted, in bytes; must be at least 1, because the header \
+                block is held in memory -- unlike the limits below, 0 does not mean unlimited \
+                and is refused at startup"
     )]
     pub max_header_size: usize,
     #[arg(
@@ -180,6 +182,28 @@ pub fn parse_listen(s: &str) -> anyhow::Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// What an operator is told when they ask for a header cap of zero bytes.
+const MAX_HEADER_SIZE_ZERO: &str = "--max_header_size must be at least 1: unlike the other \
+limits, 0 does not mean unlimited here, because the header block is held in memory";
+
+/// Limit values that parse but cannot be honoured. Separate from
+/// [`parse_args`] so that it can be tested without exiting the process.
+///
+/// `--max_connections`, `--max_connections_per_ip`, `--max_messages_per_minute`
+/// and `--max_recipients` all read 0 as "unlimited", and `--max_header_size`
+/// looks like one more of that family. It is not: the header block is the
+/// one part of a message this proxy holds in memory -- the body is streamed
+/// to the upstream precisely so that nothing unbounded is held -- so there is
+/// no unlimited setting to offer. Taken literally, 0 is a cap the first
+/// header line of every message exceeds, which is why this is a startup
+/// error rather than a silent reinterpretation either way.
+fn check_limits(cli: &Cli) -> Result<(), String> {
+    if cli.max_header_size == 0 {
+        return Err(MAX_HEADER_SIZE_ZERO.to_string());
+    }
+    Ok(())
+}
+
 /// What `pod2usage` does for a bad command line: the complaint, the usage,
 /// and exit status 1. Only for the checks this module makes by hand -- a
 /// clap error already renders its own usage, and passing one through here
@@ -206,6 +230,9 @@ pub fn parse_args() -> Config {
         }
         Err(e) => e.exit(), // --help, --man, --version
     };
+    if let Err(complaint) = check_limits(&cli) {
+        usage_exit(&complaint)
+    }
     let listen = if cli.listen.is_empty() {
         usage_exit("--listen is required")
     } else {
@@ -273,5 +300,37 @@ mod tests {
         );
         assert!(parse_listen("nonsense").is_err());
         assert!(parse_listen("127.0.0.1:notaport").is_err());
+    }
+
+    /// Every other `--max_*` flag reads 0 as "unlimited". An operator who
+    /// carries that convention across to `--max_header_size` used to get the
+    /// exact opposite of what they asked for: a cap of zero bytes, which the
+    /// first header line of every message exceeds, so every message with any
+    /// header at all died with 552. Unlimited is not on offer for this one,
+    /// so the only honest answer is to refuse the value at startup.
+    #[test]
+    fn max_header_size_zero_is_a_configuration_error() {
+        let cli = Cli::try_parse_from(["smtp-proxy", "--max_header_size", "0"]).unwrap();
+        let complaint = check_limits(&cli).expect_err("--max_header_size 0 must be refused");
+        assert!(
+            complaint.starts_with("--max_header_size "),
+            "the complaint must name the flag: {complaint}"
+        );
+        assert!(
+            complaint.contains("unlimited"),
+            "the complaint must say that 0 is not unlimited: {complaint}"
+        );
+    }
+
+    /// The guard must not fire on the default, nor on the smallest value it
+    /// does accept.
+    #[test]
+    fn max_header_size_above_zero_is_accepted() {
+        for value in ["1", "1048576"] {
+            let cli = Cli::try_parse_from(["smtp-proxy", "--max_header_size", value]).unwrap();
+            assert!(check_limits(&cli).is_ok(), "--max_header_size {value}");
+        }
+        let cli = Cli::try_parse_from(["smtp-proxy"]).unwrap();
+        assert!(check_limits(&cli).is_ok(), "the default");
     }
 }
