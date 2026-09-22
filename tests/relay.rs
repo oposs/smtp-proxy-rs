@@ -10,7 +10,7 @@ use common::raw_client::NoVerify;
 use common::upstream::RecordingUpstream;
 use smtp_proxy::api::Recipient;
 use smtp_proxy::relay::{
-    Envelope, Io, MAX_REPLY_LINE, MAX_REPLY_TOTAL, RelayConfig, RelayError, UpstreamCaps,
+    Envelope, Io, MAX_REPLY_TOTAL, MAX_UPSTREAM_REPLY_LINE, RelayConfig, RelayError, UpstreamCaps,
     UpstreamSession, UpstreamTls, UpstreamTlsMode, assert_relayable, probe, probe_over,
 };
 // The convenience constructor these tests drive `UpstreamSession` through.
@@ -958,7 +958,7 @@ async fn endless_reply_line_is_refused_not_buffered() {
     // magnitude below the mebibyte an unbounded read_line would have taken.
     let written = written.load(Ordering::Relaxed);
     assert!(
-        written <= MAX_REPLY_LINE + 8 * HOSTILE_DUPLEX,
+        written <= MAX_UPSTREAM_REPLY_LINE + 8 * HOSTILE_DUPLEX,
         "the relay consumed {written} bytes of an endless line"
     );
 }

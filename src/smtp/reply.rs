@@ -5,8 +5,18 @@
 //! framing and let text from upstream inject a forged reply line; ESC and
 //! friends would be executed by the terminal of whoever tails the smtplog.
 
-pub const MAX_REPLY_LINE: usize = 512;
-const MAX_TEXT: usize = MAX_REPLY_LINE - "250 ".len() - "\r\n".len();
+/// RFC 5321 4.5.3.1.5's cap on one reply line this proxy *sends a client*,
+/// its code, separator and CRLF included. The RFC set it, not us, so it is
+/// not ours to raise.
+///
+/// Not to be confused with [`crate::relay::MAX_UPSTREAM_REPLY_LINE`], which
+/// is this proxy's own, eight times larger memory budget for a line read the
+/// other way, back from an upstream.
+pub const RFC_MAX_CLIENT_REPLY_LINE: usize = 512;
+
+/// What is left of that line for the text once the code, the separator and
+/// the CRLF have taken their share.
+const MAX_TEXT: usize = RFC_MAX_CLIENT_REPLY_LINE - "250 ".len() - "\r\n".len();
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ReplyError {
@@ -156,7 +166,7 @@ mod tests {
     #[test]
     fn overlong_line_is_truncated_to_512_octets() {
         let long = format_reply(550, &["x".repeat(1000).as_str()]).unwrap();
-        assert!(long.len() <= MAX_REPLY_LINE);
+        assert!(long.len() <= RFC_MAX_CLIENT_REPLY_LINE);
         assert!(long.starts_with("550 xxx"));
         assert!(long.ends_with("...\r\n"));
     }
@@ -195,7 +205,7 @@ mod tests {
                 .any(|b| b != b'\t' && !(0x20..=0x7e).contains(&b))
         );
         let long = format_reply(550, &["\u{263a}".repeat(1000).as_str()]).unwrap();
-        assert!(long.len() <= MAX_REPLY_LINE);
+        assert!(long.len() <= RFC_MAX_CLIENT_REPLY_LINE);
     }
 
     #[test]
