@@ -12,7 +12,26 @@ KillSignal=SIGTERM
 # the graceful drain finish instead of cutting it short with SIGKILL. Raise it
 # with the flag if you raise the drain.
 TimeoutStopSec=45
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+# No `User=` and no `AmbientCapabilities=`: the proxy binds its listen ports
+# while it is still root and then drops to the account named by `--user`
+# itself, so a privileged port needs no capability at all. An ambient
+# CAP_NET_BIND_SERVICE would be redundant before that drop, ExecStart already
+# being root, and gone after it -- setuid(2) from uid 0 to a non-zero uid
+# clears the permitted, effective *and* ambient sets; see capabilities(7),
+# "Effect of user ID changes on capabilities".
+#
+# What is worth bounding is the root phase, and this is everything it uses:
+# bind the ports, read the TLS key and open the log files (CAP_DAC_OVERRIDE,
+# for a log directory owned by the service account rather than by root), then
+# initgroups, setgid and setuid. Do NOT narrow this to CAP_NET_BIND_SERVICE
+# alone: after execve a root process's permitted set is its bounding set, so
+# the privilege drop would fail with EPERM and the service would not start.
+#
+# If you ever move the drop to systemd with `User=`, it happens before
+# ExecStart and therefore before the bind, so you must add
+# `AmbientCapabilities=CAP_NET_BIND_SERVICE` back -- and then the capability
+# really does last for the life of the process.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
