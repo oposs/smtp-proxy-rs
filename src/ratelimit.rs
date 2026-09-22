@@ -29,8 +29,23 @@ struct Bucket {
 
 /// Drops the least recently used bucket, to make room for one more.
 ///
-/// Linear in the size of the map, but it runs only on an insert that would
-/// overflow a full one, which no real workload reaches.
+/// Linear in the size of the map, and it runs with the one mutex held that
+/// every session's MAIL FROM also needs. Documented rather than fixed,
+/// because the numbers bound it: `MAX_BUCKETS` caps the map at 10,000
+/// entries, the scan happens only on an insert of a key a *full* map does
+/// not already hold, and a `min_by_key` over ten thousand `Instant`s is tens
+/// of microseconds. Do not read that as "no real workload reaches it" -- the
+/// key is an unverified AUTH username, so filling the map is simply
+/// something a client can decide to do. What the workload does bound is the
+/// rate: the same client is held to `--max_messages_per_minute` and
+/// `--max_connections_per_ip`, which leaves a worst case of a few
+/// milliseconds of aggregate contention per second.
+///
+/// That trade stops holding if `MAX_BUCKETS` is ever raised past about
+/// 100,000, or if a profile shows one scan costing more than a millisecond.
+/// The answer then is a smaller `MAX_BUCKETS`, not a sampled LRU: sampling
+/// changes which bucket is evicted, which is the behaviour
+/// `the_map_is_capped_and_gives_up_its_idlest_bucket` exists to pin down.
 ///
 /// Evicting rather than refusing is the point: a limiter that turned new
 /// keys away once full would let anyone able to fill the map lock out every
