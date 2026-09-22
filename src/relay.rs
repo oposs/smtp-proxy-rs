@@ -228,11 +228,17 @@ impl RelayError {
     }
 }
 
-/// The most bytes one reply line may hold, its terminator included. RFC 5321
-/// 4.5.3.1.5 caps a reply line at 512 octets, so this is generous; its job is
-/// only to keep a hostile or broken upstream from feeding an endless line
+/// The most bytes one reply line *read back from an upstream* may hold, its
+/// terminator included. This is our own budget, not a protocol limit: RFC 5321
+/// 4.5.3.1.5 caps a reply line at 512 octets, so this is generous, and its job
+/// is only to keep a hostile or broken upstream from feeding an endless line
 /// into memory. The Perl bounds neither this nor [`MAX_REPLY_TOTAL`].
-pub const MAX_REPLY_LINE: usize = 4096;
+///
+/// Not to be confused with [`crate::smtp::reply::RFC_MAX_CLIENT_REPLY_LINE`],
+/// which is the RFC's 512-octet cap on a reply line this proxy *sends a
+/// client*. The two bounds govern opposite directions and differ by a factor
+/// of eight; reaching for the wrong one compiles.
+pub const MAX_UPSTREAM_REPLY_LINE: usize = 4096;
 
 /// The most bytes a whole multi-line reply may hold. Without it an upstream
 /// that answers `220-x` for ever is exactly as unbounded as one that never
@@ -494,7 +500,7 @@ async fn read_reply<R: AsyncBufRead + Unpin>(
         let n = tokio::time::timeout(
             timeout,
             (&mut *reader)
-                .take(MAX_REPLY_LINE as u64)
+                .take(MAX_UPSTREAM_REPLY_LINE as u64)
                 .read_line(&mut line),
         )
         .await
@@ -509,10 +515,10 @@ async fn read_reply<R: AsyncBufRead + Unpin>(
         // A line that spent its whole budget without reaching a newline
         // has no end in sight. One that stopped short of the budget
         // ended at EOF instead, and is parsed as it always was.
-        if !line.ends_with('\n') && line.len() >= MAX_REPLY_LINE {
+        if !line.ends_with('\n') && line.len() >= MAX_UPSTREAM_REPLY_LINE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("upstream reply line exceeds {MAX_REPLY_LINE} bytes"),
+                format!("upstream reply line exceeds {MAX_UPSTREAM_REPLY_LINE} bytes"),
             )
             .into());
         }
