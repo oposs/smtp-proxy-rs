@@ -82,6 +82,14 @@
   without this an unauthenticated client could hold every slot for ever by
   sending nothing at all. The wait for the client's *first* command has a
   shorter deadline of its own, `--greeting_timeout` above
+- the systemd unit no longer hands the service an ambient
+  CAP_NET_BIND_SERVICE, and instead limits it to the four capabilities the
+  startup actually needs -- binding the listen ports, reading the certificate
+  and the log files, and changing to the account given with `--user`. The
+  service still starts as root and still binds privileged ports, so a
+  deployment that uses the unit as shipped sees no change. An operator who
+  has replaced `--user` with systemd's own `User=` in a drop-in has to put
+  `AmbientCapabilities=CAP_NET_BIND_SERVICE` back
 - UPGRADE NOTE: an upstream that dies in the middle of a message now closes the
   client connection instead of answering `451` at the terminator. During DATA
   the proxy is a mirror: it has already relayed the body it received, so it
