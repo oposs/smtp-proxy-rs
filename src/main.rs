@@ -151,6 +151,16 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     let mut outcome = listener::ServeOutcome::Clean;
     tokio::select! {
         drained = async {
+            // The order is load-bearing: `serve` first, the drain second.
+            // `wait_drained` returns as soon as the tracker is closed and
+            // empty, and `listener::serve` closes it as soon as it has
+            // spawned the accept loops -- so the tracker is momentarily
+            // empty at startup and again every time the last live session
+            // ends. Awaiting the drain first would therefore return almost
+            // at once and cut every in-flight message off mid-body, with
+            // nothing in the log to say so; only `serve` returning proves
+            // the accept loops have stopped and that nothing further can be
+            // spawned into the tracker.
             let ended = serve.await;
             (ended, drain.wait_drained(timeout).await)
         } => {
