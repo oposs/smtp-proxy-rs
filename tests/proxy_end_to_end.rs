@@ -615,6 +615,52 @@ async fn a_refusal_mid_body_is_reported_to_the_operator() {
     );
 }
 
+/// A refusal names the SMTP step it happened at.
+///
+/// The operator sentence cannot carry it: that line is the Perl's, and the
+/// Perl's `$error` stringifies to the upstream's reply text alone
+/// (`UpstreamVerdict::into_relay_error`). On the refusal road the step is
+/// therefore lost unless `report_refusal` says it separately -- and on the
+/// mid-body road it is lost everywhere else too, because
+/// `UpstreamSession::write` reads the early reply itself and logs nothing.
+///
+/// `DATA` and not `DATA_END` here: the client is still writing when the
+/// upstream refuses. Asserting on the whole `at DATA for` is what keeps this
+/// honest -- `refuse_data` already logs `DATA rejected for ...`, so a test
+/// that merely looked for `DATA` would pass without the line it is about.
+#[tokio::test]
+async fn a_refusal_names_the_step_it_happened_at() {
+    const REFUSAL: &str = "5.3.4 stage-probe over the limit";
+    let r = rig(&["DSN"]).await;
+    r.upstream.reject_during_data(4096, (552, REFUSAL));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+    assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
+    assert!(c.command("DATA").await.starts_with("354"));
+    let line = format!("{}\r\n", "y".repeat(1022));
+    c.write_raw(&format!(
+        "Subject: x\r\n\r\n{}",
+        line.repeat(8 * 1024 * 1024 / line.len())
+    ))
+    .await;
+    assert_eq!(c.read_reply().await, format!("552 {REFUSAL}\r\n"));
+    c.write_raw(".\r\n").await;
+    assert_eq!(c.command("MAIL FROM:<x@y.com>").await, "250 OK\r\n");
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    // The guard first: without it a log missing the refusal entirely would
+    // fail below for the wrong reason.
+    assert!(
+        text.contains(REFUSAL),
+        "the refusal never reached the log at all; log:\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l.contains("Refused at DATA for")),
+        "the refusal did not name the step it happened at; log:\n{text}"
+    );
+}
+
 /// The stage a lost upstream is reported against has to be the step the
 /// proxy was driving, because the body and the terminator are two different
 /// failures to an operator reading a log
