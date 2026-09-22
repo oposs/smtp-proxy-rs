@@ -183,14 +183,31 @@ fn complete_args() -> Vec<String> {
     .collect()
 }
 
-/// Runs the binary and returns (exit code, stdout, stderr).
-fn run(args: &[String]) -> (i32, String, String) {
-    let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
-        .args(args)
-        .output()
-        .unwrap();
+/// Runs the binary to completion and returns (exit code, stdout, stderr).
+///
+/// The one helper for "drive the binary and read what it said", and it
+/// cannot hang. There used to be two -- this one without a deadline, and a
+/// `run_bounded` with one -- which is a trap rather than a choice: `run` is
+/// the name the next person reaches for, and reading a plain
+/// `std::process::Command::output()` does not announce that it waits for the
+/// child to close its pipes. A proxy that *starts* never closes them and
+/// never exits, so such a call blocks for ever: cargo does not time a test
+/// out, so the whole `cli` binary sits there until CI's wall clock kills the
+/// job, with no failing assertion and no captured output to read, and on a
+/// developer's machine it leaves a live daemon on an ephemeral port that no
+/// `Proxy` guard covers. So the deadline belongs on the obvious name, and
+/// there is nothing else to reach for.
+///
+/// The exit code is an `Option` for the same reason: `None` is a process
+/// that did not exit on its own and had to be killed at `DEADLINE`, which is
+/// a distinct outcome from any code it could have returned, and a caller
+/// comparing against `Some(1)` reports it as a failure instead of hanging.
+/// `DEADLINE` is the same ten seconds the pollers above use, four orders of
+/// magnitude above a clap error, so a loaded host cannot make this flaky.
+fn run(args: &[String]) -> (Option<i32>, String, String) {
+    let out = bin().args(args).timeout(DEADLINE).output().unwrap();
     (
-        out.status.code().unwrap(),
+        out.status.code(),
         String::from_utf8(out.stdout).unwrap(),
         String::from_utf8(out.stderr).unwrap(),
     )
@@ -244,7 +261,7 @@ fn usage_errors_exit_1_with_at_most_one_usage_block() {
         ),
     ] {
         let (code, stdout, stderr) = run(&args);
-        assert_eq!(code, 1, "{name}: exit code\nstderr:\n{stderr}");
+        assert_eq!(code, Some(1), "{name}: exit code\nstderr:\n{stderr}");
         assert_eq!(stdout, "", "{name}: nothing belongs on stdout");
         assert!(
             stderr.contains(expected),
@@ -258,20 +275,6 @@ fn usage_errors_exit_1_with_at_most_one_usage_block() {
     }
 }
 
-/// A run that cannot hang. `run` above waits for the child to close its
-/// pipes, which a proxy that *starts* never does -- and the whole point of
-/// this case is that the binary must refuse the value instead of starting.
-/// Without the deadline a regression would leave a real daemon listening and
-/// the test waiting on it for ever, rather than reporting a failure.
-fn run_bounded(args: &[String]) -> (Option<i32>, String, String) {
-    let out = bin().args(args).timeout(DEADLINE).output().unwrap();
-    (
-        out.status.code(),
-        String::from_utf8(out.stdout).unwrap(),
-        String::from_utf8(out.stderr).unwrap(),
-    )
-}
-
 /// `--max_header_size 0` used to be accepted, and then refused every message
 /// carrying any header at all with 552 -- the opposite of the "0 means
 /// unlimited" its four sibling limits document. Unlimited is not an option
@@ -282,7 +285,7 @@ fn max_header_size_zero_is_refused_at_startup() {
     let mut args = complete_args();
     args.push("--max_header_size".to_string());
     args.push("0".to_string());
-    let (code, stdout, stderr) = run_bounded(&args);
+    let (code, stdout, stderr) = run(&args);
     assert_eq!(
         code,
         Some(1),
@@ -327,7 +330,7 @@ fn help_says_max_header_size_has_no_unlimited() {
 #[test]
 fn man_exits_0_with_the_long_description() {
     let (code, stdout, stderr) = run(&["--man".to_string()]);
-    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
     assert_eq!(stderr, "", "nothing belongs on stderr");
     assert!(
         stdout.contains("Starts an SMTP server on the listen host and port."),
