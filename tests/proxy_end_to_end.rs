@@ -661,6 +661,64 @@ async fn a_refusal_names_the_step_it_happened_at() {
     );
 }
 
+/// The other refusal road: the step named when the upstream refuses at the
+/// terminator.
+///
+/// `report_refusal` is reached with two different stage literals, and the
+/// test above only walks one of them. This is the other: the upstream takes
+/// the whole body and refuses the final dot, so the verdict comes back from
+/// `UpstreamSession::finish` and `ProxySink::finish` reports it as
+/// `DATA_END`. Nothing else in the log says so -- the operator sentence
+/// above it is the Perl's, and for a `Replied` verdict
+/// `UpstreamVerdict::into_relay_error` stringifies to the upstream's reply
+/// text alone, with no slot for a step.
+///
+/// The assertion carries this client's own address, which is what a shorter
+/// one could not do honestly. `Refused at DATA_END for` by itself is
+/// already in the log every test in this binary shares:
+/// `the_stage_of_a_lost_upstream_is_the_step_the_proxy_was_driving` writes
+/// it from the *other* `DATA_END` caller, `ProxySink::write_final`, so a
+/// test looking only for that text would pass on a run where this road
+/// logged nothing at all. Scoped to this connection it cannot.
+///
+/// (A bare `DATA_END` would be no better, and a bare `DATA` worse still,
+/// for the reason the test above gives: `refuse_data` logs
+/// `DATA rejected for ...` on this very road.)
+#[tokio::test]
+async fn a_refusal_at_the_terminator_names_that_step() {
+    const REFUSAL: &str = "5.3.4 terminator-probe over the limit";
+    let r = rig(&["DSN"]).await;
+    r.upstream.reject_data_end(Some((552, REFUSAL)));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let client = c.local_addr();
+    c.login("user", "pass").await;
+    let reply = send_mail(
+        &mut c,
+        "sender@foobar.com",
+        &["receiver@foobaz.com"],
+        MESSAGE,
+    )
+    .await;
+    // Also what says the log is already written: the debug line goes out
+    // inside `finish`, and the verdict only becomes this reply afterwards,
+    // on its way back up through the session.
+    assert_eq!(reply, format!("552 {REFUSAL}\r\n"));
+
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    // The guard first: without it a log missing the refusal entirely would
+    // fail below for the wrong reason.
+    assert!(
+        text.contains(REFUSAL),
+        "the refusal never reached the log at all; log:\n{text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l.contains(&format!("Refused at DATA_END for {client}"))),
+        "the refusal at the terminator did not name the step it happened at; \
+         log:\n{text}"
+    );
+}
+
 /// The stage a lost upstream is reported against has to be the step the
 /// proxy was driving, because the body and the terminator are two different
 /// failures to an operator reading a log

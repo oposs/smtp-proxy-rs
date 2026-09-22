@@ -385,12 +385,17 @@ async fn a_header_block_that_fills_the_cap_exactly_still_ends_normally() {
     let subject = format!("Subject: {}\r\n", "z".repeat(53));
     assert_eq!(subject.len(), 64);
     c.write_raw(&subject).await;
+    // Each pause below waits on the server, not on a reply, so the bytes it
+    // is waiting for have to be pushed out by hand -- `RawClient::flush`.
+    // The last write needs none: `read_reply` flushes for itself.
+    c.flush().await;
     // The terminator arrives split across two reads. The lone dot must not be
     // read as an over-cap line: doing so would discard the message, swallow
     // the rest of the terminator as a discarded tail, and leave the session
     // waiting for a terminator that has already been sent.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.write_raw(".").await;
+    c.flush().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.write_raw("\r\n").await;
     assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
@@ -437,10 +442,14 @@ async fn a_discarded_header_line_tail_is_not_mistaken_for_the_terminator() {
     // collector holds two bytes of slack for a half-read terminator, so 55
     // bytes without a newline are what tips the block over the cap. Each
     // sleep lets the server consume what was sent and go back to waiting with
-    // an empty buffer, which fixes where the discard falls.
+    // an empty buffer, which fixes where the discard falls. The sleeps wait
+    // on the server rather than on a reply, so each write is pushed out by
+    // hand -- `RawClient::flush`.
     c.write_raw("Subject: x\r\n").await;
+    c.flush().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     c.write_raw(&"y".repeat(55)).await;
+    c.flush().await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     // The rest of that same header line now happens to be a lone dot. It ends
     // the line, but the line began 55 bytes ago, so this is not a dot on a
@@ -470,6 +479,11 @@ async fn a_client_leaving_during_a_slow_message_does_not_stop_the_server() {
     assert_eq!(c.command("RCPT TO:<a@b.com>").await, "250 OK\r\n");
     assert!(c.command("DATA").await.starts_with("354"));
     c.write_raw("Subject: x\r\n\r\n.\r\n").await;
+    // Nothing waits on a reply here -- the client is about to be dropped --
+    // so the message goes out by hand (`RawClient::flush`). A drop does not
+    // flush, and a message left behind would leave the handler with nothing
+    // to run to completion.
+    c.flush().await;
     drop(c);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     // The handler ran to completion even though the client had already gone.
