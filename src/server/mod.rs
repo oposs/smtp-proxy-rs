@@ -155,9 +155,11 @@ pub trait Handler: Send + 'static {
     /// on it only relays what the upstream says. That is why the two error
     /// types differ: `Rejection` is the proxy's own voice, `UpstreamVerdict`
     /// is the upstream's.
+    /// `headers` is the block as the client sent it, bytes and not text:
+    /// what goes upstream has to be what arrived.
     fn open_body(
         &mut self,
-        headers: String,
+        headers: Vec<u8>,
     ) -> impl Future<Output = Result<Self::Sink, Rejection>> + Send;
     /// RSET, or EHLO/HELO while a transaction is running.
     fn reset(&mut self);

@@ -137,6 +137,38 @@ async fn headers_are_inserted_replaced_and_removed() {
     );
 }
 
+/// A header carrying raw Latin-1 -- `0xFC` for `\u{00fc}`, which real MUAs
+/// still emit instead of RFC 2047 -- has to reach the upstream byte for byte.
+/// The Perl relays it untouched, reassembling byte strings it never decoded
+/// (`SMTPProxy.pm`, `map { $_->{name} . ': ' . $_->{value} . "\r\n" }`).
+#[tokio::test]
+async fn a_latin1_header_reaches_the_upstream_unchanged() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [] }));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    c.login("user", "pass").await;
+
+    assert_eq!(
+        c.command("MAIL FROM:<sender@foobar.com>").await,
+        "250 OK\r\n"
+    );
+    assert_eq!(
+        c.command("RCPT TO:<receiver@foobaz.com>").await,
+        "250 OK\r\n"
+    );
+    assert!(c.command("DATA").await.starts_with("354"));
+    let message: Vec<u8> = b"Subject: Gr\xfc\xdfe\r\n\r\nHello there\r\n.\r\n".to_vec();
+    c.write_bytes(&message).await;
+    assert!(c.read_reply().await.starts_with("250"));
+
+    assert_eq!(
+        r.upstream.raw_messages()[0],
+        b"Subject: Gr\xfc\xdfe\r\n\r\nHello there\r\n".to_vec(),
+        "the relayed header block was not byte-identical"
+    );
+}
+
 #[tokio::test]
 async fn api_can_change_the_envelope_sender_but_not_inject_commands() {
     let r = rig(&["DSN"]).await;

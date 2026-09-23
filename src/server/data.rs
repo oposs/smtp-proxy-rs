@@ -14,8 +14,10 @@ pub const WRITE_CHUNK: usize = 64 * 1024;
 /// What a complete header line did to the block.
 #[derive(Debug)]
 pub enum HeaderEvent {
-    /// The blank line arrived: here is the block.
-    Complete(String),
+    /// The blank line arrived: here is the block, as the client sent it.
+    /// Bytes rather than a `String`: a header may carry raw Latin-1, and
+    /// what goes upstream has to be what arrived (`proxy.rs`, `RawHeader`).
+    Complete(Vec<u8>),
     /// The lone dot arrived first, so the message is headers only. The
     /// block is still pending; `take_pending` hands it over.
     Terminator,
@@ -80,8 +82,7 @@ impl HeaderCollector {
         }
         if is_empty_line(line) {
             self.delivered = true;
-            let headers = String::from_utf8_lossy(&std::mem::take(&mut self.headers)).into_owned();
-            return Some(HeaderEvent::Complete(headers));
+            return Some(HeaderEvent::Complete(std::mem::take(&mut self.headers)));
         }
         let unstuffed = line.strip_prefix(b".").unwrap_or(line);
         self.size += unstuffed.len();
@@ -116,12 +117,12 @@ impl HeaderCollector {
     /// The header block, when the terminator arrived before any blank line.
     /// `None` once the block has been handed over, and once the cap has been
     /// crossed: there is nothing left to hand over in either case.
-    pub fn take_pending(&mut self) -> Option<String> {
+    pub fn take_pending(&mut self) -> Option<Vec<u8>> {
         if self.delivered || self.too_large {
             return None;
         }
         self.delivered = true;
-        Some(String::from_utf8_lossy(&std::mem::take(&mut self.headers)).into_owned())
+        Some(std::mem::take(&mut self.headers))
     }
 }
 
@@ -257,7 +258,7 @@ mod tests {
         let mut h = HeaderCollector::new(usize::MAX);
         assert!(h.push_line(b"A: 1\r\n").is_none());
         match h.push_line(b"\r\n") {
-            Some(HeaderEvent::Complete(s)) => assert_eq!(s, "A: 1\r\n"),
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, b"A: 1\r\n"),
             other => panic!("{other:?}"),
         }
     }
@@ -270,7 +271,7 @@ mod tests {
             h.push_line(b".\r\n"),
             Some(HeaderEvent::Terminator)
         ));
-        assert_eq!(h.take_pending().unwrap(), "A: 1\r\n");
+        assert_eq!(h.take_pending().unwrap(), b"A: 1\r\n");
     }
 
     #[test]
@@ -327,7 +328,7 @@ mod tests {
         let mut h = HeaderCollector::new(usize::MAX);
         assert!(h.push_line(b"..X-Odd: yes\r\n").is_none());
         match h.push_line(b"\r\n") {
-            Some(HeaderEvent::Complete(s)) => assert_eq!(s, ".X-Odd: yes\r\n"),
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, b".X-Odd: yes\r\n"),
             other => panic!("{other:?}"),
         }
     }
@@ -337,7 +338,7 @@ mod tests {
         let mut h = HeaderCollector::new(usize::MAX);
         assert!(h.push_line(b"A: 1\n").is_none());
         match h.push_line(b"\n") {
-            Some(HeaderEvent::Complete(s)) => assert_eq!(s, "A: 1\n"),
+            Some(HeaderEvent::Complete(s)) => assert_eq!(s, b"A: 1\n"),
             other => panic!("{other:?}"),
         }
     }

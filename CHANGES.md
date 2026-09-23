@@ -106,6 +106,14 @@
   connection died, leaving a crash report in the log. Any client could do it
   before authenticating. The command is now answered
   `501 invalid MAIL arguments`
+- a header carrying non-UTF-8 bytes, which mail programs still send for
+  Western European text instead of encoding it, reached the recipient with
+  every such byte replaced by a question-mark character. The header block is
+  now relayed exactly as it arrived
+- a header the API added with an empty name, or a name beginning with a space
+  or a tab, disappeared into the value of the header above it instead of being
+  added. Such a header is now refused with
+  `550 authentication service failed` and named in the log
 
 - the upstream server's own reply code now reaches the client. The Perl answered
   a refusal 550 whatever the upstream said, so an upstream 451 arrived as 550

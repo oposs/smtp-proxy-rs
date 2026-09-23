@@ -153,7 +153,7 @@ struct Transaction {
     from: String,
     mail_params: Vec<Param>,
     recipients: Vec<Recipient>,
-    headers: Vec<RequestHeader>,
+    headers: Vec<RawHeader>,
 }
 
 pub struct ProxyHandler {
@@ -162,6 +162,36 @@ pub struct ProxyHandler {
     username: Option<String>,
     password: Option<String>,
     transaction: Transaction,
+}
+
+/// One header as the message carries it, which is bytes and not text.
+///
+/// The relay-side twin of [`RequestHeader`]. They are two types because they
+/// answer to two different contracts: the API body is JSON and must be valid
+/// UTF-8, while the relayed message must be what arrived -- a `Subject:` in
+/// raw Latin-1, which MUAs still send in place of RFC 2047, reaches the
+/// recipient as the sender wrote it. Converting once, on the way into the
+/// API call, keeps the lossy step where it is unavoidable and out of the
+/// path the message itself takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawHeader {
+    pub name: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+impl RawHeader {
+    /// The API's view of this header. Lossy by necessity: JSON carries text.
+    fn to_request(&self) -> RequestHeader {
+        RequestHeader {
+            name: String::from_utf8_lossy(&self.name).into_owned(),
+            value: String::from_utf8_lossy(&self.value).into_owned(),
+        }
+    }
+
+    /// For a log line or an error: never for the wire.
+    fn name_text(&self) -> String {
+        String::from_utf8_lossy(&self.name).into_owned()
+    }
 }
 
 /// Splits at a line break followed by a non-blank (folded lines stay whole),
@@ -176,31 +206,49 @@ pub struct ProxyHandler {
 /// remaining header. API-side header policy would then be evadable by
 /// sending LF instead of CRLF. Splitting on the LF of either terminator
 /// closes that.
-pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
-    let mut lines: Vec<String> = Vec::new();
-    for raw in block.split_inclusive('\n') {
+pub fn parse_headers(block: &[u8]) -> Vec<RawHeader> {
+    let mut lines: Vec<Vec<u8>> = Vec::new();
+    for raw in block.split_inclusive(|b| *b == b'\n') {
         // The Perl splits on `/\r\n(?=$|\S)/`, whose `\S` counts the
         // vertical tab and the form feed as continuation as well.
-        let continuation = raw.starts_with([' ', '\t', '\x0b', '\x0c']);
+        let continuation = matches!(raw.first(), Some(b' ' | b'\t' | b'\x0b' | b'\x0c'));
         match lines.last_mut() {
-            Some(last) if continuation => last.push_str(raw),
-            _ => lines.push(raw.to_string()),
+            Some(last) if continuation => last.extend_from_slice(raw),
+            _ => lines.push(raw.to_vec()),
         }
     }
     let mut out = Vec::new();
     for line in lines {
-        let line = line.trim_end_matches(['\r', '\n']);
-        match line.split_once(':') {
+        let line = trim_end_breaks(&line);
+        match line.iter().position(|b| *b == b':') {
             // `[^:]+` needs a name and `(.+)` needs at least one character
             // behind the colon, so `Subject:` does not parse.
-            Some((name, rest)) if !name.is_empty() && !rest.is_empty() => out.push(RequestHeader {
-                name: name.to_string(),
-                value: perl_header_value(rest),
+            Some(colon) if colon > 0 && colon + 1 < line.len() => out.push(RawHeader {
+                name: line[..colon].to_vec(),
+                value: perl_header_value(&line[colon + 1..]),
             }),
-            _ => warn!("Could not parse header '{line}'"),
+            _ => warn!("Could not parse header '{}'", String::from_utf8_lossy(line)),
         }
     }
     out
+}
+
+/// The Perl's `\s` set, which is what `perl_header_value` and the fold check
+/// both mean by whitespace. Spelled out rather than reached for through
+/// `char::is_whitespace`, which is the *Unicode* set and would also strip a
+/// no-break space the Perl leaves alone, or through `u8::is_ascii_whitespace`,
+/// which omits the vertical tab the Perl counts.
+fn is_perl_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+}
+
+/// Drops the line's own terminator, however it arrived.
+fn trim_end_breaks(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    &line[..end]
 }
 
 /// The value half of the Perl's `/^([^:]+):\s*(.+)$/s` (`SMTPProxy.pm:96`).
@@ -209,15 +257,15 @@ pub fn parse_headers(block: &str) -> Vec<RequestHeader> {
 /// everything behind the colon is whitespace the regex backtracks by exactly
 /// one: `Subject:  ` yields a single space, not the empty string. Faithful
 /// here because the header list goes to the customer's API as it is.
-fn perl_header_value(rest: &str) -> String {
-    let trimmed = rest.trim_start();
-    if !trimmed.is_empty() {
-        return trimmed.to_string();
+fn perl_header_value(rest: &[u8]) -> Vec<u8> {
+    let start = rest.iter().position(|b| !is_perl_space(*b));
+    match start {
+        Some(i) => rest[i..].to_vec(),
+        // All whitespace: the regex backtracks by exactly one, and every
+        // character in the Perl's `\s` set is one byte, so the last byte is
+        // the last character.
+        None => rest.last().map(|b| vec![*b]).unwrap_or_default(),
     }
-    rest.chars()
-        .next_back()
-        .map(String::from)
-        .unwrap_or_default()
 }
 
 /// Spec 5.4: remove every header the API names, then append those it gave a
@@ -229,15 +277,18 @@ fn perl_header_value(rest: &str) -> String {
 /// and the relayed message carries *both*. RFC 5322 3.6.8 makes field names
 /// case-insensitive, so the comparison is too. ASCII case is the right fold:
 /// a field name is printable US-ASCII by the same section.
-pub fn merge_headers(existing: Vec<RequestHeader>, api: &[ResponseHeader]) -> Vec<RequestHeader> {
-    let mut out: Vec<RequestHeader> = existing
+pub fn merge_headers(existing: Vec<RawHeader>, api: &[ResponseHeader]) -> Vec<RawHeader> {
+    let mut out: Vec<RawHeader> = existing
         .into_iter()
-        .filter(|h| !api.iter().any(|a| a.name.eq_ignore_ascii_case(&h.name)))
+        .filter(|h| {
+            !api.iter()
+                .any(|a| a.name.as_bytes().eq_ignore_ascii_case(&h.name))
+        })
         .collect();
     out.extend(api.iter().filter_map(|a| {
-        a.value.clone().map(|value| RequestHeader {
-            name: a.name.clone(),
-            value,
+        a.value.clone().map(|value| RawHeader {
+            name: a.name.clone().into_bytes(),
+            value: value.into_bytes(),
         })
     }));
     out
@@ -269,9 +320,16 @@ fn folds_at(value: &[u8], i: usize) -> bool {
 /// A line break inside a value is legal only as a proper fold -- a `\r\n` or
 /// a bare `\n` immediately followed by a space or a tab. That precision is
 /// required rather than a blanket "no CRLF": client-supplied folded headers
-/// arrive here with their break intact and have to keep relaying. A *name*
-/// may hold no `\r`, `\n` or `:` at all, since the colon is what separates
-/// it from the value.
+/// arrive here with their break intact and have to keep relaying.
+///
+/// A *name* must be non-empty and hold no `\r`, `\n`, `:` or whitespace. The
+/// colon is what separates it from the value; the rest is about the header
+/// surviving as a header of its own. An empty name writes the line
+/// `": value"`, and whitespace in a name splits the line where RFC 5322
+/// reads a **fold** -- so a leading space makes the whole header disappear
+/// into the value of the one above it, silently, which is the worst outcome
+/// for an API that added `X-Spam-Status` and believes it was relayed. A
+/// leading dot is still allowed: [`header_block`] stuffs it back on.
 ///
 /// `Err` carries the offending header's **name only**. The value may hold
 /// customer content and this string is logged.
@@ -280,15 +338,19 @@ fn folds_at(value: &[u8], i: usize) -> bool {
 /// the value unchecked (`SMTPProxy.pm:252-253`). The envelope addresses are
 /// guarded on both sides ([`crate::relay::assert_relayable`]); the headers
 /// were not.
-pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String> {
+pub fn assert_header_relayable(headers: &[RawHeader]) -> Result<(), String> {
     for h in headers {
-        if h.name.contains(['\r', '\n', ':']) {
-            return Err(h.name.clone());
+        if h.name.is_empty()
+            || h.name
+                .iter()
+                .any(|b| matches!(b, b'\r' | b'\n' | b':') || is_perl_space(*b))
+        {
+            return Err(h.name_text());
         }
-        let value = h.value.as_bytes();
+        let value = &h.value;
         for i in 0..value.len() {
             if (value[i] == b'\r' || value[i] == b'\n') && !folds_at(value, i) {
-                return Err(h.name.clone());
+                return Err(h.name_text());
             }
         }
     }
@@ -322,10 +384,13 @@ pub fn assert_header_relayable(headers: &[RequestHeader]) -> Result<(), String> 
 /// forms carry -- so the order is the reading order and nothing rests on it.
 /// Headers the API supplied go through both alike: this is a wire encoding,
 /// not a property of where a header came from.
-pub fn header_block(headers: &[RequestHeader]) -> Vec<u8> {
+pub fn header_block(headers: &[RawHeader]) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     for h in headers {
-        out.extend_from_slice(format!("{}: {}\r\n", h.name, h.value).as_bytes());
+        out.extend_from_slice(&h.name);
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(&h.value);
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
     dot_stuff(&normalize_breaks(&out))
@@ -430,7 +495,7 @@ impl ProxyHandler {
             password: self.password.clone().unwrap_or_default(),
             from: t.from.clone(),
             to: t.recipients.iter().map(|r| r.address.clone()).collect(),
-            headers: t.headers.clone(),
+            headers: t.headers.iter().map(RawHeader::to_request).collect(),
             mail_parameters: t.mail_params.clone(),
             rcpt_parameters: t.recipients.clone(),
         }
@@ -601,7 +666,7 @@ impl Handler for ProxyHandler {
     /// Every decision the proxy makes on its own, in one place: ask the API,
     /// merge the headers it returns, check them, and settle the envelope.
     /// What comes back is a sink with no opinions left.
-    async fn open_body(&mut self, headers: String) -> Result<ProxySink, Rejection> {
+    async fn open_body(&mut self, headers: Vec<u8>) -> Result<ProxySink, Rejection> {
         self.transaction.headers = parse_headers(&headers);
         debug!("Making call to auth/headers API");
         let request = self.check_request();
@@ -646,7 +711,7 @@ impl Handler for ProxyHandler {
         // thing that might itself carry the break being complained about.
         if let Err(which) = assert_header_relayable(&merged) {
             warn!(
-                "Refusing to relay header '{}' for {}: unfolded line break",
+                "Refusing to relay header '{}' for {}: unfolded line break or unusable name",
                 which.escape_debug(),
                 self.client
             );
@@ -726,8 +791,8 @@ impl Handler for ProxyHandler {
 mod tests {
     use super::*;
 
-    fn h(n: &str, v: &str) -> RequestHeader {
-        RequestHeader {
+    fn h(n: &str, v: &str) -> RawHeader {
+        RawHeader {
             name: n.into(),
             value: v.into(),
         }
@@ -743,7 +808,7 @@ mod tests {
     #[test]
     fn headers_split_at_unfolded_crlf() {
         let block = "From: a@b.com\r\nSubject: long\r\n  folded line\r\nTo:x@y.com\r\nBroken header line\r\n";
-        let parsed = parse_headers(block);
+        let parsed = parse_headers(block.as_bytes());
         assert_eq!(
             parsed,
             vec![
@@ -761,7 +826,7 @@ mod tests {
     #[test]
     fn a_header_with_nothing_behind_the_colon_is_dropped() {
         let parsed = parse_headers(
-            "Subject:\r\nX-Empty:\r\nX-Space: \r\nX-Spaces:   \r\nX-Tab:\t\r\nTo: x@y.com\r\n",
+            b"Subject:\r\nX-Empty:\r\nX-Space: \r\nX-Spaces:   \r\nX-Tab:\t\r\nTo: x@y.com\r\n",
         );
         assert_eq!(
             parsed,
@@ -778,7 +843,7 @@ mod tests {
     /// feed as continuation, not as the start of a new header.
     #[test]
     fn vertical_tab_and_form_feed_continue_a_header() {
-        let parsed = parse_headers("Subject: a\r\n\x0bb\r\n\x0cc\r\nTo: x@y.com\r\n");
+        let parsed = parse_headers("Subject: a\r\n\x0bb\r\n\x0cc\r\nTo: x@y.com\r\n".as_bytes());
         assert_eq!(
             parsed,
             vec![h("Subject", "a\r\n\x0bb\r\n\x0cc"), h("To", "x@y.com")]
@@ -838,7 +903,7 @@ mod tests {
     /// them to have an opinion about them.
     #[test]
     fn bare_lf_header_block_splits_into_headers() {
-        let parsed = parse_headers("From: a@b.com\nSubject: hi\nTo: x@y.com\n");
+        let parsed = parse_headers("From: a@b.com\nSubject: hi\nTo: x@y.com\n".as_bytes());
         assert_eq!(
             parsed,
             vec![h("From", "a@b.com"), h("Subject", "hi"), h("To", "x@y.com")]
@@ -847,7 +912,7 @@ mod tests {
 
     #[test]
     fn bare_lf_folding_still_folds() {
-        let parsed = parse_headers("Subject: long\n  folded\nTo: x@y.com\n");
+        let parsed = parse_headers("Subject: long\n  folded\nTo: x@y.com\n".as_bytes());
         assert_eq!(
             parsed,
             vec![h("Subject", "long\n  folded"), h("To", "x@y.com")]
@@ -856,7 +921,7 @@ mod tests {
 
     #[test]
     fn mixed_crlf_and_lf_block_splits_on_both() {
-        let parsed = parse_headers("A: 1\r\nB: 2\nC: 3\r\n");
+        let parsed = parse_headers("A: 1\r\nB: 2\nC: 3\r\n".as_bytes());
         assert_eq!(parsed, vec![h("A", "1"), h("B", "2"), h("C", "3")]);
     }
 
@@ -885,6 +950,27 @@ mod tests {
         assert!(assert_header_relayable(&[h("X\r\nY", "v")]).is_err());
         assert!(assert_header_relayable(&[h("X: Y", "v")]).is_err());
         assert!(assert_header_relayable(&[h("X\nY", "v")]).is_err());
+    }
+
+    /// A name that is empty or carries whitespace does not survive
+    /// `header_block` as a header of its own. `""` writes the line
+    /// `": value"`, and a name starting with a space or a tab writes a line
+    /// RFC 5322 reads as a **fold of the header above it** -- so an API's
+    /// `" X-Spam-Status"` would vanish silently into the previous header's
+    /// value instead of being added. Whitespace inside a name splits it in
+    /// two for the same reason.
+    #[test]
+    fn an_empty_or_whitespace_name_is_refused() {
+        assert!(assert_header_relayable(&[h("", "v")]).is_err());
+        assert!(assert_header_relayable(&[h(" X-Spam-Status", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("\tX-Spam-Status", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("X-Spam Status", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("X-Spam-Status ", "v")]).is_err());
+        // The vertical tab and the form feed fold too (see `parse_headers`).
+        assert!(assert_header_relayable(&[h("\x0bX", "v")]).is_err());
+        assert!(assert_header_relayable(&[h("\x0cX", "v")]).is_err());
+        // A leading dot still relays: `header_block` stuffs it back on.
+        assert!(assert_header_relayable(&[h(".X-Odd", "v")]).is_ok());
     }
 
     /// The error names the offending header and nothing else: the value may

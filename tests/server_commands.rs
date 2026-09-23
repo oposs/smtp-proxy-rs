@@ -138,7 +138,7 @@ async fn full_transaction_reaches_the_handler() {
     assert_eq!(rec.mail[0].1[0].keyword, "SIZE");
     assert_eq!(rec.rcpt.len(), 2);
     assert_eq!(rec.rcpt[1].1[0].value.as_deref(), Some("NEVER"));
-    assert_eq!(rec.headers[0], "Subject: hi\r\nTo: a@b.com\r\n");
+    assert_eq!(rec.headers[0], b"Subject: hi\r\nTo: a@b.com\r\n");
     // The sink is given body lines verbatim (spec 5.1), so the client's
     // stuffing dot is still on `..dot line`. Undoing it is the business of
     // whoever writes the body upstream, not of the session.
@@ -400,7 +400,7 @@ async fn a_header_block_that_fills_the_cap_exactly_still_ends_normally() {
     c.write_raw("\r\n").await;
     assert_eq!(c.read_reply().await, "250 OK: queued\r\n");
     let rec = factory.recorded();
-    assert_eq!(rec.headers[0], subject);
+    assert_eq!(rec.headers[0], subject.as_bytes());
     assert!(rec.bodies[0].is_empty());
 }
 
