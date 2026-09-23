@@ -35,9 +35,11 @@ the maintainer notes.
 `docs/manual.md`, front matter `title: SMTP-PROXY`, `section: 1`,
 `header: smtp-proxy manual`, `footer: smtp-proxy`, `date: <day of writing>`.
 
-1. **NAME** — `smtp-proxy - SMTP submission proxy that asks a REST API before relaying`
+1. **NAME** — `smtp-proxy - SMTP submission proxy that lets a REST API control which sender addresses a user may use`
 2. **SYNOPSIS** — `smtp-proxy [OPTIONS]`
-3. **DESCRIPTION** — the session from the client's side: STARTTLS required, AUTH
+3. **DESCRIPTION** — opens with the purpose: the proxy controls which sender
+   addresses an authenticated user may use (owner, 2026-09-23); the API decides,
+   and may also replace the envelope sender. Then the session from the client's side: STARTTLS required, AUTH
    PLAIN, the envelope and the header block go to the API, the API allows or refuses
    and may add headers, the body streams to the upstream, the upstream's answer
    reaches the client. From the POD's DESCRIPTION and README "Usage".
@@ -66,7 +68,8 @@ for sections `man-pages(7)` does not list.
 
 Target: about 100 lines.
 
-1. Title, and three sentences of what it is.
+1. Title, and three sentences of what it is, leading with sender-address control
+   per user (not recipient policy).
 2. **Install** — the `.deb`, the container image on ghcr.io, the static binary. Commands
    only.
 3. **Quick start** — a minimal `/etc/default/smtp-proxy` and `systemctl enable --now`.
