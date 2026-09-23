@@ -12,7 +12,9 @@ pub struct Recorded {
     pub auth: Vec<(String, String, String)>,
     pub mail: Vec<(String, Vec<Param>)>,
     pub rcpt: Vec<(String, Vec<Param>)>,
-    pub headers: Vec<String>,
+    /// Bytes, matching `Handler::open_body`: a fake that stored text
+    /// could not tell a faithful relay from a lossy one.
+    pub headers: Vec<Vec<u8>>,
     /// One entry per message that reached `finish`, exactly as the sink was
     /// given it: verbatim body lines, stuffing dot and all, with the line
     /// endings normalised to CRLF. That is what a real sink writes upstream.
@@ -164,7 +166,7 @@ impl Handler for ScriptedHandler {
         self.script().rcpt_error.map_or(Ok(()), Err)
     }
 
-    async fn open_body(&mut self, headers: String) -> Result<ScriptedSink, Rejection> {
+    async fn open_body(&mut self, headers: Vec<u8>) -> Result<ScriptedSink, Rejection> {
         let mut recorded = self.recorded.lock().unwrap();
         recorded.headers.push(headers);
         recorded.message_started += 1;

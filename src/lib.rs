@@ -25,5 +25,6 @@ pub mod proxy;
 pub mod ratelimit;
 pub mod relay;
 pub mod server;
+pub mod shutdown;
 pub mod smtp;
 pub mod smtplog;

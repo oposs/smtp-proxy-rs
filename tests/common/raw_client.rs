@@ -48,7 +48,13 @@ impl RawClient {
     }
 
     pub async fn write_raw(&mut self, data: &str) {
-        self.stream.write_all(data.as_bytes()).await.unwrap();
+        self.write_bytes(data.as_bytes()).await;
+    }
+
+    /// For content a `&str` cannot hold: a header carrying raw Latin-1, which
+    /// real MUAs still send in place of RFC 2047.
+    pub async fn write_bytes(&mut self, data: &[u8]) {
+        self.stream.write_all(data).await.unwrap();
     }
 
     /// Pushes everything written so far out onto the wire.

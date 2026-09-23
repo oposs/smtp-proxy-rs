@@ -106,7 +106,7 @@ pub struct Cli {
     #[arg(
         long = "max_connections_per_ip",
         default_value_t = 50,
-        help = "concurrent connections allowed from a single client IP; 0 means unlimited"
+        help = "concurrent connections allowed from a single client IP, counted per IPv6 /64; 0 means unlimited"
     )]
     pub max_connections_per_ip: usize,
     #[arg(

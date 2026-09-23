@@ -101,6 +101,27 @@
 
 ### Fixed
 
+- a client sending a non-ASCII character where `MAIL FROM:` or `RCPT TO:`
+  belongs -- `MAIL FROMÖ`, for instance -- got no reply at all and the
+  connection died, leaving a crash report in the log. Any client could do it
+  before authenticating. The command is now answered
+  `501 invalid MAIL arguments`
+- a header carrying non-UTF-8 bytes, which mail programs still send for
+  Western European text instead of encoding it, reached the recipient with
+  every such byte replaced by a question-mark character. The header block is
+  now relayed exactly as it arrived
+- a header the API added with an empty name, or a name beginning with a space
+  or a tab, disappeared into the value of the header above it instead of being
+  added. Such a header is now refused with
+  `550 authentication service failed` and named in the log
+- `--max_connections_per_ip` never engaged for IPv6 clients: each connection
+  arrived from a different address out of the client's own /64, so the count
+  never rose. IPv6 connections are now counted per /64, IPv4 per address, and
+  a dual-stack listener counts an IPv4 client as IPv4
+- a second stop signal sent while the proxy was starting its drain could be
+  ignored, so the documented way to cut a long drain short did not always
+  work. Both signals are now heard
+
 - the upstream server's own reply code now reaches the client. The Perl answered
   a refusal 550 whatever the upstream said, so an upstream 451 arrived as 550
   and the client deleted a mail it should have queued. Where the upstream never
