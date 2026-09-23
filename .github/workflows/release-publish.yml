@@ -295,7 +295,7 @@ jobs:
       # The Dockerfile does its own musl build: `rust:1-alpine` is already a
       # native musl host, so it needs no cross-compilation and shares nothing
       # with the build above.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
