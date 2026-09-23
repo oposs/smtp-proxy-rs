@@ -65,9 +65,10 @@ impl ConnectionLimits {
             },
             None => None,
         };
+        let key = limit_key(ip);
         if self.per_ip_max != 0 {
             let mut counts = self.per_ip.lock().unwrap();
-            let count = counts.entry(ip).or_insert(0);
+            let count = counts.entry(key).or_insert(0);
             if *count >= self.per_ip_max {
                 // `total` (if any) drops here, releasing the slot it just
                 // reserved -- this connection is refused after all.
@@ -78,9 +79,36 @@ impl ConnectionLimits {
         Ok(ConnectionPermit {
             _total: total,
             per_ip: self.per_ip.clone(),
-            ip,
+            ip: key,
             counted: self.per_ip_max != 0,
         })
+    }
+}
+
+/// The bucket a connection counts against (spec 9.2).
+///
+/// An IPv4 address is its own bucket. An IPv6 address counts against its
+/// **/64**, because that is what a single customer is ordinarily given: keyed
+/// on the full address, a client with a routed prefix has 2^64 of them and
+/// the per-IP limit never engages, leaving `--max_connections` as the only
+/// bound -- the "one client locks out everyone else" state the limit exists
+/// to prevent.
+///
+/// An IPv4-mapped address is unwrapped first. A dual-stack listener on `[::]`
+/// reports every IPv4 client as `::ffff:a.b.c.d`, and those all share one
+/// 64-bit prefix: folded by prefix they would become a single bucket holding
+/// the whole IPv4 internet.
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+        },
     }
 }
 
@@ -282,5 +310,58 @@ mod tests {
         assert_eq!(limits.per_ip.lock().unwrap().get(&ip), Some(&1));
         drop(p2);
         assert!(limits.per_ip.lock().unwrap().is_empty());
+    }
+
+    /// Spec 9.2 exists so that one client cannot lock everyone else out. A
+    /// /64 is the ordinary allocation to a single IPv6 customer, so counting
+    /// per exact address hands that client 2^64 free passes and the limit
+    /// never engages at all.
+    #[test]
+    fn ipv6_addresses_in_one_prefix_share_a_bucket() {
+        let limits = ConnectionLimits::new(0, 2);
+        let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2::2".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+
+        let _p1 = limits.try_acquire(a).unwrap();
+        let _p2 = limits.try_acquire(b).unwrap();
+        assert_eq!(limits.try_acquire(c).err(), Some("per-ip"));
+    }
+
+    /// The prefix is the /64 and stops there: a neighbouring customer keeps
+    /// its own budget.
+    #[test]
+    fn a_neighbouring_ipv6_prefix_has_its_own_bucket() {
+        let limits = ConnectionLimits::new(0, 1);
+        let mine: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let theirs: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+
+        let _p1 = limits.try_acquire(mine).unwrap();
+        assert!(limits.try_acquire(theirs).is_ok());
+    }
+
+    /// A dual-stack listener on `[::]` reports an IPv4 client as
+    /// `::ffff:a.b.c.d`. Every one of those shares the same 64-bit prefix,
+    /// so folding them by prefix would put the whole IPv4 internet into one
+    /// bucket and refuse the second IPv4 client the proxy ever sees.
+    #[test]
+    fn ipv4_mapped_addresses_are_counted_as_ipv4() {
+        let limits = ConnectionLimits::new(0, 1);
+        let a: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        let b: IpAddr = "::ffff:192.0.2.2".parse().unwrap();
+
+        let _p1 = limits.try_acquire(a).unwrap();
+        assert!(limits.try_acquire(b).is_ok());
+    }
+
+    /// IPv4 has no prefix to fold: one address is one client.
+    #[test]
+    fn ipv4_addresses_are_counted_whole() {
+        let limits = ConnectionLimits::new(0, 1);
+        let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let b = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+
+        let _p1 = limits.try_acquire(a).unwrap();
+        assert!(limits.try_acquire(b).is_ok());
     }
 }

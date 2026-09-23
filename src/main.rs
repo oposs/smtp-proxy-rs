@@ -6,6 +6,7 @@ use smtp_proxy::config::parse_args;
 use smtp_proxy::proxy::{ProxyConfig, ProxyFactory};
 use smtp_proxy::relay::{RelayConfig, UpstreamTls};
 use smtp_proxy::server::{Drain, ServerConfig, listener};
+use smtp_proxy::shutdown::Signals;
 use smtp_proxy::smtplog::SmtpLog;
 
 /// How often the idle rate-limit buckets are swept (spec 9.3).
@@ -120,6 +121,12 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         .collect();
     println!("Waiting for connections on {}", listen_text.join(", "));
     println!("Will forward mails to {}:{}", config.tohost, config.toport);
+    // Registered once, before the accept loops start, and waited on by both
+    // `select!`s below. One value rather than one per wait: a signal reaches
+    // the receivers registered when it arrives and is not queued for later
+    // ones, so a receiver built per wait is deaf across the drain handover
+    // -- where the operator's second signal is most likely to land.
+    let mut signals = Signals::new();
     // Pinned rather than spawned, so that a panic in `serve` itself still
     // reaches this thread as a panic instead of becoming a `JoinError` that
     // nobody reads.
@@ -133,7 +140,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         // exit 0 alone, and the unit then reads as cleanly stopped while no
         // mail is being delivered.
         outcome = &mut serve => return listener_outcome(outcome),
-        _ = shutdown_signal() => {}
+        _ = signals.recv() => {}
     }
     // Spec 9.1. Cancelling stops the accept loops -- which closes the
     // listening sockets, so `serve` returns -- and closes every session
@@ -171,7 +178,7 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
             }
         }
         // A second signal from an operator who is not prepared to wait.
-        _ = shutdown_signal() => {}
+        _ = signals.recv() => {}
     }
     // A listener that panicked earlier is still a failure, even though the
     // shutdown itself went to plan.
@@ -185,14 +192,5 @@ fn listener_outcome(outcome: listener::ServeOutcome) -> anyhow::Result<()> {
         listener::ServeOutcome::ListenerFailed => {
             Err(anyhow::anyhow!("An accept loop ended abnormally"))
         }
-    }
-}
-
-async fn shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
     }
 }

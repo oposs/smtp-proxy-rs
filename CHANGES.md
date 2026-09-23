@@ -114,6 +114,13 @@
   or a tab, disappeared into the value of the header above it instead of being
   added. Such a header is now refused with
   `550 authentication service failed` and named in the log
+- `--max_connections_per_ip` never engaged for IPv6 clients: each connection
+  arrived from a different address out of the client's own /64, so the count
+  never rose. IPv6 connections are now counted per /64, IPv4 per address, and
+  a dual-stack listener counts an IPv4 client as IPv4
+- a second stop signal sent while the proxy was starting its drain could be
+  ignored, so the documented way to cut a long drain short did not always
+  work. Both signals are now heard
 
 - the upstream server's own reply code now reaches the client. The Perl answered
   a refusal 550 whatever the upstream said, so an upstream 451 arrived as 550

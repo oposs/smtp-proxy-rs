@@ -169,7 +169,8 @@ Options:
       --max_connections <MAX_CONNECTIONS>
           total concurrent connections allowed; 0 means unlimited [default: 1000]
       --max_connections_per_ip <MAX_CONNECTIONS_PER_IP>
-          concurrent connections allowed from a single client IP; 0 means unlimited [default: 50]
+          concurrent connections allowed from a single client IP, counted per IPv6 /64; 0 means
+          unlimited [default: 50]
       --max_messages_per_minute <MAX_MESSAGES_PER_MINUTE>
           messages a single authenticated username may start per minute; 0 means unlimited [default:
           60]
@@ -324,7 +325,11 @@ this is then relayed to the client.
   client sat in the kernel's backlog with no greeting and no explanation. The
   socket is now answered `421 <service> Too many connections, try again
   later` and closed, before the 220 greeting. `--max_connections_per_ip`
-  (default 50) is new and has no Perl equivalent. `0` means unlimited for
+  (default 50) is new and has no Perl equivalent. An IPv6 client is counted
+  against its **/64**, which is the ordinary allocation to one customer:
+  counted per exact address, such a client has 2^64 of them and the limit
+  would never engage. An IPv4 client, including one a dual-stack listener
+  reports as `::ffff:a.b.c.d`, is counted whole. `0` means unlimited for
   either.
 - **A single authenticated username may start 60 messages per minute.** Over
   that, `MAIL FROM` is answered `450 4.7.1 Rate limit exceeded, try again
