@@ -104,7 +104,7 @@ To build and run a container image instead:
 
 ```console
 ./build-docker.sh
-podman run --rm smtp-proxy:1.0.0
+podman run --rm smtp-proxy:0.1.0
 ```
 
 `build-docker.sh` runs the test suite (`cargo test`), then builds

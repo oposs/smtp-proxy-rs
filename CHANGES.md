@@ -164,8 +164,11 @@ every merge to main red -- `CHANGES.md says 0.8.0 but these disagree:
 Cargo.toml, Cargo.lock` -- until the first release lands. Left as it is,
 `latestRelease` returns nothing and the job says so and stops.
 
-Once `1.0.0` has been released, its heading is the first match and this is moot;
+Once `0.1.0` has been released, its heading is the first match and this is moot;
 converting the tail then is a cosmetic change and safe.
+
+The Rust version numbers start again at `0.1.0` and do not continue the Perl
+series below. A `0.1.0` here is newer than the Perl `0.8.0`.
 
 0.8.0 2026-09-10 14:24:32 +0200 Tobias Oetiker <tobi@oetiker.ch>
 
