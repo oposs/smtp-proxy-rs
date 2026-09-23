@@ -177,8 +177,15 @@ fn parse_path(
     allow_empty: bool,
 ) -> Result<(String, Vec<Param>), PathError> {
     let args = args.ok_or(PathError::Arguments)?;
-    if args.len() < keyword.len() || !args[..keyword.len()].eq_ignore_ascii_case(keyword) {
-        return Err(PathError::Arguments);
+    // Compared as bytes rather than as `args[..keyword.len()]`: `args` is
+    // whatever UTF-8 the client sent, and slicing a `&str` at a byte index
+    // panics when that index falls inside a multi-byte character -- which
+    // `MAIL FROM\u{00d6}` does, before any state or auth check has run.
+    // `keyword` is ASCII, so once it matches, `keyword.len()` is a character
+    // boundary and the slice below cannot panic.
+    match args.as_bytes().get(..keyword.len()) {
+        Some(head) if head.eq_ignore_ascii_case(keyword.as_bytes()) => {}
+        _ => return Err(PathError::Arguments),
     }
     let rest = args[keyword.len()..].trim_start();
     let rest = rest.strip_prefix('<').ok_or(PathError::Arguments)?;
@@ -215,6 +222,23 @@ mod tests {
         Param {
             keyword: k.into(),
             value: v.map(String::from),
+        }
+    }
+
+    /// A multi-byte character straddling the keyword's byte length used to
+    /// panic the session task: `args[..keyword.len()]` cuts a `&str` at a
+    /// byte index, and `parse_command` runs before any state or auth check,
+    /// so any client that can open the port could reach it.
+    #[test]
+    fn multibyte_argument_is_refused_not_panicked() {
+        for line in [
+            "MAIL FROM\u{00d6}",
+            "MAIL FROM\u{00d6}:<sender@foobar.com>",
+            "RCPT T\u{00d6}",
+            "MAIL FROM:<a@b.com> \u{00d6}",
+            "MAIL \u{00d6}",
+        ] {
+            assert!(parse(line).is_err(), "{line}");
         }
     }
 

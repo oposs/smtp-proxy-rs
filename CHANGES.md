@@ -101,6 +101,12 @@
 
 ### Fixed
 
+- a client sending a non-ASCII character where `MAIL FROM:` or `RCPT TO:`
+  belongs -- `MAIL FROMÖ`, for instance -- got no reply at all and the
+  connection died, leaving a crash report in the log. Any client could do it
+  before authenticating. The command is now answered
+  `501 invalid MAIL arguments`
+
 - the upstream server's own reply code now reaches the client. The Perl answered
   a refusal 550 whatever the upstream said, so an upstream 451 arrived as 550
   and the client deleted a mail it should have queued. Where the upstream never
