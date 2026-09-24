@@ -13,7 +13,7 @@ use crate::relay::UpstreamTlsMode;
 #[command(
     name = "smtp-proxy",
     version,
-    about = "SMTP authentication and header injection proxy",
+    about = "SMTP submission proxy that lets a REST API control which sender addresses a user may use",
     disable_help_flag = true,
     disable_version_flag = true
 )]

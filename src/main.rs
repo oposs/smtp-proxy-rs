@@ -38,8 +38,10 @@ fn main() {
 
 async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     let tls = ServerConfig::load_tls(&config.tls_cert, &config.tls_key)?;
-    // Before the listeners: a bad CA file or an unusable trust store has to
-    // be a startup error, not a surprise on the first message.
+    // Before the listeners: a bad CA file has to be a startup error, not a
+    // surprise on the first message. The system trust store is loaded best
+    // effort (`UpstreamTls::build` skips what fails to load), so an unusable
+    // one shows up only when an upstream certificate does not verify.
     let upstream_tls = UpstreamTls::build(
         config.upstream_tls,
         config.upstream_tls_ca.as_deref(),

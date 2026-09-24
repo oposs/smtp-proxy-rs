@@ -67,6 +67,9 @@
 
 ### Changed
 
+- The first line of `smtp-proxy --help` now reads `SMTP submission proxy that
+  lets a REST API control which sender addresses a user may use`, the same
+  sentence the manual page opens with
 - complete rewrite in Rust, replacing smtpproxy.pl 0.8.0. Every flag the Perl
   had is spelled the same way, and the API JSON and the log formats are
   unchanged. Some SMTP replies are NOT: the items below are the set an operator
