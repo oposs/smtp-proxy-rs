@@ -48,6 +48,9 @@ Every flag the Perl had is still spelled the same way. New flags: `--version`, `
 - `SIZE` is advertised with the upstream's limit, and a client's `SIZE=` on `MAIL FROM` is forwarded when the upstream announced `SIZE`. The Perl did neither.
 - A refusal from the upstream keeps the upstream's reply code; the Perl turned every one into `550`. An upstream that never answered gives `451`; a malformed address the proxy refuses itself stays `550`.
 - An API call that fails or gives no verdict is answered `451 authentication service failed`, not `550`.
+- The API call follows up to ten redirects; after a `301`, `302` or `303` it repeats as a GET without a body.
+- The API call honours `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`, `ALL_PROXY`/`all_proxy` and `NO_PROXY`/`no_proxy`.
+- `reason`, `from` and `authId` in the API answer must be JSON strings; any other type makes the answer invalid and the client gets `451 authentication service failed`.
 - During DATA an upstream reply reaches the client verbatim, and an upstream that drops closes the client connection. A failure before the body is still answered with a reply code.
 - A message the API refuses leaves the upstream one connection that was greeted and dropped, with no envelope and no message: the connect runs alongside the API call.
 - Header names from the API are matched without regard to case.
