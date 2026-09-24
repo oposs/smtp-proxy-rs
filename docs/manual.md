@@ -65,6 +65,8 @@ own.
 
 The EHLO reply offers `DSN` when the upstream announces DSN, and `SIZE` with
 the upstream's limit when the upstream states one.
+The proxy sets no limit of its own on the size of a message; only the header
+block is bounded, by **--max_header_size**.
 The proxy asks the upstream at startup and notes the answer again with every
 relayed message.
 The DSN parameters `RET` and `ENVID` on MAIL FROM and `NOTIFY` and `ORCPT` on
@@ -438,7 +440,7 @@ At `debug` the log also shows the progress of each session.
 A message the API refuses adds the request as JSON after `INPUT`, with the
 password replaced by `*******`.
 A message the upstream refuses adds the same request after `Mail` and the
-API's answer after `ApiResult`.
+API's answer, also as JSON, after `ApiResult`.
 A failed API call adds the request JSON on a line of its own.
 
 ## SMTP log

@@ -610,7 +610,7 @@ async fn an_upstream_rejection_mid_body_reaches_the_client_verbatim() {
 /// `read_message` hands the verdict to `mirror`, whose only output is a
 /// `debug!`. So the three-line report had to be added to `ProxySink::write`
 /// as well. Without it an operator grepping `Mail refused by relay server` --
-/// the line the README teaches and `conformance/t/connection-lifecycle.t`
+/// the line the manual (LOGS) lists and `conformance/t/connection-lifecycle.t`
 /// greps for -- misses exactly the newest failure mode on this branch, and at
 /// the default log level sees nothing about it at all.
 ///

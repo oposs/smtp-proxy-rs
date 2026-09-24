@@ -227,7 +227,7 @@ mod tests {
         assert!(!json.contains("secret"));
     }
 
-    /// The relay-failure dump is JSON, as README promises of every debug
+    /// The relay-failure dump is JSON, as the manual (LOGS) promises of every debug
     /// dump, and it carries the API's own field names.
     #[test]
     fn response_json_is_the_dump_format() {
