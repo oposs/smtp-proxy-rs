@@ -65,10 +65,10 @@ own.
 
 The EHLO reply offers `DSN` when the upstream announces DSN, and `SIZE` with
 the upstream's limit when the upstream states one.
-The proxy sets no limit of its own on the size of a message; only the header
-block is bounded, by **--max_header_size**.
 The proxy asks the upstream at startup and notes the answer again with every
 relayed message.
+The proxy sets no limit of its own on the size of a message; only the header
+block is bounded, by **--max_header_size**.
 The DSN parameters `RET` and `ENVID` on MAIL FROM and `NOTIFY` and `ORCPT` on
 RCPT TO are checked against RFC 3461, and a malformed one is answered `501`.
 They are relayed when the upstream announces DSN and dropped with a warning in
@@ -533,7 +533,7 @@ Other signals have their default effect.
 
 # SEE ALSO
 
-The project: <https://github.com/oposs/smtp-proxy-rs>
+The project: <https://github.com/oposs/smtp-proxy-rs>.
 
 The Perl program this one replaces: <https://github.com/oposs/smtp-proxy>.
 Its differences are listed in

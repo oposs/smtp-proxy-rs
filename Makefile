@@ -69,5 +69,5 @@ docker:
 conformance: build
 	$(MAKE) -C conformance
 
-# Last, so that its `man` target does not become the default goal.
+# build/man.mk keeps the default goal, so the include may go anywhere.
 include build/man.mk

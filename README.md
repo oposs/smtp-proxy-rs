@@ -57,7 +57,7 @@ Every flag the Perl had is still spelled the same way. New flags: `--version`, `
 - A command line that reaches 64 KiB without ending is answered `500 Line too long` and the connection is closed; the Perl's buffer grew without limit.
 - An idle connection is closed after ten minutes in every phase; the Perl timed nothing before STARTTLS.
 - A connection that has sent no complete command is closed after 30 seconds (`--greeting_timeout`; `0` gives that wait the ten minutes as well). The Perl timed neither wait, so a silent connection lived for ever.
-- Concurrent connections are capped at 1000 (`--max_connections`) and 50 per client (`--max_connections_per_ip`, IPv6 counted by /64). The excess is answered `421 <service> Too many connections, try again later` before the greeting, where Mojo left it in the backlog unanswered.
+- Concurrent connections are capped at 1000 (`--max_connections`) and 50 per client (`--max_connections_per_ip`, IPv6 counted by /64). The excess is answered `421 smtp-proxy Too many connections, try again later` before the greeting, where Mojo left it in the backlog unanswered.
 - One username may start 60 messages per minute (`--max_messages_per_minute`); over that, `MAIL FROM` is answered `450 4.7.1 Rate limit exceeded, try again later`. The Perl had no rate limit.
 - A message may name 1000 recipients (`--max_recipients`); the next `RCPT TO` is answered `452 4.5.3 Too many recipients`. The Perl counted none.
 - An AUTH username over 256 bytes is refused with `535 Authentication credentials invalid`; the Perl had no bound.
@@ -87,7 +87,7 @@ cargo build --release   # target/release/smtp-proxy
 make test               # also: make build, make lint
 make conformance        # the Perl proxy's tests against this binary; needs ../smtp-proxy
 make man                # man/smtp-proxy.1, needs pandoc
-make deb                # static musl binary and .deb under target/x86_64-unknown-linux-musl/
+make deb                # static musl binary and .deb under target/x86_64-unknown-linux-musl/ by default
 make docker             # cargo test, then podman build of smtp-proxy:<version>
 ```
 

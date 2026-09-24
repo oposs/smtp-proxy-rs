@@ -70,8 +70,8 @@
 - complete rewrite in Rust, replacing smtpproxy.pl 0.8.0. Every flag the Perl
   had is spelled the same way, and the API JSON and the log formats are
   unchanged. Some SMTP replies are NOT: the items below are the set an operator
-  has to plan for, and README.md "Differences from the Perl version" carries all
-  of them with the reasoning
+  has to plan for, and README.md "Differences from the Perl version" carries
+  all of them; docs/maintainer-notes.md gives the reasons
 - TLS 1.0 and 1.1 are no longer offered (rustls)
 - a command line that reaches 64 KiB without ending is answered
   `500 Line too long` and the connection is closed; the Perl grew its command

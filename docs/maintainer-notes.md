@@ -372,4 +372,5 @@ to be readable raw, and a terminal renderer would be a dependency for one
 flag. A reader that closes the pipe early (`smtp-proxy --man | head`) is not
 an error.
 
-Where: `src/config.rs`, `fn manual`.
+Where: `src/config.rs`, `fn manual`; the closed-pipe handling is `fn
+print_manual`.

@@ -67,8 +67,8 @@ A submission proxy that lets a REST API control which sender addresses an
 authenticated user may use, and that may also replace the envelope sender.
 The API is called once the envelope and the message headers are in, so it can
 also judge the recipient addresses and the credentials, and it may return
-headers to insert. Accepted mail is relayed to a configured upstream SMTP
-server.
+headers to add or remove. Accepted mail is relayed to a configured upstream
+SMTP server.
 Configure it in /etc/default/smtp-proxy. See smtp-proxy(1).
 """
 # The `target/release/` prefix is deliberate and is not a mistake against the
