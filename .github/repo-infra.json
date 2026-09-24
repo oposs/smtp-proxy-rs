@@ -1,19 +1,28 @@
 {
   "_comment": [
     "smtp-proxy-rs uses the GENERATED repo-infra standard: ci.yml, changelog.yml,",
-    "release-pr.yml, release-publish.yml, dependabot.yml and",
-    ".github/workflows/lib/ all come out of the assembler. Do not hand-edit them;",
-    "take the newer set instead, or the next `apply` reverts you silently.",
-    "The ONE deliberate exception is the publish-deb-container add-on job in",
-    "release-publish.yml, and the `needs:` line on `finalize` that waits for it.",
-    "Both are commented at the top of that file. Read them before running `apply`.",
-    "The static musl build is NOT a local edit: it is the opt-in ci-rust-musl",
-    "block named below, so it joins the required ci-passed check."
+    "release-pr.yml, release-publish.yml, dependabot.yml, .github/workflows/lib/",
+    "and build/man.mk plus build/man-deflist.lua all come out of the assembler.",
+    "Do not hand-edit them; take the newer set instead, or the next `apply`",
+    "reverts you silently.",
+    "The ONE deliberate exception is the publish-deb-container job in",
+    "release-publish.yml. It is declared under publish_local below, so the",
+    "assembler generates finalize's `needs:` and asset check for it; the job",
+    "body itself is hand-owned and must survive every merge `apply` asks for.",
+    "The static musl build and the man page check are NOT local edits: they are",
+    "the opt-in ci-rust-musl and ci-man blocks named below, so they join the",
+    "required ci-passed check."
   ],
   "ecosystems": ["rust"],
   "moving_major_tag": false,
-  "ci": ["ci-rust-musl"],
+  "ci": ["ci-rust-musl", "ci-man"],
   "publish": [],
+  "publish_local": [
+    {
+      "job": "publish-deb-container",
+      "assets": ["*.deb", "smtp-proxy-*-x86_64-unknown-linux-musl"]
+    }
+  ],
   "build": [],
   "version_files": [
     {
