@@ -18,7 +18,7 @@ has result => sub { { allow => 1, headers => [] } };
 has calledWith => sub { [] };
 has 'url';
 
-# `allow` is a JSON boolean on the wire (README, "the API answers"), and the
+# `allow` is a JSON boolean on the wire (manual, API), and the
 # Rust proxy decodes it as one. FakeAPI never went through JSON at all, so its
 # tests spell the field as the Perl truth values 1 and 0; they are translated
 # here rather than in every test.

@@ -4,6 +4,10 @@
 
 ### New
 
+- The Debian package installs a manual page, `man smtp-proxy`, and
+  `smtp-proxy --man` prints the same manual instead of the option list. A
+  command-line error now ends in `For more information, try '--help'.` where
+  it named `--man`
 - `--max_header_size`, default 1 MiB; a header block larger than that is
   answered `552 Header block exceeds maximum size of <n> bytes`. It replaces
   the `--max_message_size` this section used to announce: the body is streamed
@@ -63,11 +67,14 @@
 
 ### Changed
 
+- The first line of `smtp-proxy --help` now reads `SMTP submission proxy that
+  lets a REST API control which sender addresses a user may use`, the same
+  sentence the manual page opens with
 - complete rewrite in Rust, replacing smtpproxy.pl 0.8.0. Every flag the Perl
   had is spelled the same way, and the API JSON and the log formats are
   unchanged. Some SMTP replies are NOT: the items below are the set an operator
-  has to plan for, and README.md "Differences from the Perl version" carries all
-  of them with the reasoning
+  has to plan for, and README.md "Differences from the Perl version" carries
+  all of them; docs/maintainer-notes.md gives the reasons
 - TLS 1.0 and 1.1 are no longer offered (rustls)
 - a command line that reaches 64 KiB without ending is answered
   `500 Line too long` and the connection is closed; the Perl grew its command
@@ -150,6 +157,10 @@
   of being swallowed. It used to exit 0, which `Restart=on-failure` leaves
   alone, or -- with several `--listen` addresses -- leave the process up and
   healthy-looking with one port silently closed
+- when the API answered with an empty `authId`, the log line read
+  `Relayed mail successfully for <client> using token` with nothing after it;
+  it now reads `using no token`, as the Perl version did. An `authId` of `0`
+  is treated the same way
 
 ## Earlier releases
 

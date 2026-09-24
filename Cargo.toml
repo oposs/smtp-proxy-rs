@@ -3,7 +3,7 @@ name = "smtp-proxy"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "SMTP authentication and header injection proxy"
+description = "SMTP submission proxy that lets a REST API control which sender addresses a user may use"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/oposs/smtp-proxy-rs"
 
@@ -63,12 +63,13 @@ section = "mail"
 # Description field -- fenced JSON blocks, the full differences list and all,
 # which made the control file 229 lines long.
 extended-description = """
-A submission proxy that asks a REST API whether a mail may be sent. The API is
-called once the envelope and the message headers are in, so it can judge the
-sender and recipient addresses as well as the credentials, and it may return
-headers to insert. Accepted mail is relayed to a configured upstream SMTP
-server.
-Configure it in /etc/default/smtp-proxy; see /usr/share/doc/smtp-proxy/README.md.
+A submission proxy that lets a REST API control which sender addresses an
+authenticated user may use, and that may also replace the envelope sender.
+The API is called once the envelope and the message headers are in, so it can
+also judge the recipient addresses and the credentials, and it may return
+headers to add or remove. Accepted mail is relayed to a configured upstream
+SMTP server.
+Configure it in /etc/default/smtp-proxy. See smtp-proxy(1).
 """
 # The `target/release/` prefix is deliberate and is not a mistake against the
 # musl build: cargo-deb rewrites it to `target/<triple>/release/` when
@@ -76,6 +77,9 @@ Configure it in /etc/default/smtp-proxy; see /usr/share/doc/smtp-proxy/README.md
 assets = [
     ["target/release/smtp-proxy", "usr/bin/", "755"],
     ["packaging/smtp-proxy.default", "etc/default/smtp-proxy", "644"],
+    # Built by `make man`, which `make deb` runs first. cargo-deb gzips
+    # everything under usr/share/man/, so the package holds smtp-proxy.1.gz.
+    ["man/smtp-proxy.1", "usr/share/man/man1/", "644"],
     ["README.md", "usr/share/doc/smtp-proxy/", "644"],
     ["CHANGES.md", "usr/share/doc/smtp-proxy/", "644"],
 ]

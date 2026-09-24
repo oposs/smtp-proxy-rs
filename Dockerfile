@@ -9,6 +9,9 @@ RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# `--man` prints docs/manual.md, compiled in with include_str!, so the build
+# needs it; .dockerignore excludes the rest of docs/.
+COPY docs/manual.md ./docs/manual.md
 RUN cargo build --release --locked -j 4 && \
     strip target/release/smtp-proxy
 

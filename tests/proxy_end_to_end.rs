@@ -232,6 +232,69 @@ async fn an_empty_api_sender_keeps_the_client_sender() {
     assert_eq!(r.upstream.commands()[1], "MAIL FROM:<sender@foobar.com>");
 }
 
+/// The Perl's own log line is a second truthiness test, on `authId` rather
+/// than `from`: `$apiResult->{authId} ? " using token $id" : " using no
+/// token"` (`SMTPProxy.pm:310`). An API that answers with an empty string
+/// is untruthy in Perl, so the line ends `using no token` there; naively
+/// matching only `Option::None` here would instead log `using token` with
+/// nothing after it.
+#[tokio::test]
+async fn an_empty_auth_id_logs_using_no_token() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [], "authId": "" }));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let client = c.local_addr();
+    c.login("user", "pass").await;
+    assert!(
+        send_mail(
+            &mut c,
+            "sender@foobar.com",
+            &["receiver@foobaz.com"],
+            MESSAGE
+        )
+        .await
+        .starts_with("250")
+    );
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    assert!(
+        text.lines().any(|l| l.contains(&format!(
+            "Relayed mail successfully for {client} using no token"
+        ))),
+        "{text}"
+    );
+}
+
+/// Perl truthiness again, its sharper edge: the string `"0"` is also false
+/// in Perl (`perl -e 'print "0" ? "t" : "f"'` prints `f`), so an `authId` of
+/// `"0"` logs `using no token` in the Perl too, not `using token 0`.
+#[tokio::test]
+async fn an_auth_id_of_zero_logs_using_no_token() {
+    let r = rig(&["DSN"]).await;
+    r.api
+        .respond(serde_json::json!({ "allow": true, "headers": [], "authId": "0" }));
+    let (mut c, _) = RawClient::connect(r.addr).await;
+    let client = c.local_addr();
+    c.login("user", "pass").await;
+    assert!(
+        send_mail(
+            &mut c,
+            "sender@foobar.com",
+            &["receiver@foobaz.com"],
+            MESSAGE
+        )
+        .await
+        .starts_with("250")
+    );
+    let text = String::from_utf8(captured_log().lock().unwrap().clone()).unwrap();
+    assert!(
+        text.lines().any(|l| l.contains(&format!(
+            "Relayed mail successfully for {client} using no token"
+        ))),
+        "{text}"
+    );
+}
+
 /// M2, end to end: a header the Perl could not parse reaches neither the
 /// API nor the upstream.
 #[tokio::test]
@@ -610,7 +673,7 @@ async fn an_upstream_rejection_mid_body_reaches_the_client_verbatim() {
 /// `read_message` hands the verdict to `mirror`, whose only output is a
 /// `debug!`. So the three-line report had to be added to `ProxySink::write`
 /// as well. Without it an operator grepping `Mail refused by relay server` --
-/// the line the README teaches and `conformance/t/connection-lifecycle.t`
+/// the line the manual (LOGS) lists and `conformance/t/connection-lifecycle.t`
 /// greps for -- misses exactly the newest failure mode on this branch, and at
 /// the default log level sees nothing about it at all.
 ///

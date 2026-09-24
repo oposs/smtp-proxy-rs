@@ -544,7 +544,7 @@ fn report_refusal(
     debug!("Mail {}", request.redacted_json());
     // The Perl dumps the API result next to the mail: it is what says whether
     // the refused message carried injected headers or a substituted sender.
-    // JSON like the line above it, because README promises that every debug
+    // JSON like the line above it, because the manual (LOGS) promises that every debug
     // dump on this branch is JSON.
     debug!("ApiResult {}", outcome.json());
     // After the Perl's three lines, not inside them: the sentence above is
@@ -606,11 +606,14 @@ impl BodySink for ProxySink {
         match upstream.finish().await {
             Ok(message) => {
                 debug!("Upstream server says: {message}");
-                match &outcome.auth_id {
-                    Some(id) => {
+                // Perl truthiness (`SMTPProxy.pm:310`): `$apiResult->{authId}
+                // ? ... : "using no token"` treats both an empty string and
+                // the string `"0"` as false, unlike `Option::is_some`.
+                match outcome.auth_id.as_deref() {
+                    Some(id) if !id.is_empty() && id != "0" => {
                         info!("Relayed mail successfully for {client} using token {id}")
                     }
-                    None => info!("Relayed mail successfully for {client} using no token"),
+                    _ => info!("Relayed mail successfully for {client} using no token"),
                 }
                 Ok(message)
             }
