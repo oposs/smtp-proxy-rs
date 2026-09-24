@@ -220,7 +220,7 @@ fn run(args: &[String]) -> (Option<i32>, String, String) {
 ///
 /// The expected count is per case because clap is not uniform about it: an
 /// unknown argument renders a `Usage:` block, while a bad *value* for a
-/// known flag renders only the complaint and the `--man` hint. Both are
+/// known flag renders only the complaint and the `--help` hint. Both are
 /// clap's own output and neither is the defect this test pins shut.
 #[test]
 fn usage_errors_exit_1_with_at_most_one_usage_block() {
@@ -324,19 +324,102 @@ fn help_says_max_header_size_has_no_unlimited() {
     );
 }
 
-/// `--man` is a help action, so it succeeds and prints the long about to
-/// stdout. Grouped here because it is the one flag of this family that
-/// must *not* look like a usage error.
+/// What `--man` must print: `docs/manual.md` without its YAML front matter.
+/// Derived here rather than by calling `config::manual`, so a stripping
+/// defect in the binary cannot pass by being shared with its test.
+fn manual_body() -> &'static str {
+    let source = include_str!("../docs/manual.md");
+    let rest = source
+        .strip_prefix("---\n")
+        .expect("docs/manual.md opens with front matter");
+    let close = rest.find("\n---\n").expect("the front matter is closed");
+    rest[close + "\n---\n".len()..].trim_start_matches('\n')
+}
+
+/// `--man` prints the manual, byte for byte, and nothing else.
 #[test]
-fn man_exits_0_with_the_long_description() {
+fn man_prints_the_manual() {
     let (code, stdout, stderr) = run(&["--man".to_string()]);
     assert_eq!(code, Some(0), "stderr:\n{stderr}");
     assert_eq!(stderr, "", "nothing belongs on stderr");
+    let want = manual_body();
     assert!(
-        stdout.contains("Starts an SMTP server on the listen host and port."),
-        "{stdout}"
+        want.starts_with("# NAME\n"),
+        "the test's own stripping is off"
     );
-    assert!(stdout.contains("--max_header_size"), "{stdout}");
+    if stdout != want {
+        let at = stdout
+            .bytes()
+            .zip(want.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(stdout.len().min(want.len()));
+        let lo = at.saturating_sub(80);
+        let hi = (at + 80).min(stdout.len());
+        panic!(
+            "--man printed {} bytes, the manual body is {}; first difference at byte {at}:\n{}",
+            stdout.len(),
+            want.len(),
+            String::from_utf8_lossy(&stdout.as_bytes()[lo..hi])
+        );
+    }
+}
+
+/// `--man` answers before any other check: a command line that would be
+/// refused still gets the manual, as `--help` does.
+#[test]
+fn man_is_printed_whatever_else_the_command_line_holds() {
+    let args = ["--max_header_size", "0", "--man"].map(String::from);
+    let (code, stdout, stderr) = run(&args);
+    assert_eq!(code, Some(0), "stderr:\n{stderr}");
+    assert_eq!(stderr, "", "nothing belongs on stderr");
+    assert!(stdout.starts_with("# NAME\n"), "{stdout}");
+}
+
+/// `smtp-proxy --man | head` at its most abrupt: the only read end is closed
+/// before the child writes, so the write fails with EPIPE. That is the
+/// reader's choice and not an error: exit 0, and no panic on stderr.
+#[test]
+fn man_into_a_closed_pipe_exits_0() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Proxy::spawn(
+        std::process::Command::new(assert_cmd::cargo::cargo_bin("smtp-proxy"))
+            .arg("--man")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    );
+    drop(child.stdout.take());
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            start.elapsed() < DEADLINE,
+            "--man did not exit within {DEADLINE:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "stderr:\n{stderr}");
+    assert_eq!(stderr, "", "a closed pipe is not worth a message");
+}
+
+/// With `--man` a plain switch, clap's hint names the help flag.
+#[test]
+fn a_clap_error_points_to_help() {
+    let (code, _stdout, stderr) = run(&["--bogus".to_string()]);
+    assert_eq!(code, Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("For more information, try '--help'."),
+        "{stderr}"
+    );
 }
 
 #[test]

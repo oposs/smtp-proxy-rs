@@ -6,15 +6,6 @@ use clap::{CommandFactory, Parser};
 
 use crate::relay::UpstreamTlsMode;
 
-const LONG_ABOUT: &str = "Starts an SMTP server on the listen host and port. When a connection is \
-established, communicates with the client up to the point it has both the envelope and the mail \
-data headers. It requires STARTTLS to be used, and takes authentication details using the PLAIN \
-mechanism. It then passes the authentication details, envelope headers, and data headers to a \
-REST API, which determines if the mail is allowed to be sent and, if so, what additional headers \
-should be inserted. Once the mail has been fully received, and if it is allowed to be sent, then \
-an upstream connection to the target SMTP server is established. The mail is sent using that SMTP \
-server, with the extra headers inserted. The outcome of this is then relayed to the client.";
-
 /// The flags of spec section 7, spelled as the Perl proxy spells them. The
 /// mandatory ones are `Option` so that `--help` works without them;
 /// [`parse_args`] enforces their presence.
@@ -23,13 +14,12 @@ server, with the extra headers inserted. The outcome of this is then relayed to 
     name = "smtp-proxy",
     version,
     about = "SMTP authentication and header injection proxy",
-    long_about = LONG_ABOUT,
     disable_help_flag = true,
     disable_version_flag = true
 )]
 pub struct Cli {
-    #[arg(long, action = clap::ArgAction::Help, help = "show the full manual and exit")]
-    pub man: (),
+    #[arg(long, help = "show the full manual and exit")]
+    pub man: bool,
     #[arg(short = 'h', long, action = clap::ArgAction::HelpShort, help = "show usage and exit")]
     pub help: (),
     #[arg(long, action = clap::ArgAction::Version, help = "print the version and exit")]
@@ -182,6 +172,39 @@ pub fn parse_listen(s: &str) -> anyhow::Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
+/// `docs/manual.md`, compiled in: the static binary and the container image
+/// have no man page installed, and `--man` has to work there too.
+const MANUAL_SOURCE: &str = include_str!("../docs/manual.md");
+
+/// The manual as `--man` prints it: the Markdown source without its YAML
+/// front matter, which is pandoc's metadata and not text for a reader.
+pub fn manual() -> &'static str {
+    MANUAL_SOURCE
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n"))
+        .map_or(MANUAL_SOURCE, |(_, body)| body)
+        .trim_start_matches('\n')
+}
+
+/// `--man`. A reader that closes the pipe early (`smtp-proxy --man | head`)
+/// is not an error; `print!` would panic on that EPIPE and exit 101. Any
+/// other write failure is reported and exits 1.
+fn print_manual() -> ! {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out
+        .write_all(manual().as_bytes())
+        .and_then(|()| out.flush())
+    {
+        Ok(()) => std::process::exit(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Could not print the manual: {e}");
+            std::process::exit(1)
+        }
+    }
+}
+
 /// What an operator is told when they ask for a header cap of zero bytes.
 const MAX_HEADER_SIZE_ZERO: &str = "--max_header_size must be at least 1: unlike the other \
 limits, 0 does not mean unlimited here, because the header block is held in memory";
@@ -228,8 +251,11 @@ pub fn parse_args() -> Config {
             eprint!("{e}");
             std::process::exit(1)
         }
-        Err(e) => e.exit(), // --help, --man, --version
+        Err(e) => e.exit(), // --help, --version
     };
+    if cli.man {
+        print_manual()
+    }
     if let Err(complaint) = check_limits(&cli) {
         usage_exit(&complaint)
     }
@@ -300,6 +326,25 @@ mod tests {
         );
         assert!(parse_listen("nonsense").is_err());
         assert!(parse_listen("127.0.0.1:notaport").is_err());
+    }
+
+    #[test]
+    fn manual_is_printed_without_front_matter() {
+        let text = manual();
+        assert!(
+            text.starts_with("# NAME\n"),
+            "{}",
+            &text[..text.len().min(200)]
+        );
+        assert!(!text.contains("\ntitle: SMTP-PROXY\n"));
+    }
+
+    #[test]
+    fn man_is_a_plain_switch() {
+        let cli = Cli::try_parse_from(["smtp-proxy", "--man"]).unwrap();
+        assert!(cli.man);
+        let cli = Cli::try_parse_from(["smtp-proxy"]).unwrap();
+        assert!(!cli.man);
     }
 
     /// Every other `--max_*` flag reads 0 as "unlimited". An operator who
