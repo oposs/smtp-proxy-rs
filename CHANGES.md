@@ -4,6 +4,12 @@
 
 ### New
 
+### Changed
+
+### Fixed
+
+## 0.1.0 - 2026-09-24
+### New
 - The Debian package installs a manual page, `man smtp-proxy`, and
   `smtp-proxy --man` prints the same manual instead of the option list. A
   command-line error now ends in `For more information, try '--help'.` where
@@ -66,7 +72,6 @@
   for what it does and does not measure
 
 ### Changed
-
 - The first line of `smtp-proxy --help` now reads `SMTP submission proxy that
   lets a REST API control which sender addresses a user may use`, the same
   sentence the manual page opens with
@@ -107,7 +112,6 @@
   upstream that *answers* mid-body is still relayed verbatim
 
 ### Fixed
-
 - a client sending a non-ASCII character where `MAIL FROM:` or `RCPT TO:`
   belongs -- `MAIL FROMÖ`, for instance -- got no reply at all and the
   connection died, leaving a crash report in the log. Any client could do it
