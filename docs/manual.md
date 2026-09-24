@@ -56,8 +56,9 @@ A session runs in this order:
    body as it arrives from the client.
 8. The upstream's answer reaches the client.
    An accepted message is answered `250 OK:` followed by the upstream's reply
-   text; a refusal keeps the upstream's code and text.
-   The upstream connection is closed with QUIT.
+   text, and the upstream connection is closed with QUIT.
+   A refusal keeps the upstream's code and text, and the upstream connection
+   is closed without QUIT.
 
 A session may send further messages, and each is checked and relayed on its
 own.
@@ -131,8 +132,8 @@ the program with exit status 1 and a usage message on standard error.
 - `--loglevel <level>`: `debug`, `info`, `warn`, `error` or `fatal`. `fatal`
   writes nothing. Default: debug.
 
-- `--smtplog <file>`: Also write every SMTP line sent and received to *file*;
-  see **LOGS**.
+- `--smtplog <file>`: Also write the SMTP commands received and the replies
+  sent to *file*; see **LOGS**.
 
 - `--credentials`: Write AUTH arguments to the **--smtplog** file in clear.
 
@@ -267,8 +268,8 @@ or
 - `allow`: `true` relays the message, `false` refuses it with `550`.
   The field is required.
 
-- `reason`: With `allow` false, the text of the `550` reply and of the log
-  line.
+- `reason`: A string.
+  With `allow` false, the text of the `550` reply and of the log line.
 
 - `headers`: With `allow` true, headers for the relayed message, each an
   object with `name` and `value`.
@@ -278,21 +279,30 @@ or
   block, in the order given.
   An entry whose `value` is `null` removes the header and adds nothing.
 
-- `from`: With `allow` true, the envelope sender relayed to the upstream in
-  place of the MAIL FROM address.
+- `from`: A string.
+  With `allow` true, the envelope sender relayed to the upstream in place of
+  the MAIL FROM address.
   When it is absent, `null` or empty, the MAIL FROM address is relayed.
   The `From:` header is not changed by this field.
 
-- `authId`: A name for the credentials that were used, written to the log
+- `authId`: A string naming the credentials that were used, written to the log
   line of a relayed message; see **LOGS**.
 
+A `reason`, `from` or `authId` of another JSON type makes the whole answer
+invalid.
 Other fields are ignored.
 
 ## Failures
 
-A call that fails to connect, gets no answer within 60 seconds, gets a status
-outside 2xx, or gets a body that is not the JSON object above is answered
-`451 authentication service failed` and logged as `Failed to call API`.
+The call follows up to ten redirects.
+After a `301`, `302` or `303` the request is repeated as a GET without a body;
+after a `307` or `308` it is posted again.
+The answer to the last request counts, and an eleventh redirect is a failure.
+
+A call that fails to connect, gets no answer within 60 seconds, gets a final
+status outside 2xx, or gets a body that is not the JSON object above is
+answered `451 authentication service failed` and logged as
+`Failed to call API`.
 A header that cannot be relayed, one with a line break that is not a fold or
 with an unusable name, is answered `550 authentication service failed`.
 See **SMTP REPLIES**.
@@ -326,7 +336,7 @@ text, and is not listed.
   The reply follows the end of the message.
 
 - `550 <reason>`: The API refused the message; *reason* is the API's `reason`.
-  Without one, the reply is `550` alone.
+  Without one, the reply is `550` followed by a space.
 
 - `451 authentication service failed`: The API gave no verdict; see
   **API**.
@@ -395,8 +405,8 @@ The lines of interest at `info` and above:
 - `Mail rejected by API (<reason>) for <client>`: The API refused the message.
 
 - `Mail refused by relay server (<error>) for <client>`: The upstream refused
-  the message or could not be used; *error* is the upstream's reply text or
-  the cause.
+  the message or could not be used, or an envelope address could not be
+  relayed; *error* is the upstream's reply text or the cause.
 
 - `Failed to call API (<error>) for <client>`: The API gave no verdict, at
   `warn`; *error* is the connection error, the HTTP status text such as
@@ -454,11 +464,14 @@ the lines exchanged with the upstream are not written.
   `421 smtp-proxy Service not available, closing transmission channel` and
   closed.
   A session inside DATA, or waiting for the API or the upstream, finishes its
-  message and replies, and is closed at its next command.
+  message, replies, and is then answered the same `421` and closed.
   After **--drain_timeout** seconds the connections still open are closed
   without a reply, and the program exits.
   A second SIGTERM or SIGINT exits at once.
 
+Before the two lines on standard output, SIGTERM and SIGINT end the program
+at once.
+SIGPIPE is ignored.
 Other signals have their default effect.
 
 # EXIT STATUS
@@ -467,11 +480,15 @@ Other signals have their default effect.
 
 - `1`: A command line that cannot be used, a startup failure, or an accept
   loop that ended abnormally.
-  Startup failures are an unreadable certificate or key, a listen address
-  that cannot be bound, a **--user** that cannot be taken, a log file that
+  Startup failures are a certificate or key that cannot be read, is not
+  valid PEM or does not match the other, a listen address that cannot be
+  bound, a **--user** that cannot be taken, a log file that
   cannot be opened, an unreadable **--upstream_tls_ca** file or a bad
   certificate in it, and an unknown **--loglevel**.
   The message goes to standard error.
+
+- `101`: The program panicked, for example because the async runtime or a
+  signal handler could not be set up.
 
 # ENVIRONMENT
 
@@ -494,8 +511,7 @@ Other signals have their default effect.
 
 - `TZ`: The time zone of the timestamps in both logs.
 
-`SMTP_PROXY_OPTS` is read by the systemd unit and not by the program; see
-**FILES**.
+`SMTP_PROXY_OPTS` belongs to the systemd unit; see **FILES**.
 
 # FILES
 
