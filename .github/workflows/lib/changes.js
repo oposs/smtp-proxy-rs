@@ -1,4 +1,4 @@
-// repo-infra: workflow-lib v2
+// repo-infra: workflow-lib v3
 'use strict';
 
 // The bracketed form, per Keep a Changelog. mdmost used a bare '## Unreleased';

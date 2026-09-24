@@ -1,4 +1,4 @@
-// repo-infra: workflow-lib v2
+// repo-infra: workflow-lib v3
 'use strict';
 
 const test = require('node:test');
@@ -33,6 +33,28 @@ function fakeGithub() {
       },
     },
   };
+}
+
+/// The API's answer when the branch is still there: a closed-but-undeleted
+/// release PR, or a run that committed and then failed before opening one.
+function refExistsError() {
+  const e = new Error('Reference already exists');
+  e.status = 422;
+  return e;
+}
+
+function githubWithExistingRef() {
+  const github = fakeGithub();
+  github.rest.git.createRef = async (params) => {
+    github.seen.refs.push(params);
+    throw refExistsError();
+  };
+  github.seen.updates = [];
+  github.rest.git.updateRef = async (params) => {
+    github.seen.updates.push(params);
+    return { data: { ref: params.ref } };
+  };
+  return github;
 }
 
 const ARGS = {
@@ -98,4 +120,26 @@ test('an empty file list is refused', async () => {
     () => commit.commitFiles(github, { ...ARGS, files: [] }),
     /nothing to commit/,
   );
+});
+
+test('a branch left over from an earlier run is moved, not fatal', async () => {
+  // Re-running the release workflow used to die here with an opaque 422.
+  // The operator's only way out was deleting the branch by hand.
+  const github = githubWithExistingRef();
+  const sha = await commit.commitFiles(github, ARGS);
+  assert.equal(sha, 'new-commit');
+  assert.equal(github.seen.updates.length, 1);
+  assert.equal(github.seen.updates[0].ref, 'heads/release/v1.2.3');
+  assert.equal(github.seen.updates[0].sha, 'new-commit');
+  assert.equal(github.seen.updates[0].force, true);
+});
+
+test('an error that is not "ref exists" still fails the run', async () => {
+  const github = fakeGithub();
+  github.rest.git.createRef = async () => {
+    const e = new Error('Bad credentials');
+    e.status = 401;
+    throw e;
+  };
+  await assert.rejects(() => commit.commitFiles(github, ARGS), /Bad credentials/);
 });
