@@ -154,6 +154,10 @@
   of being swallowed. It used to exit 0, which `Restart=on-failure` leaves
   alone, or -- with several `--listen` addresses -- leave the process up and
   healthy-looking with one port silently closed
+- when the API answered with an empty `authId`, the log line read
+  `Relayed mail successfully for <client> using token` with nothing after it;
+  it now reads `using no token`, as the Perl version did. An `authId` of `0`
+  is treated the same way
 
 ## Earlier releases
 

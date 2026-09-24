@@ -402,7 +402,7 @@ The lines of interest at `info` and above:
 
 - `Relayed mail successfully for <client> using token <authId>`: The upstream
   accepted the message; *authId* is the API's `authId`.
-  Without one, the line ends `using no token`.
+  When it is absent, empty or `0`, the line ends `using no token`.
 
 - `Mail rejected by API (<reason>) for <client>`: The API refused the message.
 

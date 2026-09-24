@@ -606,11 +606,14 @@ impl BodySink for ProxySink {
         match upstream.finish().await {
             Ok(message) => {
                 debug!("Upstream server says: {message}");
-                match &outcome.auth_id {
-                    Some(id) => {
+                // Perl truthiness (`SMTPProxy.pm:310`): `$apiResult->{authId}
+                // ? ... : "using no token"` treats both an empty string and
+                // the string `"0"` as false, unlike `Option::is_some`.
+                match outcome.auth_id.as_deref() {
+                    Some(id) if !id.is_empty() && id != "0" => {
                         info!("Relayed mail successfully for {client} using token {id}")
                     }
-                    None => info!("Relayed mail successfully for {client} using no token"),
+                    _ => info!("Relayed mail successfully for {client} using no token"),
                 }
                 Ok(message)
             }
