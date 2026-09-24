@@ -1,4 +1,4 @@
-# repo-infra: man v1
+# repo-infra: man v2
 #
 # The man page, built from docs/manual.md (D23).
 #
@@ -12,6 +12,10 @@
 #
 #     MAN_NAME = mytool
 #     include build/man.mk
+#
+# The manual is read as `markdown-smart`. pandoc's default `smart` extension
+# turns `--` into an en dash, so an option such as **--api** in running text
+# would reach the page as `\[en]api`; code spans are never affected.
 #
 # The page's date comes from `date:` in the manual's front matter, never from
 # the build, so two builds of one source produce the same page.
@@ -31,7 +35,7 @@ man: man/$(MAN_NAME).1
 
 man/$(MAN_NAME).1: docs/manual.md build/man-deflist.lua
 	@mkdir -p man
-	pandoc --standalone --to man --lua-filter build/man-deflist.lua \
+	pandoc --standalone --from markdown-smart --to man --lua-filter build/man-deflist.lua \
 	  docs/manual.md -o $@
 
 .DEFAULT_GOAL := $(_repo_infra_man_goal)
