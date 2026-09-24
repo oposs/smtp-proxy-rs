@@ -24,6 +24,10 @@ CROSS ?= cross
 TARGET_DIR ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 BINARY = $(TARGET_DIR)/$(TARGET)/release/smtp-proxy
 
+# The man page is built from docs/manual.md by build/man.mk (repo-infra),
+# which reads MAN_NAME and writes man/$(MAN_NAME).1. man/ is not in git.
+MAN_NAME = smtp-proxy
+
 .PHONY: build test lint release verify-static deb docker conformance
 
 build:
@@ -56,7 +60,7 @@ verify-static: release
 # and letting cargo-deb strip again would put a file through the package that
 # nothing verified. cargo-deb rewrites the `target/release/` asset paths in
 # Cargo.toml to the target triple when --target is given.
-deb: verify-static
+deb: verify-static man
 	cargo deb --no-build --no-strip --target $(TARGET)
 
 docker:
@@ -64,3 +68,6 @@ docker:
 
 conformance: build
 	$(MAKE) -C conformance
+
+# Last, so that its `man` target does not become the default goal.
+include build/man.mk

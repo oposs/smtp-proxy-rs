@@ -4,6 +4,10 @@
 
 ### New
 
+- The Debian package installs a manual page, `man smtp-proxy`, and
+  `smtp-proxy --man` prints the same manual instead of the option list. A
+  command-line error now ends in `For more information, try '--help'.` where
+  it named `--man`
 - `--max_header_size`, default 1 MiB; a header block larger than that is
   answered `552 Header block exceeds maximum size of <n> bytes`. It replaces
   the `--max_message_size` this section used to announce: the body is streamed

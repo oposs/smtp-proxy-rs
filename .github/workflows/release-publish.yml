@@ -203,6 +203,10 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --version '^3.7' --locked
 
+      - name: Install pandoc
+        # `make deb` runs `make man`, which converts docs/manual.md with pandoc.
+        run: sudo apt-get update && sudo apt-get install -y pandoc
+
       # The same targets a developer runs locally, in the same order. `make
       # deb` depends on `verify-static`, which asserts the binary really is
       # statically linked -- `crt-static` is a hint the linker is free to
@@ -224,7 +228,8 @@ jobs:
           dpkg-deb -c "$DEB"
           for want in ./usr/bin/smtp-proxy \
                       ./usr/lib/systemd/system/smtp-proxy.service \
-                      ./etc/default/smtp-proxy; do
+                      ./etc/default/smtp-proxy \
+                      ./usr/share/man/man1/smtp-proxy.1.gz; do
             if ! dpkg-deb -c "$DEB" | grep -q " ${want}\$"; then
               echo "::error::${want} missing from ${DEB}"
               exit 1
