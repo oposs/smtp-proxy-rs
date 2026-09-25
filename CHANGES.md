@@ -7,6 +7,9 @@
 ### Changed
 
 ### Fixed
+
+## 0.1.1 - 2026-09-25
+### Fixed
 - A proxy stopped with SIGTERM right after it printed `Waiting for
   connections on ...` could die at once, without the `Shutting down;
   draining 0 connection(s)` log line and without a drain. The stop signal is
