@@ -225,12 +225,16 @@ jobs:
           set -euo pipefail
           DEB=$(ls target/x86_64-unknown-linux-musl/debian/*.deb)
           echo "Package: ${DEB}"
-          dpkg-deb -c "$DEB"
+          # Listed once and searched as text: `dpkg-deb -c | grep -q` fails
+          # under pipefail whenever grep exits before tar has finished
+          # writing, and then reports a file that is there as missing.
+          CONTENTS=$(dpkg-deb -c "$DEB")
+          echo "$CONTENTS"
           for want in ./usr/bin/smtp-proxy \
                       ./usr/lib/systemd/system/smtp-proxy.service \
                       ./etc/default/smtp-proxy \
                       ./usr/share/man/man1/smtp-proxy.1.gz; do
-            if ! dpkg-deb -c "$DEB" | grep -q " ${want}\$"; then
+            if ! grep -q " ${want}\$" <<<"$CONTENTS"; then
               echo "::error::${want} missing from ${DEB}"
               exit 1
             fi
@@ -280,7 +284,7 @@ jobs:
               core.notice(`Attached ${asset.name} (${asset.size} bytes).`);
             }
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -289,7 +293,7 @@ jobs:
       # The Dockerfile does its own musl build: `rust:1-alpine` is already a
       # native musl host, so it needs no cross-compilation and shares nothing
       # with the build above.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: true

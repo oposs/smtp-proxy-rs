@@ -115,6 +115,16 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
     // that may be blackholed rather than merely refusing.
     let probe = factory.clone();
     tokio::spawn(async move { probe.probe_upstream().await });
+    // Registered once, before the accept loops start, and waited on by both
+    // `select!`s below. One value rather than one per wait: a signal reaches
+    // the receivers registered when it arrives and is not queued for later
+    // ones, so a receiver built per wait is deaf across the drain handover
+    // -- where the operator's second signal is most likely to land. And
+    // before the announcement below: a SIGTERM that arrives ahead of the
+    // handler takes the default action and kills the process without a
+    // drain or a log line, and anyone who waits for the announcement to
+    // stop the proxy would hit exactly that window.
+    let mut signals = Signals::new();
     // After `bind`, so that `--listen ...:0` reports the port the kernel
     // picked, and after the privilege drop.
     let listen_text: Vec<String> = listeners
@@ -123,12 +133,6 @@ async fn run(config: smtp_proxy::config::Config) -> anyhow::Result<()> {
         .collect();
     println!("Waiting for connections on {}", listen_text.join(", "));
     println!("Will forward mails to {}:{}", config.tohost, config.toport);
-    // Registered once, before the accept loops start, and waited on by both
-    // `select!`s below. One value rather than one per wait: a signal reaches
-    // the receivers registered when it arrives and is not queued for later
-    // ones, so a receiver built per wait is deaf across the drain handover
-    // -- where the operator's second signal is most likely to land.
-    let mut signals = Signals::new();
     // Pinned rather than spawned, so that a panic in `serve` itself still
     // reaches this thread as a panic instead of becoming a `JoinError` that
     // nobody reads.
