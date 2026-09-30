@@ -1,4 +1,4 @@
-// repo-infra: workflow-lib v3
+// repo-infra: workflow-lib v5
 'use strict';
 
 const test = require('node:test');
@@ -67,6 +67,15 @@ test('missing patterns keep their declared order', () => {
   // The job message names them in the order the config declares, so the reader
   // can find the one that is wrong.
   assert.deepEqual(assets.missingAssets(['x'], ['a', 'b', 'c']), ['a', 'b', 'c']);
+});
+
+test('unfinishedAssets names every asset whose state is not uploaded', () => {
+  assert.deepEqual(assets.unfinishedAssets([
+    { name: 'a.deb', state: 'uploaded' },
+    { name: 'b.deb', state: 'starter' },
+    { name: 'c.deb', state: 'open' },
+  ]), ['b.deb', 'c.deb']);
+  assert.deepEqual(assets.unfinishedAssets(undefined), []);
 });
 
 test('absent arguments are not a crash', () => {

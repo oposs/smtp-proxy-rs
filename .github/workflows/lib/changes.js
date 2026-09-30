@@ -1,4 +1,4 @@
-// repo-infra: workflow-lib v3
+// repo-infra: workflow-lib v5
 'use strict';
 
 // The bracketed form, per Keep a Changelog. mdmost used a bare '## Unreleased';
@@ -60,7 +60,17 @@ function roll(text, version, date) {
   }
 
   const block = lines.slice(range.start + 1, range.end).join('\n');
-  const kept = subsections(block).filter((s) => s.body !== '');
+  // A heading that appears twice (two branches each brought a skeleton) is
+  // one subsection in the release, its entries in the order they were written.
+  const kept = [];
+  for (const s of subsections(block).filter((s) => s.body !== '')) {
+    const earlier = kept.find((k) => k.heading === s.heading);
+    if (earlier) {
+      earlier.body += '\n' + s.body;
+    } else {
+      kept.push({ ...s });
+    }
+  }
   if (kept.length === 0) {
     throw new Error(`'${UNRELEASED_HEADING}' is empty - nothing to release`);
   }

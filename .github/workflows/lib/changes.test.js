@@ -1,4 +1,4 @@
-// repo-infra: workflow-lib v3
+// repo-infra: workflow-lib v5
 'use strict';
 
 const test = require('node:test');
@@ -90,6 +90,41 @@ test('roll preserves the preamble and every earlier release', () => {
   assert.match(out, /Preamble that must survive/);
   assert.match(out, /## 1\.2\.3 - 2026-08-01/);
   assert.match(out, /## 1\.2\.2 - 2026-07-01/);
+});
+
+test('roll merges subsections that share a heading, in order', () => {
+  // Two branches that each add a skeleton merge into one Unreleased block
+  // with every heading twice. The release notes must list each heading once.
+  const twice = [
+    '## [Unreleased]',
+    '',
+    '### New',
+    '- newer feature',
+    '',
+    '### Fixed',
+    '- newer fix',
+    '',
+    '### New',
+    '- older feature',
+    '',
+    '### Changed',
+    '- a change',
+    '',
+    '### Fixed',
+    '- older fix',
+    '',
+    '## 1.2.3 - 2026-08-01',
+    '### Fixed',
+    '- released',
+    '',
+  ].join('\n');
+  const out = changes.roll(twice, '1.3.0', '2026-08-17');
+  const released = out.split('## 1.3.0 - 2026-08-17')[1].split('## 1.2.3')[0];
+  assert.equal(released.match(/### New/g).length, 1);
+  assert.equal(released.match(/### Fixed/g).length, 1);
+  assert.match(released, /### New\n- newer feature\n- older feature\n/);
+  assert.match(released, /### Fixed\n- newer fix\n- older fix\n/);
+  assert.ok(released.indexOf('### New') < released.indexOf('### Fixed'));
 });
 
 test('rolling twice is possible: the result is still parseable', () => {
